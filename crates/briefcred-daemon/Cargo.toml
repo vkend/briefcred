@@ -36,7 +36,7 @@ zeroize.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
-objc2 = "0.6"
+objc2.workspace = true
 objc2-core-foundation.workspace = true
 objc2-foundation.workspace = true
 objc2-local-authentication.workspace = true

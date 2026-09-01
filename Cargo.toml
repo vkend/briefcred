@@ -32,6 +32,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 inventory = "0.3"
 libc = "0.2"
 notify = "8"
+objc2 = "0.6"
 objc2-core-foundation = "0.3"
 objc2-foundation = "0.3"
 objc2-local-authentication = "0.3"

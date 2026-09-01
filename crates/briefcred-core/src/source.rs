@@ -341,8 +341,8 @@ impl MasterSource for EnvSource {
     async fn fetch(&self, key: &str) -> Result<Zeroizing<String>> {
         validate_key(key)?;
         let name = EnvSource::var_name(key);
-        // Once per process, not once per fetch: a daemon that mints every
-        // fifteen minutes would otherwise bury its own log in this warning.
+        // Once per source, not once per fetch: the daemon holds one, and a
+        // warning on every fetch would bury the log it is trying to warn in.
         self.warned.call_once(|| {
             eprintln!(
                 "briefcred: reading master credentials from the environment ({ENV_PREFIX}*). \

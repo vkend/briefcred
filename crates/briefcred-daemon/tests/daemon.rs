@@ -700,3 +700,77 @@ async fn an_idle_session_is_evicted_and_audited() {
     call(&mut stream, Request::Shutdown).await;
     assert!(daemon.wait());
 }
+
+/// The same profile, but with the default biometric policy left in place.
+const GUARDED_PROFILE: &str = "\
+name: guarded
+credentials:
+  - name: db
+    kind: postgres-dynamic
+    source_key: app-db
+    config:
+      host: 127.0.0.1
+      dbname: app
+      user: master
+      sslmode: disable
+      role_template: {}
+";
+
+#[tokio::test]
+async fn a_headless_daemon_refuses_a_guarded_profile_and_reads_no_master() {
+    // `BRIEFCRED_FORCE_NO_AQUA` stands in for an SSH login, which is the case
+    // that must never fall back to something weaker.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("daemon.toml"),
+        "metrics_enabled = false\nmaster_source = \"file\"\n",
+    )
+    .unwrap();
+    write_profile(home.path(), "guarded.yaml", GUARDED_PROFILE);
+    write_master(home.path(), "app-db", "the-master-password");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_briefcred-daemon"))
+        .env("BRIEFCRED_HOME", home.path())
+        .env("BRIEFCRED_FORCE_NO_AQUA", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn briefcred-daemon");
+    let mut daemon = Daemon {
+        child: Some(child),
+        home,
+    };
+    let mut stream = daemon.connect().await;
+
+    let Response::Locked { reason, message } = call(
+        &mut stream,
+        Request::OpenSession {
+            profile: "guarded".into(),
+        },
+    )
+    .await
+    else {
+        panic!("a headless daemon must refuse a biometric profile");
+    };
+    assert_eq!(reason, "no_aqua_session");
+    assert!(message.contains("unlock.policy: none"), "{message}");
+
+    call(&mut stream, Request::Shutdown).await;
+    assert!(daemon.wait());
+
+    let rows = audit_rows(&daemon.audit_dir());
+    assert!(
+        rows.iter().any(|r| matches!(
+            r,
+            AuditEntry::UnlockDenied { profile, policy, reason, .. }
+                if profile == "guarded" && policy == "biometric" && reason == "no_aqua_session"
+        )),
+        "no UnlockDenied row in {rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| matches!(r, AuditEntry::SessionOpen { .. })),
+        "a refused unlock must open no session"
+    );
+}
