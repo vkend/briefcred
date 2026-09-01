@@ -108,6 +108,62 @@ old certificate first, because the macOS trust store matches on content and
 after the replacement there would be nothing left to match, leaving a stale
 trust entry for a key nobody holds.
 
+**Phase 3a: master sources, the unlock gate, and sessions.** This is where
+briefcred starts holding the secret that matters. The guarantee it aims at is
+narrow and worth stating exactly: *malware running as the user cannot mint a
+credential without a human physically answering a prompt, and cannot read a
+master except during the window a human opened.*
+
+What bounds it:
+
+- **The gate runs before the master is fetched.** `OpenSession` prompts first
+  and reads the keychain second, so a refused prompt leaves nothing behind.
+  The refusal is audited as `unlock_denied` with the reason.
+- **The gate fails closed.** With no graphical session — over SSH, or in a
+  `launchd` background session — there is nothing to draw a prompt in, and
+  briefcred returns `no_aqua_session` rather than falling back to something an
+  attacker could satisfy. Detection is `SessionGetInfo`'s
+  `sessionHasGraphicAccess`, plus `SSH_CONNECTION` and `SSH_TTY`. Turning the
+  gate off is possible, but only by editing the profile to say
+  `unlock.policy: none`, which is a visible, auditable choice rather than an
+  inference.
+- **The cache is per profile and time-bounded.** A cached unlock lasts
+  `unlock.cache_secs`, 300 seconds by default. Unlocking a low-value profile
+  never opens a high-value one, and a profile reload clears the cache, so
+  tightening a policy takes effect at once.
+- **Session lifetime bounds master lifetime.** Masters live in
+  `Zeroizing<String>` inside the session, and closing, idle eviction, and
+  shutdown all wipe them by dropping it. There is no state where a session is
+  "closed" but its masters are still resident.
+- **Session handles are unguessable.** 128 bits from the OS CSPRNG, because the
+  handle is a bearer token: a predictable one would let any process on the
+  machine use a session it never unlocked.
+- **A key cannot escape its namespace.** Master keys are validated against one
+  character set for every backend, so a key that is meaningless against the
+  keychain cannot become `../ca/ca.key` against the file backend.
+
+Residual risks, stated plainly:
+
+- **The cache window is a real window.** For up to `unlock.cache_secs` after a
+  successful unlock, a local process running as the user can open a session
+  without a prompt. Setting `cache_secs: 0` closes it at the cost of prompting
+  every time. This is the deliberate trade, not an oversight.
+- **An open session is an exposed master.** Anything that can read the daemon's
+  memory — a debugger attached as the same user, root, a core dump — can read
+  every master of every open session. `session_idle_secs` bounds how long that
+  is true; it does not make it false.
+- **`EnvSource` is not safe and does not pretend to be.** Every child process
+  inherits the master, and it warns once per process saying so. It exists for
+  development on a machine with no keychain.
+- **The prompt is a system prompt.** briefcred asks `LAContext` to
+  authenticate the device owner; it does not, and cannot, verify that the
+  answer came from the person who typed the command rather than someone else
+  at the same keyboard.
+- **A trusted profile directory.** Anyone who can write `profiles/*.yaml` can
+  add a profile with `unlock.policy: none` and a `source_key` naming an
+  existing master. The directory is `0700`, which means that attacker is
+  already the user — the same boundary as everything else here.
+
 **Phase 3: Model C exposure.** This is the weakest point in the plan and it is
 deliberate. `briefcred exec` hands the subprocess a minted role through
 `PGUSER` / `PGPASSWORD` / `DATABASE_URL`. Consequences:
@@ -152,6 +208,12 @@ the audit log.
 - **Every outcome is recorded, including failure.** A failed revoke carries a
   non-empty `detail` with the backend's SQLSTATE and message. An `outcome=failed`
   row with no detail is a bug, and there is a test for it in both directions.
+- **Session and unlock events are recorded.** `session_open` and
+  `session_close` carry the handle and profile, and `session_close` says which
+  of `request`, `idle`, or `shutdown` ended it, so every opened session can be
+  accounted for. `unlock_denied` records a refused prompt and its reason;
+  `profile_load_error` records that the daemon carried on with stale profiles.
+  None of these rows carries a master, a key's value, or a profile's contents.
 - **Not tamper-evident.** A user who can write the log can rewrite it. Signing
   or an append-only system store is deliberately out of scope for now, and this
   line should be revisited before anyone treats the log as compliance evidence.

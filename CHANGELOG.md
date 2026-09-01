@@ -134,3 +134,70 @@ All notable changes to briefcred are recorded here. The format follows
   `tokio-rustls` server on loopback holding an issued leaf, and the system
   `curl --cacert ca.pem` accepting it. Skips with a printed reason where there
   is no `curl`.
+- `briefcred_core::source`: the `MasterSource` backends. `KeychainSource`
+  reads generic passwords under the service `dev.briefcred.master` with the
+  key as the account; `FileSource` reads `0600` files under
+  `paths::secrets_dir()` and refuses a file that is readable by group or
+  other; `EnvSource` reads `BRIEFCRED_MASTER_<KEY>` for development and warns
+  once per process that every child inherits it. Every key is validated
+  against the same character set, so a key that works against the keychain
+  cannot become a path traversal against a file. A master that is simply
+  absent is `Error::MasterNotFound`, which names the key and where the backend
+  looked, rather than a generic failure.
+- `briefcred_core::registry`: the minter registry. A minter registers itself
+  with `inventory::submit!` next to its own implementation, and
+  `Registry::discover` collects whatever the binary was linked with.
+  `Profile::validate(&Registry)` resolves every credential's `kind` and builds
+  its minter, so a typo or a malformed `config` block fails when the profile is
+  loaded rather than at the first mint. An unknown kind reads
+  `unknown minter kind "X" (registered: a, b, c)`.
+- `CredentialSpec::source_key`: the master-source key a credential's master is
+  filed under, defaulting to the credential's own name. Naming it explicitly
+  lets several credentials share one master.
+- `Unlock::cache_secs`: how long a successful unlock is honoured for a profile,
+  defaulting to 300 seconds. Zero means every session prompts.
+- `briefcred_daemon::unlock`: the presence gate. `UnlockGate::unlock` runs
+  `LAContext` with `LAPolicyDeviceOwnerAuthentication` on macOS — Touch ID
+  falling back to the login password — on a dedicated OS thread with its own
+  run loop, returning through a oneshot so the prompt never blocks the reactor.
+  `UnlockPolicy::None` skips the gate entirely. A session with no graphical
+  subsystem to draw in fails closed with `NoAquaSession` rather than falling
+  back to something weaker; the check is `SessionGetInfo`'s
+  `sessionHasGraphicAccess`, plus `SSH_CONNECTION` and `SSH_TTY`. Every other
+  platform reports `Unsupported` for anything but `none`. `UnlockCache` is
+  keyed per profile, so unlocking a low-value profile never opens a
+  high-value one.
+- `briefcred_daemon::profiles`: the loaded profile set and its watcher.
+  `notify` with a 250 ms debounce turns an editor's save burst into one
+  reload, and a reload that fails leaves the previous set in force, logs, and
+  writes a `ProfileLoadError` audit row — a typo in one file must not cost the
+  user every profile. Reloading clears the unlock cache, because the file that
+  was unlocked for is not necessarily the file on disk now.
+- `briefcred_daemon::session`: open sessions. `OpenSession` runs the unlock
+  gate, then fetches the master for each credential's `source_key`, and answers
+  with an unguessable 128-bit session handle and an expiry. Masters live in
+  `Zeroizing<String>`, so `CloseSession`, idle eviction, and shutdown all wipe
+  them by dropping the session. An idle sweep runs every 30 seconds against
+  `session_idle_secs`, which defaults to 1800.
+- `briefcred_daemon::clock`: the `Clock` the session and unlock deadlines read,
+  so their expiry rules are tested against a stopped clock rather than a sleep.
+- `briefcred-proto`: `ListProfiles`, `ShowProfile`, `OpenSession`, and
+  `CloseSession` requests, answered with `Profiles`, `Profile`,
+  `SessionOpened`, `SessionClosed`, and `Locked`. Profiles cross the socket as
+  a `ProfileSummary` of their own rather than as the daemon's `Profile`, so a
+  future profile field cannot leak across the socket by default.
+- `daemon.toml` gains `session_idle_secs` and `master_source`.
+- `paths::secrets_dir()`: the `0700` directory `FileSource` reads, created by
+  `ensure_layout`.
+- `CONTRIBUTING.md`, with the "Adding a minter" section describing the registry
+  contract.
+
+### Changed
+
+- The daemon's dispatch table now maps a request name to an async handler
+  taking the deserialised `Request` and `Arc<State>`, rather than a synchronous
+  `fn(&State) -> Response`. Requests carry payloads now, and opening a session
+  prompts the user and reads a keychain. The table is still asserted to cover
+  `Request::NAMES` exactly.
+- `Profile::load_dir` takes a `&Registry` and validates every profile against
+  it.

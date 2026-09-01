@@ -162,8 +162,10 @@ its connection closed and an `auth_reject` audit row written.
 
 The wire protocol is one JSON message per frame behind a 4-byte big-endian
 length prefix, capped at 16 MiB so a four-byte header cannot be turned into a
-large allocation. Phase 1 speaks `Ping`, `Status`, and `Shutdown`; requests
-reach handlers through a dispatch table keyed by the request's own wire name.
+large allocation. It speaks `Ping`, `Status`, `Shutdown`, `ListProfiles`,
+`ShowProfile`, `OpenSession`, and `CloseSession`; requests reach async handlers
+through a dispatch table keyed by the request's own wire name, and the table is
+asserted in a test to cover every request the protocol defines.
 
 `SIGTERM`, `SIGINT`, and `Request::Shutdown` all stop the daemon the same way:
 it stops accepting, gives in-flight connections five seconds to finish, removes
@@ -178,6 +180,8 @@ the socket file, and writes a `daemon_stop` row.
 | `retention_days` | `90` | Audit logs older than this are deleted |
 | `metrics_port` | `9317` | Loopback port for `/metrics`; `0` asks for a free one |
 | `metrics_enabled` | `true` | Whether to serve `/metrics` at all |
+| `session_idle_secs` | `1800` | Seconds a session may go untouched before it is wiped |
+| `master_source` | platform default | `"keychain"`, `"file"`, or `"env"` |
 | `ca.keystore` | platform default | `"keychain"` or `"file"`; where the CA key lives |
 
 An unknown key is an error rather than a silent no-op, so a typo cannot switch
@@ -250,8 +254,52 @@ profile declares; `${config.<key>}` is resolved at exec time. Every regex in
 against the six briefcred sets.
 
 The master credential is never written in a profile. `user` names the master
-role; its password comes from a `MasterSource`, which is the Keychain from
-Phase 3.
+role; its password comes from a master source, described below.
+
+Profiles hot-reload. The daemon watches `profiles/` and reloads 250 ms after
+the last change, so an editor's save burst is one reload rather than five. A
+file that does not parse leaves the previous set in force, logs, and writes a
+`profile_load_error` audit row: a typo in one profile must not cost you the
+others.
+
+## Master credentials
+
+Each credential's master is fetched by key when a session opens. The key is the
+credential's `source_key`, or its `name` when `source_key` is absent, so
+several credentials can share one master by naming the same key.
+
+| `master_source` | Where it looks |
+| --- | --- |
+| `keychain` | The login keychain, service `dev.briefcred.master`, key as the account. The default on macOS. |
+| `file` | `secrets/<key>` under the briefcred home, mode `0600`. The default elsewhere. |
+| `env` | `BRIEFCRED_MASTER_<KEY>`, upper-cased with `-` as `_`. Development only. |
+
+The file backend refuses a file readable by group or other rather than using
+it, and the environment backend warns once per process that every child
+inherits what it reads. A master that is simply missing is reported with the
+key and the place that was searched, so the fix is obvious.
+
+## Sessions and the unlock gate
+
+`OpenSession` proves presence, then fetches the masters, in that order — a
+refused prompt leaves no master in the daemon's memory at all. On macOS the
+prompt is Touch ID falling back to the login password, shown on a dedicated
+thread so the daemon keeps serving while it is up. It is skipped entirely for
+a profile with `unlock.policy: none`.
+
+A successful unlock is cached per profile for `unlock.cache_secs`, 300 seconds
+by default, so a shell running briefcred in a loop prompts once rather than
+once a second. The cache is per profile, so unlocking a low-value profile never
+opens a high-value one, and a profile reload clears it.
+
+Over SSH, or anywhere else with no graphical session to draw the prompt in,
+`OpenSession` fails with `no_aqua_session` rather than falling back to
+something weaker. If a profile is genuinely meant to run unattended, say so
+with `unlock.policy: none`; briefcred will not infer it.
+
+A session is wiped when it is closed, when it has gone `session_idle_secs`
+without being used, and at shutdown. Every one of those writes a
+`session_close` audit row naming which of the three it was.
 
 ## Filesystem layout
 
@@ -259,7 +307,7 @@ macOS:
 
 ```
 ~/Library/Application Support/briefcred/
-  sock  profiles/  audit/  ca/  logs/  state/  daemon.toml
+  sock  profiles/  audit/  ca/  secrets/  logs/  state/  daemon.toml
 ```
 
 Every directory is mode `0700` and the socket is `0600`. The service unit lives

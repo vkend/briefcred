@@ -77,7 +77,9 @@ are the two things every other crate has to agree on.
 | `types` | `MintId`, `MintCtx`, `RevokeCtx`, `MintedCredential`, `RevokeOutcome`. |
 | `traits` | `MasterSource` and `Minter`. |
 | `audit` | `AuditEntry` and argument hashing. |
-| `minters` | Concrete minters. Phase 0 ships `postgres`. |
+| `minters` | Concrete minters, each registering itself with the registry. |
+| `registry` | `MinterFactory` and the `inventory`-collected `Registry` that resolves a profile's `kind`. |
+| `source` | The `MasterSource` backends: keychain, file, and environment. |
 | `keystore` | The `KeyStore` trait, the macOS keychain backend, and the file backend. |
 | `ca` | The root CA, leaf issuance, and the runtime trust environment. |
 
@@ -167,6 +169,58 @@ whole layout, including the socket; tests always set it.
    output. `ca.pem` holds the public half alone.
 7. Anything that needs `sudo` is built as a plan and executed separately, so
    `--dry-run` can print it and no test can ever run it.
+8. The unlock gate runs before any master is fetched. A refused prompt leaves
+   no master in the daemon's memory at all.
+9. A gate that cannot run fails closed. With no graphical session there is no
+   weaker fallback, only `NoAquaSession`.
+10. A session is the lifetime of the masters it holds. There is no "closed"
+    flag: closing, evicting, and shutting down all drop the session, and
+    dropping it zeroises every master in it.
+11. Profiles cross the socket as a `ProfileSummary` built by hand, never as the
+    daemon's own `Profile`, so a future profile field cannot leak by default.
+
+## The minter registry
+
+A minter registers itself with `inventory::submit!` in the same file as its
+implementation:
+
+```rust
+inventory::submit! {
+    MinterFactory { kind: KIND, build: |config| { /* validate, construct */ } }
+}
+```
+
+`Registry::discover()` collects whatever the binary was linked with, and
+`Profile::validate(&Registry)` resolves every credential's `kind` and calls its
+`build` with that credential's `config`. Both failures therefore happen when
+the profile is loaded, while the user is still looking at the file, rather than
+at the first mint. An unknown kind names every kind that *is* registered, which
+is the only thing that makes the message actionable. See `CONTRIBUTING.md`.
+
+## Sessions, and where the dangerous state lives
+
+The daemon holds exactly one kind of dangerous state: the master credentials of
+open sessions. Everything about the session model exists to bound how long that
+state lives.
+
+```
+OpenSession(profile)
+  |
+  |-- profile loaded?            no -> Error
+  |-- unlock cached for it?      no -> UnlockGate::unlock
+  |                                     |-- no graphical session -> Locked{no_aqua_session}
+  |                                     |-- cancelled / failed    -> Locked{...}, audit UnlockDenied
+  |                                     `-- ok                    -> cache for unlock.cache_secs
+  |-- fetch a master per distinct source_key   (any failure -> Error, nothing retained)
+  `-- Session { masters: Zeroizing<String> }   -> SessionOpened{session_id, expires_at}
+
+wiped by: CloseSession | idle sweep every 30 s | daemon shutdown
+```
+
+The idle sweep and the unlock cache both read a `Clock` rather than
+`Instant::now`, so their boundaries are tested against a stopped clock instead
+of a sleep. The clock is monotonic: a session must not become immortal, or
+instantly stale, because the laptop resynchronised NTP.
 
 ## The root CA
 
