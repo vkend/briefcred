@@ -7,8 +7,27 @@ license.workspace = true
 repository.workspace = true
 description = "The briefcred per-user daemon."
 
+[lib]
+name = "briefcred_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "briefcred-daemon"
 path = "src/main.rs"
 
 [dependencies]
+briefcred-core.workspace = true
+briefcred-proto.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "net", "signal", "sync"] }
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

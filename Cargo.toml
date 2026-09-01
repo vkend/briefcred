@@ -22,8 +22,13 @@ briefcred-proto = { path = "crates/briefcred-proto", version = "0.1.0" }
 
 async-trait = "0.1"
 base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
 hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
 postgres-protocol = "0.6"
 regex = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -38,4 +43,5 @@ time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tokio-postgres = { version = "0.7", features = ["with-time-0_3"] }
 tokio-postgres-rustls = "0.14"
+toml = "0.9"
 zeroize = { version = "1", features = ["derive"] }
