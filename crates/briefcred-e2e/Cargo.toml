@@ -1,0 +1,20 @@
+[package]
+name = "briefcred-e2e"
+description = "End-to-end tests for briefcred, including the ephemeral PostgreSQL harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+briefcred-core.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+
+[dev-dependencies]
+serde_yaml.workspace = true
+time.workspace = true
+zeroize.workspace = true

@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/briefcred-core",
+    "crates/briefcred-proto",
+    "crates/briefcred-daemon",
+    "crates/briefcred-cli",
+    "crates/briefcred-hook",
+    "crates/briefcred-e2e",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/briefcred/briefcred"
+
+[workspace.dependencies]
+briefcred-core = { path = "crates/briefcred-core", version = "0.1.0" }
+briefcred-proto = { path = "crates/briefcred-proto", version = "0.1.0" }
+
+async-trait = "0.1"
+base64 = "0.22"
+getrandom = "0.3"
+hex = "0.4"
+postgres-protocol = "0.6"
+regex = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde", "serde-well-known"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-time-0_3"] }
+tokio-postgres-rustls = "0.14"
+zeroize = { version = "1", features = ["derive"] }

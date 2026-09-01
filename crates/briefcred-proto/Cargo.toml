@@ -1,0 +1,10 @@
+[package]
+name = "briefcred-proto"
+description = "Wire types shared between the briefcred daemon and its clients."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

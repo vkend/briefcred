@@ -1,0 +1,14 @@
+[package]
+name = "briefcred-hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The briefcred agent hook shim."
+
+[[bin]]
+name = "briefcred-hook"
+path = "src/main.rs"
+
+[dependencies]
