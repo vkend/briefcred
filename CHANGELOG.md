@@ -42,3 +42,44 @@ All notable changes to briefcred are recorded here. The format follows
   revoke failure that must report a non-empty detail.
 - `ARCHITECTURE.md`, `THREAT_MODEL.md`, `README.md`, and a `Justfile` with
   `check`, `test`, `fmt`, and `e2e`.
+- `briefcred_proto`: the daemon IPC wire protocol. `Request` (`Ping`, `Status`,
+  `Shutdown`) and `Response` (`Pong`, `Status`, `ShuttingDown`, `Error`) as
+  tagged JSON, behind a 4-byte big-endian length prefix with a 16 MiB frame
+  ceiling enforced on both sides. `Request::name` gives the daemon its
+  dispatch-table key, so the table and the wire format cannot drift apart.
+- `briefcred-daemon`: the per-user daemon. A Unix listener at `paths::sock()`
+  with the socket at `0600` inside a `0700` directory, a peer-UID check that
+  closes mismatched connections and writes an `auth_reject` audit row, and
+  stale-socket cleanup that refuses to displace a daemon still answering.
+  Requests reach handlers through a `HashMap` dispatch table rather than one
+  large `match`. `SIGTERM`, `SIGINT`, and `Request::Shutdown` all stop
+  accepting, drain in-flight connections for five seconds, and remove the
+  socket file.
+- The JSONL audit writer: `audit/audit-YYYY-MM-DD.jsonl`, `O_APPEND` with an
+  `fsync` per row, daily rotation by filename, and a retention sweep at startup
+  and hourly that deletes by the date in the filename. It never removes the
+  file it is writing to and ignores filenames it did not write.
+- A Prometheus text endpoint on `127.0.0.1`, serving `briefcred_uptime_seconds`,
+  `briefcred_ipc_requests_total{request}`, and
+  `briefcred_audit_write_errors_total`, with every request series seeded at zero.
+- `daemon.toml`: `retention_days` (90), `metrics_port` (9317; `0` asks the OS
+  for a free port), and `metrics_enabled` (true). An absent or empty file is
+  valid; an unknown key is an error.
+- `briefcred-cli`: the `briefcred` binary. `install [--dry-run]` and
+  `uninstall`, both idempotent, and `daemon status | start | stop | restart`.
+  Lifecycle goes through `launchctl bootstrap gui/$UID` or
+  `systemctl --user`; the CLI never spawns the daemon itself. `daemon status`
+  exits 3 with `daemon is not running; run 'briefcred daemon start'` when the
+  socket is absent. `uninstall` removes the unit and boots the agent out, and
+  deliberately retains the audit log, profiles, and configuration.
+- LaunchAgent plist and systemd user unit generation as pure, snapshot-tested
+  functions. The plist sets `RunAtLoad`, `KeepAlive`, and
+  `ProcessType Interactive`, pins `BRIEFCRED_HOME`, and redirects stdout and
+  stderr into `paths::log_dir()`. XML metacharacters in paths are escaped.
+- `briefcred_core::paths`: `log_dir()`, `state_dir()`, `config_dir()`,
+  `service_dir()`, `service_file()`, `service_label()`, `platform()`, and
+  `ensure_layout()`. `BRIEFCRED_HOME` relocates the service unit too, so a test
+  can never write into the real `~/Library/LaunchAgents`.
+- `briefcred_core::audit`: `DaemonStart`, `DaemonStop`, and `AuthReject`
+  variants. `AuditEntry::mint_id` now returns `Option<&MintId>`, because these
+  rows describe the daemon rather than a minted principal.
