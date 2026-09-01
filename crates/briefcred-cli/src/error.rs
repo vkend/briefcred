@@ -47,13 +47,18 @@ pub enum Error {
         detail: String,
     },
 
+    /// There is no root CA yet.
+    #[error("no briefcred CA yet; run 'briefcred install --trust-ca'")]
+    NoCa,
+
     /// The `briefcred-daemon` binary could not be found next to this one.
     #[error("cannot find the briefcred-daemon binary at {0}")]
     DaemonBinaryMissing(PathBuf),
 
-    /// The on-disk layout could not be resolved.
+    /// Something in `briefcred-core` failed: the layout, the key store, or
+    /// the certificate authority.
     #[error(transparent)]
-    Layout(#[from] briefcred_core::Error),
+    Core(#[from] briefcred_core::Error),
 }
 
 impl Error {
