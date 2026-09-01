@@ -55,16 +55,20 @@ impl Daemon {
     }
 
     /// Wait for the process to exit, returning whether it exited successfully.
+    ///
+    /// The budget is generous on purpose. How *fast* shutdown is belongs to
+    /// `shutdown_does_not_wait_out_the_drain_timeout_on_idle_connections`;
+    /// a tight budget here would only turn a loaded machine into a flake.
     fn wait(&mut self) -> bool {
         let mut child = self.child.take().expect("daemon already reaped");
-        for _ in 0..300 {
+        for _ in 0..750 {
             match child.try_wait().unwrap() {
                 Some(status) => return status.success(),
                 None => std::thread::sleep(Duration::from_millis(20)),
             }
         }
         let _ = child.kill();
-        panic!("daemon did not exit within six seconds");
+        panic!("daemon did not exit within fifteen seconds");
     }
 }
 
@@ -95,6 +99,13 @@ fn http_get(addr: &str, path: &str) -> String {
     body
 }
 
+struct Timer(&'static str, std::time::Instant);
+impl Drop for Timer {
+    fn drop(&mut self) {
+        eprintln!("TIME {} {:?}", self.0, self.1.elapsed());
+    }
+}
+
 fn audit_rows(dir: &Path) -> Vec<AuditEntry> {
     let mut rows = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -108,6 +119,11 @@ fn audit_rows(dir: &Path) -> Vec<AuditEntry> {
 
 #[tokio::test]
 async fn the_daemon_pings_reports_status_serves_metrics_and_shuts_down() {
+    let __t = std::time::Instant::now();
+    let __g = Timer(
+        "the_daemon_pings_reports_status_serves_metrics_and_shuts_down",
+        __t,
+    );
     let mut daemon = Daemon::start("retention_days = 90\nmetrics_port = 0\n");
     let mut stream = daemon.connect().await;
 
@@ -186,6 +202,8 @@ async fn the_daemon_pings_reports_status_serves_metrics_and_shuts_down() {
 
 #[tokio::test]
 async fn the_socket_and_its_directory_are_private_to_the_owner() {
+    let __t = std::time::Instant::now();
+    let __g = Timer("the_socket_and_its_directory_are_private_to_the_owner", __t);
     let daemon = Daemon::start("metrics_enabled = false\n");
     let _stream = daemon.connect().await;
 
@@ -205,6 +223,8 @@ async fn the_socket_and_its_directory_are_private_to_the_owner() {
 
 #[tokio::test]
 async fn metrics_can_be_switched_off_entirely() {
+    let __t = std::time::Instant::now();
+    let __g = Timer("metrics_can_be_switched_off_entirely", __t);
     let daemon = Daemon::start("metrics_enabled = false\n");
     let mut stream = daemon.connect().await;
 
@@ -216,6 +236,11 @@ async fn metrics_can_be_switched_off_entirely() {
 
 #[tokio::test]
 async fn a_socket_left_behind_by_a_dead_daemon_is_cleared_on_start() {
+    let __t = std::time::Instant::now();
+    let __g = Timer(
+        "a_socket_left_behind_by_a_dead_daemon_is_cleared_on_start",
+        __t,
+    );
     let home = tempfile::tempdir().unwrap();
     // A plain file where the socket belongs: what a SIGKILLed daemon leaves.
     std::fs::write(home.path().join("sock"), b"stale").unwrap();
@@ -242,6 +267,8 @@ async fn a_socket_left_behind_by_a_dead_daemon_is_cleared_on_start() {
 
 #[tokio::test]
 async fn a_second_daemon_refuses_to_take_over_a_live_socket() {
+    let __t = std::time::Instant::now();
+    let __g = Timer("a_second_daemon_refuses_to_take_over_a_live_socket", __t);
     let daemon = Daemon::start("metrics_enabled = false\n");
     let _stream = daemon.connect().await;
 
@@ -252,4 +279,86 @@ async fn a_second_daemon_refuses_to_take_over_a_live_socket() {
     assert!(!second.status.success(), "the second daemon should refuse");
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(stderr.contains("already listening"), "{stderr}");
+}
+
+#[tokio::test]
+async fn shutdown_does_not_wait_out_the_drain_timeout_on_idle_connections() {
+    let __t = std::time::Instant::now();
+    let __g = Timer(
+        "shutdown_does_not_wait_out_the_drain_timeout_on_idle_connections",
+        __t,
+    );
+    let mut daemon = Daemon::start("metrics_enabled = false\n");
+    let mut control = daemon.connect().await;
+    // A second connection that is open, authenticated, and silent. Before the
+    // connection loop learned to watch for shutdown, this held the drain open
+    // for its full five seconds on every single stop.
+    let _idle = daemon.connect().await;
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        call(&mut control, Request::Shutdown).await,
+        Response::ShuttingDown
+    );
+    assert!(daemon.wait());
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < briefcred_daemon::server::DRAIN_TIMEOUT,
+        "shutdown took {elapsed:?}, which is the whole drain timeout"
+    );
+}
+
+#[tokio::test]
+async fn sigterm_stops_the_daemon_and_says_so_in_the_audit_log() {
+    let __t = std::time::Instant::now();
+    let __g = Timer("sigterm_stops_the_daemon_and_says_so_in_the_audit_log", __t);
+    let mut daemon = Daemon::start("metrics_enabled = false\n");
+    let _stream = daemon.connect().await;
+
+    let pid = daemon.child.as_ref().unwrap().id();
+    let killed = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    assert!(daemon.wait(), "SIGTERM is a clean exit, not a crash");
+
+    assert!(!daemon.sock().exists(), "the socket must be cleaned up");
+    let reason = audit_rows(&daemon.audit_dir())
+        .into_iter()
+        .find_map(|row| match row {
+            AuditEntry::DaemonStop { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("a DaemonStop row");
+    assert_eq!(reason, "sigterm");
+}
+
+#[tokio::test]
+async fn a_connection_racing_the_signal_does_not_hold_the_drain_open() {
+    // Connect and signal with no pause in between, so the connection is
+    // sometimes still in the accept backlog and sometimes accepted in the same
+    // breath as the shutdown request. The second case used to leave the
+    // connection task waiting on a change that had already happened, and the
+    // daemon then sat out its whole drain timeout on every such stop.
+    for attempt in 0..6 {
+        let mut daemon = Daemon::start("metrics_enabled = false\n");
+        let _stream = daemon.connect().await;
+        let pid = daemon.child.as_ref().unwrap().id();
+
+        let started = std::time::Instant::now();
+        assert!(Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(daemon.wait(), "attempt {attempt} did not exit cleanly");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < briefcred_daemon::server::DRAIN_TIMEOUT,
+            "attempt {attempt} took {elapsed:?}, the whole drain timeout"
+        );
+    }
 }

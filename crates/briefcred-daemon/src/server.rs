@@ -94,7 +94,10 @@ impl State {
             *current = reason;
         }
         drop(current);
-        let _ = self.shutdown.send(true);
+        // `send_replace`, not `send`: `send` fails and leaves the value alone
+        // when no receiver happens to exist yet, which would lose a signal
+        // that arrived during startup.
+        self.shutdown.send_replace(true);
     }
 
     /// What asked the daemon to stop.
@@ -116,6 +119,21 @@ impl State {
     pub fn started_at(&self) -> OffsetDateTime {
         self.started_at
     }
+}
+
+/// Resolve as soon as shutdown has been requested, including when it already
+/// has been.
+///
+/// This is deliberately not `Receiver::changed`. `changed` only reports a
+/// change made *after* the receiver was created, so a connection accepted in
+/// the same breath as the shutdown request would subscribe to an already-true
+/// value and then wait forever, holding the drain open for its whole timeout.
+/// `wait_for` inspects the current value first, which is the behaviour every
+/// caller here actually wants.
+pub async fn shutdown_requested(watcher: &mut tokio::sync::watch::Receiver<bool>) {
+    // An error means the sender is gone, which only happens as the daemon is
+    // being torn down: treat it as a shutdown too.
+    let _ = watcher.wait_for(|requested| *requested).await;
 }
 
 /// The request-name to handler map.
@@ -192,7 +210,7 @@ pub async fn serve(listener: UnixListener, state: Arc<State>) {
     loop {
         let stream = tokio::select! {
             biased;
-            _ = shutdown.changed() => break,
+            _ = shutdown_requested(&mut shutdown) => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => stream,
                 Err(err) => {
@@ -205,8 +223,9 @@ pub async fn serve(listener: UnixListener, state: Arc<State>) {
         let state = Arc::clone(&state);
         let table = Arc::clone(&table);
         let guard = in_flight.clone();
+        let closing = state.shutdown_signal();
         tokio::spawn(async move {
-            serve_connection(stream, state, table).await;
+            serve_connection(stream, state, table, closing).await;
             drop(guard);
         });
     }
@@ -230,6 +249,7 @@ async fn serve_connection(
     mut stream: UnixStream,
     state: Arc<State>,
     table: Arc<HashMap<&'static str, Handler>>,
+    mut closing: tokio::sync::watch::Receiver<bool>,
 ) {
     let expected_uid = own_uid();
     match stream.peer_cred() {
@@ -249,7 +269,18 @@ async fn serve_connection(
     }
 
     loop {
-        let request: Request = match read_frame(&mut stream).await {
+        // Once shutdown is under way there is nothing more to serve, so an
+        // idle connection must not hold the drain open for its full timeout.
+        // A client that has just been answered `ShuttingDown` is exactly this
+        // case, so without the select the common path always waits five
+        // seconds.
+        let next = tokio::select! {
+            biased;
+            _ = shutdown_requested(&mut closing) => return,
+            next = read_frame(&mut stream) => next,
+        };
+
+        let request: Request = match next {
             Ok(Some(request)) => request,
             Ok(None) => return,
             Err(err) => {
@@ -297,6 +328,50 @@ mod tests {
             Request::NAMES.len(),
             "the table has handlers the protocol does not define"
         );
+    }
+
+    #[tokio::test]
+    async fn a_watcher_created_after_the_request_still_sees_the_shutdown() {
+        let (tx, _) = tokio::sync::watch::channel(false);
+        tx.send_replace(true);
+        // Subscribing now records `true` as already seen, so `changed()` would
+        // never fire. This is the connection that is accepted in the same
+        // breath as the shutdown request, and before the fix it sat in
+        // `read_frame` until the drain timed out.
+        let mut late = tx.subscribe();
+
+        tokio::time::timeout(Duration::from_secs(5), shutdown_requested(&mut late))
+            .await
+            .expect("a watcher created after the request must resolve at once");
+    }
+
+    #[tokio::test]
+    async fn a_watcher_created_before_the_request_waits_for_it() {
+        let (tx, _) = tokio::sync::watch::channel(false);
+        let mut early = tx.subscribe();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), shutdown_requested(&mut early))
+                .await
+                .is_err(),
+            "nothing has asked for shutdown yet"
+        );
+
+        tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), shutdown_requested(&mut early))
+            .await
+            .expect("the request must wake the watcher");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_sender_counts_as_a_shutdown() {
+        let (tx, _) = tokio::sync::watch::channel(false);
+        let mut watcher = tx.subscribe();
+        drop(tx);
+
+        tokio::time::timeout(Duration::from_secs(5), shutdown_requested(&mut watcher))
+            .await
+            .expect("a gone sender means the daemon is going away");
     }
 
     #[test]

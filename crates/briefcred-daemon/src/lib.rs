@@ -47,6 +47,12 @@ pub async fn run() -> Result<()> {
     };
     let metrics_addr = bound_metrics.as_ref().map(|(_, addr)| addr.to_string());
 
+    // Register the signal handlers before the socket exists. `signal` installs
+    // the handler when it is called, not when the future is first polled, so
+    // doing this after `bind` would leave a window where the daemon is
+    // reachable but a SIGTERM still hits the default disposition and kills it.
+    let signals = install_signal_handlers()?;
+
     let listener = server::bind(paths.sock())?;
     let (shutdown, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(State::new(
@@ -74,7 +80,7 @@ pub async fn run() -> Result<()> {
         ));
     }
     tokio::spawn(sweep_loop(Arc::clone(&state)));
-    tokio::spawn(watch_signals(Arc::clone(&state)));
+    tokio::spawn(watch_signals(Arc::clone(&state), signals));
 
     eprintln!(
         "briefcred-daemon: listening on {} (pid {})",
@@ -108,28 +114,33 @@ async fn sweep_loop(state: Arc<State>) {
     ticker.tick().await;
     loop {
         tokio::select! {
-            _ = shutdown.changed() => return,
+            _ = server::shutdown_requested(&mut shutdown) => return,
             _ = ticker.tick() => state.sweep(),
         }
     }
 }
 
-async fn watch_signals(state: Arc<State>) {
+/// The signal streams the daemon shuts down on, registered eagerly.
+struct Signals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+fn install_signal_handlers() -> Result<Signals> {
     use tokio::signal::unix::{signal, SignalKind};
 
-    let (mut term, mut interrupt) = match (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    ) {
-        (Ok(term), Ok(interrupt)) => (term, interrupt),
-        _ => {
-            eprintln!("briefcred-daemon: cannot install signal handlers");
-            return;
-        }
+    let handler = |kind, name: &'static str| {
+        signal(kind).map_err(|source| Error::io("install a signal handler for", name, source))
     };
+    Ok(Signals {
+        terminate: handler(SignalKind::terminate(), "SIGTERM")?,
+        interrupt: handler(SignalKind::interrupt(), "SIGINT")?,
+    })
+}
 
+async fn watch_signals(state: Arc<State>, mut signals: Signals) {
     tokio::select! {
-        _ = term.recv() => state.request_shutdown("sigterm"),
-        _ = interrupt.recv() => state.request_shutdown("sigint"),
+        _ = signals.terminate.recv() => state.request_shutdown("sigterm"),
+        _ = signals.interrupt.recv() => state.request_shutdown("sigint"),
     }
 }

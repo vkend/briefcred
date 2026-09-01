@@ -104,7 +104,7 @@ pub async fn serve(
     loop {
         let stream = tokio::select! {
             biased;
-            _ = shutdown.changed() => return,
+            _ = crate::server::shutdown_requested(&mut shutdown) => return,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => stream,
                 // A failed accept is not worth taking the daemon down for.
