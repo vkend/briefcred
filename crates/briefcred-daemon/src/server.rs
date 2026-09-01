@@ -162,7 +162,7 @@ pub fn bind(sock: &Path) -> Result<UnixListener> {
             std::io::ErrorKind::NotFound.into(),
         )
     })?;
-    crate::ensure_private_dir(parent)?;
+    briefcred_core::paths::ensure_private_dir(parent)?;
 
     if std::fs::symlink_metadata(sock).is_ok() {
         match std::os::unix::net::UnixStream::connect(sock) {

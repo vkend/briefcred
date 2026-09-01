@@ -5,6 +5,7 @@
 //! is how tests stay off the real user directories.
 
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -191,6 +192,24 @@ impl Paths {
         }
     }
 
+    /// Create every directory briefcred owns, all of them mode `0700`.
+    ///
+    /// The service directory is deliberately not among them: it belongs to
+    /// launchd or systemd, and `install` creates it with the mode they expect.
+    pub fn ensure_layout(&self) -> Result<()> {
+        for dir in [
+            self.root.clone(),
+            self.profiles_dir(),
+            self.audit_dir(),
+            self.ca_dir(),
+            self.log_dir(),
+            self.state_dir(),
+        ] {
+            ensure_private_dir(&dir)?;
+        }
+        Ok(())
+    }
+
     /// The label the platform's service manager knows the daemon by.
     ///
     /// `launchctl` addresses it as `gui/<uid>/dev.briefcred.daemon`; systemd
@@ -201,6 +220,22 @@ impl Paths {
             Platform::Linux => "briefcred.service",
         }
     }
+}
+
+/// Create `dir` if it is missing and make sure only its owner can enter it.
+///
+/// Idempotent, so both `briefcred install` and a daemon start can call it.
+pub fn ensure_private_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|source| Error::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
+        Error::Io {
+            path: dir.to_path_buf(),
+            source,
+        }
+    })
 }
 
 fn non_empty(value: Option<OsString>) -> Option<OsString> {
@@ -371,6 +406,33 @@ mod tests {
         assert_eq!(
             Paths::resolve(Platform::Linux, &env).unwrap().platform(),
             Platform::Linux
+        );
+    }
+
+    #[test]
+    fn ensure_layout_creates_every_directory_privately() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("home");
+        let env = env_of(&[("HOME", "/nonexistent"), (HOME_ENV, root.to_str().unwrap())]);
+        let paths = Paths::resolve(Platform::MacOs, &env).unwrap();
+
+        paths.ensure_layout().unwrap();
+        paths.ensure_layout().unwrap();
+
+        for dir in [
+            paths.root().to_path_buf(),
+            paths.profiles_dir(),
+            paths.audit_dir(),
+            paths.ca_dir(),
+            paths.log_dir(),
+            paths.state_dir(),
+        ] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} is {mode:o}", dir.display());
+        }
+        assert!(
+            !paths.service_dir().exists(),
+            "install owns the service dir"
         );
     }
 }

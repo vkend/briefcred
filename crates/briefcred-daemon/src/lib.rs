@@ -13,8 +13,6 @@ pub mod error;
 pub mod metrics;
 pub mod server;
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,34 +29,10 @@ use crate::server::State;
 /// How often the retention sweep runs after the one at startup.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// Create `dir` if needed and make sure only its owner can enter it.
-pub fn ensure_private_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).map_err(|e| Error::io("create", dir, e))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| Error::io("set the mode of", dir, e))
-}
-
-/// Create every directory briefcred owns, all of them private.
-///
-/// Idempotent, so `briefcred install` and a daemon start can both call it.
-pub fn ensure_layout(paths: &Paths) -> Result<()> {
-    for dir in [
-        paths.root().to_path_buf(),
-        paths.profiles_dir(),
-        paths.audit_dir(),
-        paths.ca_dir(),
-        paths.log_dir(),
-        paths.state_dir(),
-    ] {
-        ensure_private_dir(&dir)?;
-    }
-    Ok(())
-}
-
 /// Run the daemon until it is asked to stop.
 pub async fn run() -> Result<()> {
     let paths = Paths::discover()?;
-    ensure_layout(&paths)?;
+    paths.ensure_layout()?;
 
     let config = Config::load(&paths.daemon_toml())?;
     let audit = AuditLog::open(&paths.audit_dir(), config.retention_days)?;

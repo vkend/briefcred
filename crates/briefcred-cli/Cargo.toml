@@ -7,8 +7,23 @@ license.workspace = true
 repository.workspace = true
 description = "The briefcred command-line interface."
 
+[lib]
+name = "briefcred_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "briefcred"
 path = "src/main.rs"
 
 [dependencies]
+briefcred-core.workspace = true
+briefcred-proto.workspace = true
+clap.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
