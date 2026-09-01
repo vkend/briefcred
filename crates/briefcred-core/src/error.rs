@@ -54,6 +54,16 @@ pub enum Error {
     /// TLS could not be configured for an outbound database connection.
     #[error("tls: {0}")]
     Tls(String),
+
+    /// The private-key store could not be read, written, or opened.
+    ///
+    /// Carries the backend's complaint, never the key it was protecting.
+    #[error("keystore: {0}")]
+    Keystore(String),
+
+    /// The root CA could not be generated, loaded, or used to issue a leaf.
+    #[error("ca: {0}")]
+    Ca(String),
 }
 
 impl Error {
