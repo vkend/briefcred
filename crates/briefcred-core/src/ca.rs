@@ -149,11 +149,6 @@ impl Leaf {
         &self.key_pem
     }
 
-    /// The hostnames this leaf carries as subject alternative names.
-    pub fn hostnames(&self) -> &[String] {
-        &self.hostnames
-    }
-
     /// When this leaf stops being valid.
     pub fn expires_at(&self) -> OffsetDateTime {
         self.expires_at

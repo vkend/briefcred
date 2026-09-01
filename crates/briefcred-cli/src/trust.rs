@@ -151,6 +151,21 @@ pub fn run(plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+/// Run `plan`, saying first what it is about to ask for.
+///
+/// `sudo` prints its own prompt, but out of context: the user sees a bare
+/// password request with no indication of which command wants it or why.
+/// This is the entry point every caller that might prompt should use.
+pub fn run_announced(plan: &Plan) -> Result<()> {
+    if plan.needs_sudo() {
+        println!("this needs an administrator password:");
+        for line in plan.lines() {
+            println!("  {line}");
+        }
+    }
+    run(plan)
+}
+
 /// Whether the machine currently trusts `ca.pem`.
 ///
 /// `None` when the question cannot be answered, which is not the same as a

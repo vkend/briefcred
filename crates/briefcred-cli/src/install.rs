@@ -151,7 +151,7 @@ pub fn install(
     // mistyped password, and failing it after the daemon is up would leave
     // the user unsure which half of the install took.
     if options.trust_ca {
-        match trust::run(&trust::trust_plan(paths)) {
+        match trust::run_announced(&trust::trust_plan(paths)) {
             Ok(()) => report.trusted = Some(true),
             Err(err) => {
                 report.trusted = Some(false);

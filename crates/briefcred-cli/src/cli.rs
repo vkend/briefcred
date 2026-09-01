@@ -113,8 +113,12 @@ fn run_ca(paths: &Paths, action: CaAction) -> Result<()> {
             // The old certificate has to be untrusted while the file still
             // holds it: `security remove-trusted-cert` matches on content,
             // and after the replacement there is nothing left to match.
-            let untrusted = if paths.ca_cert().exists() {
-                trust::run(&trust::untrust_plan(paths)).err()
+            //
+            // Only when it is actually trusted, though. Untrusting regardless
+            // would ask for an administrator password to remove something
+            // that was never added.
+            let untrusted = if trust::is_trusted(paths) == Some(true) {
+                trust::run_announced(&trust::untrust_plan(paths)).err()
             } else {
                 None
             };
@@ -123,7 +127,7 @@ fn run_ca(paths: &Paths, action: CaAction) -> Result<()> {
             print_regenerated(&result, untrusted.as_ref());
 
             if trust_ca {
-                trust::run(&trust::trust_plan(paths))?;
+                trust::run_announced(&trust::trust_plan(paths))?;
                 println!("  trusted    the new CA is in the system trust store");
             } else {
                 println!("\nthe new CA is not trusted yet; run:");
@@ -134,7 +138,7 @@ fn run_ca(paths: &Paths, action: CaAction) -> Result<()> {
             Ok(())
         }
         CaAction::Untrust => {
-            trust::run(&trust::untrust_plan(paths))?;
+            trust::run_announced(&trust::untrust_plan(paths))?;
             println!("the CA is no longer in the system trust store");
             println!(
                 "  kept       {} (run 'briefcred install --trust-ca' to trust it again)",
