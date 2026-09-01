@@ -8,10 +8,12 @@
 #![deny(unsafe_code)]
 
 pub mod audit;
+pub mod clock;
 pub mod config;
 pub mod error;
 pub mod metrics;
 pub mod server;
+pub mod unlock;
 
 use std::sync::Arc;
 use std::time::Duration;
