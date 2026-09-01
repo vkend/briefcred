@@ -26,8 +26,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "net", "signal", "sync"] }
+tokio = { workspace = true, features = ["io-util", "net", "signal", "sync"] }
 toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
