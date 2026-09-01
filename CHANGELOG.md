@@ -88,3 +88,49 @@ All notable changes to briefcred are recorded here. The format follows
 - `briefcred_core::audit`: `DaemonStart`, `DaemonStop`, and `AuthReject`
   variants. `AuditEntry::mint_id` now returns `Option<&MintId>`, because these
   rows describe the daemon rather than a minted principal.
+- `briefcred_core::keystore`: the `KeyStore` trait with two backends.
+  `KeychainKeyStore` stores a generic password in the macOS login keychain
+  under service `dev.briefcred.ca`; `FileKeyStore` writes a `0600` file,
+  created with that mode rather than chmodded afterwards, and `fsync`ed. The
+  backend is chosen in exactly one place, `ca::CaConfig::open_keystore`.
+  Asking for the keychain off macOS is an error, never a silent fallback to a
+  file.
+- `briefcred_core::ca`: the per-machine root CA. `CertificateAuthority::generate`
+  produces an ECDSA P-256 root with common name `briefcred local CA <hostname>`,
+  ten years of validity, and a critical `basicConstraints` of `CA:TRUE,
+  pathlen:0`. `save` writes the public half to `ca/ca.pem` at `0644` and hands
+  the private key to the key store; `load` treats a certificate without its key
+  as an error rather than regenerating over it. `ensure` is idempotent, so a
+  reinstall keeps the CA the machine already trusts.
+- `CertificateAuthority::issue_leaf`: 24-hour `serverAuth` leaves for a
+  hostname list, backdated five minutes against clock skew, cached in memory
+  keyed on the whole list. Neither the CA nor a leaf ever prints its private
+  key: both have hand-written `Debug` impls that redact it.
+- `briefcred_core::ca::trust_env`: `AWS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
+  `GIT_SSL_CAINFO`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, and
+  `SSL_CERT_FILE` pointing at `ca.pem`, narrowed by a profile's optional
+  `trust_env` list. An empty list opts the profile out entirely; a name
+  briefcred does not set is rejected when the profile is loaded.
+- `briefcred install --trust-ca`: generates the CA during provisioning and
+  adds it to the system trust store. macOS runs `security add-trusted-cert -d
+  -r trustRoot -k /Library/Keychains/System.keychain`; Linux installs the
+  certificate into `/usr/local/share/ca-certificates` and runs
+  `update-ca-certificates`. Like the service-manager commands, the privileged
+  step is built as a plan and executed separately, so `--dry-run` prints it and
+  the tests never run `sudo`. A failed trust step is reported without failing
+  the install.
+- `briefcred ca show | regenerate [--trust-ca] | untrust`. `show` prints the
+  subject, SHA-256 fingerprint, validity, key location, and trust state.
+  `regenerate` untrusts the old certificate before replacing it, because the
+  macOS trust store matches on content and afterwards there would be nothing
+  left to match.
+- `daemon.toml` gains `[ca] keystore = "file" | "keychain"`, defaulting to the
+  keychain on macOS and a file elsewhere.
+- `uninstall` now also retains `ca/`, so a reinstall stays trusted.
+- `docs/ca-pinning.md`: what a pinning failure looks like in each ecosystem,
+  the known offenders, how to tell pinning apart from a CA that is merely
+  untrusted, and why disabling verification is worse than the problem.
+- End-to-end proof that the CA works outside briefcred's own assumptions: a
+  `tokio-rustls` server on loopback holding an issued leaf, and the system
+  `curl --cacert ca.pem` accepting it. Skips with a printed reason where there
+  is no `curl`.

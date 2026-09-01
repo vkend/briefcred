@@ -68,11 +68,16 @@ idempotent, and it never overwrites a `daemon.toml` you have edited.
 
 ```sh
 briefcred install --dry-run   # print every file and command, change nothing
-briefcred install
+briefcred install --trust-ca  # also add the root CA to the system trust store
 briefcred daemon status
+briefcred ca show
 curl -s 127.0.0.1:9317/metrics
 briefcred uninstall
 ```
+
+`--trust-ca` is the only part of an install that needs `sudo`. Without it the
+CA is still generated and `ca.pem` still written; only the system trust store
+is left alone, and `briefcred ca show` prints the command to run later.
 
 On macOS the unit is a LaunchAgent at
 `~/Library/LaunchAgents/dev.briefcred.daemon.plist` with `RunAtLoad`,
@@ -92,8 +97,62 @@ is down, `briefcred daemon status` prints
 distinct from the generic failure code 1.
 
 `briefcred uninstall` boots the agent out and deletes the unit file. It leaves
-the audit log, profiles, and configuration in place; deleting the audit trail on
-the way out is the one thing an audit trail must not do.
+the audit log, profiles, configuration, and the CA in place; deleting the audit
+trail on the way out is the one thing an audit trail must not do, and deleting
+the CA would break the trust the machine has already granted it.
+
+## The root CA
+
+briefcred terminates TLS locally, so it needs a certificate authority this
+machine trusts. `install` generates one: ECDSA P-256, common name
+`briefcred local CA <hostname>`, ten years, and `pathlen:0` so it can sign
+leaves and never an intermediate. The certificate is `ca/ca.pem`, mode `0644`
+because every runtime that reads it does so as you. The private key never
+touches that file: it goes to the macOS login keychain as a generic password
+under service `dev.briefcred.ca`, or to `ca/ca.key` at mode `0600` elsewhere.
+
+```sh
+briefcred ca show                    # subject, fingerprint, validity, trust state
+briefcred ca regenerate --trust-ca   # replace it, and trust the replacement
+briefcred ca untrust                 # remove it from the trust store, keep the files
+```
+
+`regenerate` untrusts the old certificate before replacing it, because the
+macOS trust store matches on content and there would be nothing left to match
+afterwards. Every certificate the old CA issued stops being trusted.
+
+Leaves are issued on demand for the hostnames a subprocess is talking to, are
+valid for 24 hours, and are cached in memory per hostname list.
+
+### Choosing where the key lives
+
+| `daemon.toml` | Backend |
+| --- | --- |
+| absent | keychain on macOS, file elsewhere |
+| `[ca]`<br>`keystore = "keychain"` | macOS login keychain |
+| `[ca]`<br>`keystore = "file"` | `ca/ca.key`, mode `0600` |
+
+Asking for `keychain` off macOS is an error rather than a silent fallback to a
+file: a configuration that says "keychain" must not quietly write the key to
+disk instead.
+
+### Trust environment
+
+Not every runtime reads the system trust store, so `briefcred exec` also
+points the ones that do not at `ca.pem`:
+
+`AWS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `NODE_EXTRA_CA_CERTS`,
+`REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`.
+
+A profile may narrow that list with `trust_env:`, and an empty list opts out
+of it entirely. A name briefcred does not set is rejected when the profile is
+loaded rather than ignored, so a typo cannot leave a runtime silently
+uncovered.
+
+Clients that pin a certificate rather than checking the trust store fail
+loudly, and are out of scope. See [docs/ca-pinning.md](docs/ca-pinning.md) for
+what those failures look like and how to tell pinning apart from a CA that is
+simply not trusted yet.
 
 ## The daemon
 
@@ -119,6 +178,7 @@ the socket file, and writes a `daemon_stop` row.
 | `retention_days` | `90` | Audit logs older than this are deleted |
 | `metrics_port` | `9317` | Loopback port for `/metrics`; `0` asks for a free one |
 | `metrics_enabled` | `true` | Whether to serve `/metrics` at all |
+| `ca.keystore` | platform default | `"keychain"` or `"file"`; where the CA key lives |
 
 An unknown key is an error rather than a silent no-op, so a typo cannot switch
 a control off.
@@ -174,6 +234,9 @@ credentials:
 exec:
   allow_argv0: [psql]
   allow_args: ['^-c$', '^SELECT ']
+trust_env:                 # optional; absent means all six
+  - SSL_CERT_FILE
+  - REQUESTS_CA_BUNDLE
 env:
   PGUSER: ${minted.db.PGUSER}
   PGPASSWORD: ${minted.db.PGPASSWORD}
@@ -183,7 +246,8 @@ env:
 Unknown keys are errors at every level, so a typo cannot silently switch a
 control off. `${minted.<credential>.<field>}` must name a credential the
 profile declares; `${config.<key>}` is resolved at exec time. Every regex in
-`exec.allow_args` is compiled at load.
+`exec.allow_args` is compiled at load, and every `trust_env` name is checked
+against the six briefcred sets.
 
 The master credential is never written in a profile. `user` names the master
 role; its password comes from a `MasterSource`, which is the Keychain from

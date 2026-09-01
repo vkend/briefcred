@@ -35,6 +35,11 @@ pub const STARTER_CONFIG: &str = "\
 
 # Whether to serve the Prometheus endpoint at all.
 # metrics_enabled = true
+
+# Where the root CA's private key is kept: \"keychain\" or \"file\". The
+# default is the keychain on macOS and a file elsewhere.
+# [ca]
+# keystore = \"keychain\"
 ";
 
 /// How long `install` waits for the started daemon to start listening.

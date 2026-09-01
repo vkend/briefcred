@@ -9,7 +9,7 @@ weakens a guarantee has to say so out loud before it ships.
 | --- | --- | --- |
 | Master credentials | macOS Keychain; Linux kernel keyring or an encrypted file | Long-lived, broadly scoped. The whole point of the product is that these never leave the daemon. |
 | Minted credentials | Daemon memory, and for Model C the subprocess environment | Short-lived and narrowly scoped, but real. |
-| Root CA private key | Keychain / keyring, generated per machine | Signs certificates the machine's TLS clients trust. Compromise means transparent interception of every proxied connection. |
+| Root CA private key | macOS login keychain (`dev.briefcred.ca`), or `ca/ca.key` at 0600 | Signs certificates the machine's TLS clients trust. Compromise means transparent interception of every proxied connection. |
 | Audit log | `.../briefcred/audit/*.jsonl` | Tampering hides an incident; reading it reveals what ran and when. |
 | Profiles | `.../briefcred/profiles/*.yaml` | Write access is privilege escalation: a profile decides what gets minted and what may run. |
 | Policy (Cedar, Phase 5) | `.../briefcred` | Same as profiles. |
@@ -75,6 +75,39 @@ that briefcred does not control and does not zero. Closing this needs an
 upstream change or a hand-rolled startup packet, and is tracked for Phase 3
 when the persistent helper connection replaces per-call connects.
 
+**Phase 2: the CA.** Generating a root CA and asking the machine to trust it
+is the single largest privilege briefcred takes. What bounds it:
+
+- `pathlen:0`. The CA can sign leaves and nothing else. Whoever holds the key
+  cannot mint an intermediate and hand signing authority to someone else, so a
+  stolen key is a machine-scoped problem rather than a transferable one.
+- The key never leaves the machine and is never written to `ca.pem`. On macOS
+  it is a login-keychain item gated by the login session; elsewhere it is a
+  `0600` file inside a `0700` directory. Nothing prints it: both
+  `CertificateAuthority` and `Leaf` have hand-written `Debug` impls that
+  redact the key, and the key store's own `Debug` prints its location only.
+- Leaves live 24 hours and are per hostname, so a leaked one is narrow and
+  short.
+- Trust is scoped to one certificate, added with an explicit `--trust-ca` and
+  removable with `briefcred ca untrust`. `briefcred ca show` prints the
+  fingerprint so the user can check what they trusted against what is
+  installed.
+- The trust step is the only thing briefcred runs under `sudo`. It is built as
+  a plan and executed separately, so it can be printed before it is run, and
+  no test can invoke it.
+
+Residual risk, stated plainly: anyone who can read the user's login keychain,
+which includes root and anyone with the login password, can take the CA key
+and issue certificates every TLS client on that machine will accept. The trust
+store entry also outlives an uninstall by design, because `uninstall` keeps
+`ca/` so a reinstall stays trusted; a user who wants the trust gone must run
+`briefcred ca untrust`.
+
+Regenerating is destructive on purpose. `briefcred ca regenerate` untrusts the
+old certificate first, because the macOS trust store matches on content and
+after the replacement there would be nothing left to match, leaving a stale
+trust entry for a key nobody holds.
+
 **Phase 3: Model C exposure.** This is the weakest point in the plan and it is
 deliberate. `briefcred exec` hands the subprocess a minted role through
 `PGUSER` / `PGPASSWORD` / `DATABASE_URL`. Consequences:
@@ -127,6 +160,11 @@ the audit log.
 
 - A local process running as the same user is inside every boundary. briefcred
   raises the cost of exfiltration and shortens the window; it is not a sandbox.
-- Certificate-pinning clients cannot be proxied and will fail.
+- Certificate-pinning clients cannot be proxied and will fail. That failure is
+  documented in `docs/ca-pinning.md`, and briefcred never works around it by
+  disabling a client's verification.
+- Trusting the CA is machine-wide. Every process running as any user on the
+  machine, not only briefcred's subprocesses, will accept a certificate this
+  CA issued.
 - Revoke against an eventually consistent backend, such as AWS STS, cannot be
   immediate. The outcome type says so rather than pretending otherwise.

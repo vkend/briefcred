@@ -78,6 +78,8 @@ are the two things every other crate has to agree on.
 | `traits` | `MasterSource` and `Minter`. |
 | `audit` | `AuditEntry` and argument hashing. |
 | `minters` | Concrete minters. Phase 0 ships `postgres`. |
+| `keystore` | The `KeyStore` trait, the macOS keychain backend, and the file backend. |
+| `ca` | The root CA, leaf issuance, and the runtime trust environment. |
 
 ## Data flow: one `briefcred exec`
 
@@ -134,7 +136,7 @@ macOS:
   sock            daemon Unix socket, mode 0600
   profiles/       *.yaml work envelopes
   audit/          append-only JSONL, daily rotation
-  ca/             per-machine root CA material
+  ca/             ca.pem (0644) and, on the file backend, ca.key (0600)
   logs/           daemon stdout and stderr, written by the service manager
   state/          daemon state that survives a restart
   daemon.toml     daemon configuration
@@ -161,3 +163,38 @@ whole layout, including the socket; tests always set it.
 4. Policy is typed and compiled, never string-interpolated.
 5. A failed revoke always carries a non-empty detail. A row with
    `outcome=failed` and no detail is a bug.
+6. The CA private key is never written to `ca.pem` and never reaches a `Debug`
+   output. `ca.pem` holds the public half alone.
+7. Anything that needs `sudo` is built as a plan and executed separately, so
+   `--dry-run` can print it and no test can ever run it.
+
+## The root CA
+
+`briefcred install` generates a per-machine root CA: ECDSA P-256, common name
+`briefcred local CA <hostname>`, ten years, `pathlen:0`. The constraint is the
+point — the CA signs leaves and can never issue an intermediate that signs on
+its behalf, so a stolen key cannot delegate onward.
+
+The certificate goes to `ca/ca.pem`. The private key goes to a `KeyStore`:
+
+| Platform | Backend | Where |
+| --- | --- | --- |
+| macOS | `KeychainKeyStore` | login keychain, generic password, service `dev.briefcred.ca` |
+| Linux and fallback | `FileKeyStore` | `ca/ca.key`, mode `0600` |
+
+The choice is made in exactly one place, `ca::CaConfig::open_keystore`, which
+reads the `[ca] keystore` key out of `daemon.toml` and otherwise takes the
+platform default. Everything downstream takes a `&dyn KeyStore` and does not
+know which backend it got, which is what lets the tests run the real code
+against a temporary directory instead of the developer's keychain.
+
+Leaves are issued on demand for a hostname list, live 24 hours, carry
+`serverAuth` and `CA:FALSE`, and are backdated five minutes against clock
+skew. They are cached in memory keyed on the whole hostname list, so a leaf
+issued for one host is never handed out for another.
+
+Trust has two halves, because one is not enough. The system trust store covers
+anything that reads it: `security add-trusted-cert` on macOS,
+`/usr/local/share/ca-certificates` plus `update-ca-certificates` on Linux. The
+six trust environment variables cover the runtimes that do not. A client that
+pins past both fails loudly and is out of scope; see `docs/ca-pinning.md`.
