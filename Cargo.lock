@@ -245,11 +245,15 @@ version = "0.1.0"
 dependencies = [
  "briefcred-core",
  "getrandom 0.3.4",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
  "serde_yaml",
  "tempfile",
  "time",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "zeroize",
 ]
 
