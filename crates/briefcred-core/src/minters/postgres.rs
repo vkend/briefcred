@@ -281,36 +281,73 @@ impl Minter for PostgresDynamicMinter {
             Err(e) => return RevokeOutcome::failed(describe(&e)),
         }
 
-        // Symmetric REVOKE loop first: on a managed cluster the master cannot
-        // see, and therefore cannot drop, privileges through DROP OWNED BY.
-        for grant in &template.grants {
-            if let Err(e) = client.batch_execute(&revoke_sql(grant, &ctx.mint_id)).await {
-                return RevokeOutcome::failed(describe(&e));
+        let mut owned_error: Option<String> = None;
+        for step in revoke_plan(&ctx.mint_id, &template) {
+            let result = client.batch_execute(step.sql()).await;
+            match (step, result) {
+                (_, Ok(())) => {}
+                // Best effort: DROP OWNED BY clears objects the role created
+                // so DROP ROLE can succeed. If it fails and DROP ROLE then
+                // succeeds, the role owned nothing and the error did not
+                // matter, so it is kept only in case DROP ROLE also fails.
+                (RevokeStep::DropOwned(_), Err(e)) => owned_error = Some(describe(&e)),
+                (RevokeStep::DropRole(_), Err(e)) => {
+                    let detail = match owned_error {
+                        Some(owned) => format!(
+                            "DROP ROLE failed: {}; DROP OWNED BY failed: {owned}",
+                            describe(&e)
+                        ),
+                        None => format!("DROP ROLE failed: {}", describe(&e)),
+                    };
+                    return RevokeOutcome::failed(detail);
+                }
+                (RevokeStep::Revoke(sql), Err(e)) => {
+                    return RevokeOutcome::failed(format!("`{sql}` failed: {}", describe(&e)));
+                }
             }
-        }
-
-        // Best effort: clears objects the role created so DROP ROLE can
-        // succeed. If it fails but DROP ROLE then succeeds, the role owned
-        // nothing and the error was not load-bearing.
-        let owned_error = client
-            .batch_execute(&drop_owned_sql(&ctx.mint_id))
-            .await
-            .err()
-            .map(|e| describe(&e));
-
-        if let Err(e) = client.batch_execute(&drop_role_sql(&ctx.mint_id)).await {
-            let detail = match owned_error {
-                Some(owned) => format!(
-                    "DROP ROLE failed: {}; DROP OWNED BY failed: {owned}",
-                    describe(&e)
-                ),
-                None => format!("DROP ROLE failed: {}", describe(&e)),
-            };
-            return RevokeOutcome::failed(detail);
         }
 
         RevokeOutcome::Revoked
     }
+}
+
+/// One statement in a revoke, in the order it must be issued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RevokeStep {
+    /// Undo one template grant.
+    Revoke(String),
+    /// Drop objects the role owns.
+    DropOwned(String),
+    /// Remove the role itself.
+    DropRole(String),
+}
+
+impl RevokeStep {
+    fn sql(&self) -> &str {
+        match self {
+            RevokeStep::Revoke(sql) | RevokeStep::DropOwned(sql) | RevokeStep::DropRole(sql) => sql,
+        }
+    }
+}
+
+/// The statements a revoke issues, in order.
+///
+/// The ordering is the whole point and is asserted in the tests below: every
+/// `REVOKE` runs **before** `DROP OWNED BY`. `DROP OWNED BY` only removes
+/// privileges the current role is entitled to revoke, so on a cluster where
+/// the master does not own the objects it silently leaves grants in place and
+/// `DROP ROLE` then fails. PostgreSQL 18 additionally made `DROP OWNED BY`
+/// delete `pg_auth_members` rows, which would strip the master's membership of
+/// the minted role and make a later `REVOKE` fail outright.
+fn revoke_plan(mint_id: &MintId, template: &RoleTemplate) -> Vec<RevokeStep> {
+    let mut plan: Vec<RevokeStep> = template
+        .grants
+        .iter()
+        .map(|grant| RevokeStep::Revoke(revoke_sql(grant, mint_id)))
+        .collect();
+    plan.push(RevokeStep::DropOwned(drop_owned_sql(mint_id)));
+    plan.push(RevokeStep::DropRole(drop_role_sql(mint_id)));
+    plan
 }
 
 /// `CREATE ROLE ... LOGIN PASSWORD ... VALID UNTIL ...`.
@@ -572,6 +609,55 @@ role_template:
         assert_eq!(
             grant_membership_sql(&mint_id()),
             "GRANT \"briefcred_t_0123456789ab\" TO CURRENT_USER"
+        );
+    }
+
+    #[test]
+    fn every_revoke_precedes_drop_owned_by_and_drop_role() {
+        let template = RoleTemplate {
+            grants: vec![
+                grant(),
+                Grant {
+                    privileges: vec!["USAGE".into()],
+                    on: "SCHEMA public".into(),
+                },
+            ],
+        };
+        let plan = revoke_plan(&mint_id(), &template);
+        assert_eq!(
+            plan,
+            vec![
+                RevokeStep::Revoke(revoke_sql(&template.grants[0], &mint_id())),
+                RevokeStep::Revoke(revoke_sql(&template.grants[1], &mint_id())),
+                RevokeStep::DropOwned(drop_owned_sql(&mint_id())),
+                RevokeStep::DropRole(drop_role_sql(&mint_id())),
+            ]
+        );
+
+        let last_revoke = plan
+            .iter()
+            .rposition(|s| matches!(s, RevokeStep::Revoke(_)))
+            .expect("the plan revokes the template grants");
+        let drop_owned = plan
+            .iter()
+            .position(|s| matches!(s, RevokeStep::DropOwned(_)))
+            .expect("the plan drops owned objects");
+        assert!(
+            last_revoke < drop_owned,
+            "DROP OWNED BY must never run before the REVOKE loop"
+        );
+        assert!(matches!(plan.last(), Some(RevokeStep::DropRole(_))));
+    }
+
+    #[test]
+    fn a_template_with_no_grants_still_drops_the_role() {
+        let plan = revoke_plan(&mint_id(), &RoleTemplate { grants: vec![] });
+        assert_eq!(
+            plan,
+            vec![
+                RevokeStep::DropOwned(drop_owned_sql(&mint_id())),
+                RevokeStep::DropRole(drop_role_sql(&mint_id())),
+            ]
         );
     }
 
