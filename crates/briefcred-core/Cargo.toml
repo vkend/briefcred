@@ -1,0 +1,31 @@
+[package]
+name = "briefcred-core"
+description = "Core types, profile schema, and credential minters for briefcred."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+postgres-protocol.workspace = true
+regex.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
