@@ -104,6 +104,50 @@ pub enum AuditEntry {
         /// What asked it to stop: `sigterm`, `sigint`, or `request`.
         reason: String,
     },
+    /// A profile directory failed to load; the previous set is still in force.
+    ProfileLoadError {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The complaint, naming the offending file. Never file contents.
+        message: String,
+    },
+    /// A session was opened after a successful unlock.
+    SessionOpen {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The session handle, so open and close can be correlated.
+        session_id: String,
+        /// The profile it was opened for.
+        profile: String,
+        /// How many credentials the profile declares.
+        credentials: usize,
+    },
+    /// A session ended, by request, by idle eviction, or at shutdown.
+    SessionClose {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The session handle.
+        session_id: String,
+        /// The profile it belonged to.
+        profile: String,
+        /// One of `request`, `idle`, or `shutdown`.
+        reason: String,
+    },
+    /// An unlock was refused, so nothing was opened and no master was read.
+    UnlockDenied {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The profile that was being opened.
+        profile: String,
+        /// The policy that was asked for: `biometric`, `passcode`, or `none`.
+        policy: String,
+        /// One of `cancelled`, `failed`, `no_aqua_session`, `unsupported`.
+        reason: String,
+    },
     /// A connection was refused because the peer is not the owning user.
     ///
     /// The socket lives in a `0700` directory at mode `0600`, so this row is
@@ -151,7 +195,11 @@ impl AuditEntry {
             | AuditEntry::Revoke { mint_id, .. } => Some(mint_id),
             AuditEntry::DaemonStart { .. }
             | AuditEntry::DaemonStop { .. }
-            | AuditEntry::AuthReject { .. } => None,
+            | AuditEntry::AuthReject { .. }
+            | AuditEntry::ProfileLoadError { .. }
+            | AuditEntry::SessionOpen { .. }
+            | AuditEntry::SessionClose { .. }
+            | AuditEntry::UnlockDenied { .. } => None,
         }
     }
 }

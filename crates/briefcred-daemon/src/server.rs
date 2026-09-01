@@ -6,23 +6,47 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use briefcred_core::audit::AuditEntry;
-use briefcred_proto::{read_frame, write_frame, Request, Response};
+use briefcred_core::MasterSource;
+use briefcred_proto::{
+    read_frame, write_frame, CredentialSummary, ProfileSummary, Request, Response,
+};
 use time::OffsetDateTime;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::audit::AuditLog;
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
+use crate::profiles::ProfileStore;
+use crate::session::{SessionError, SessionStore};
+use crate::unlock::{UnlockCache, UnlockGate};
 
 /// How long in-flight connections get to finish once shutdown begins.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A handler's answer, boxed so the table can hold handlers of different shapes.
+pub type BoxFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>;
+
 /// One request handler.
 ///
-/// Handlers are synchronous because every Phase 1 request is a memory read or
-/// a single appended audit row. When a handler needs to do real work, this
-/// becomes a boxed future and the table keeps its shape.
-pub type Handler = fn(&State) -> Response;
+/// Handlers take the deserialised [`Request`] because a request now carries a
+/// payload — a profile name, a session id — and they are async because opening
+/// a session prompts the user and reads a keychain. They take `Arc<State>`
+/// rather than a reference so the returned future owns everything it needs.
+pub type Handler = fn(Request, Arc<State>) -> BoxFuture;
+
+/// Wrap an `async fn(Request, Arc<State>) -> Response` as a [`Handler`].
+///
+/// A macro rather than a closure because a [`Handler`] is a plain function
+/// pointer, and a closure that captures nothing still cannot be named as one
+/// without this shim.
+macro_rules! handler {
+    ($name:ident) => {{
+        fn wrapper(request: Request, state: Arc<State>) -> BoxFuture {
+            Box::pin($name(request, state))
+        }
+        wrapper as Handler
+    }};
+}
 
 /// Everything a handler needs, shared across every connection.
 #[derive(Debug)]
@@ -33,15 +57,26 @@ pub struct State {
     metrics_addr: Option<String>,
     shutdown: tokio::sync::watch::Sender<bool>,
     shutdown_reason: Mutex<&'static str>,
+    profiles: Arc<ProfileStore>,
+    sessions: Arc<SessionStore>,
+    unlock: Arc<dyn UnlockGate>,
+    unlock_cache: UnlockCache,
+    master_source: Arc<dyn MasterSource>,
 }
 
 impl State {
     /// Assemble the shared state. Takes ownership of the audit log.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         audit: AuditLog,
         metrics: Arc<Metrics>,
         metrics_addr: Option<String>,
         shutdown: tokio::sync::watch::Sender<bool>,
+        profiles: Arc<ProfileStore>,
+        sessions: Arc<SessionStore>,
+        unlock: Arc<dyn UnlockGate>,
+        unlock_cache: UnlockCache,
+        master_source: Arc<dyn MasterSource>,
     ) -> State {
         State {
             started_at: OffsetDateTime::now_utc(),
@@ -50,12 +85,32 @@ impl State {
             metrics_addr,
             shutdown,
             shutdown_reason: Mutex::new("unknown"),
+            profiles,
+            sessions,
+            unlock,
+            unlock_cache,
+            master_source,
         }
     }
 
     /// The metrics registry, for the endpoint and for request counting.
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
+    }
+
+    /// The loaded profiles.
+    pub fn profiles(&self) -> &Arc<ProfileStore> {
+        &self.profiles
+    }
+
+    /// The open sessions.
+    pub fn sessions(&self) -> &Arc<SessionStore> {
+        &self.sessions
+    }
+
+    /// The per-profile unlock cache, so a reload can invalidate it.
+    pub fn unlock_cache(&self) -> &UnlockCache {
+        &self.unlock_cache
     }
 
     /// Append an audit row, counting rather than propagating a failure.
@@ -142,17 +197,21 @@ pub async fn shutdown_requested(watcher: &mut tokio::sync::watch::Receiver<bool>
 /// function, and so [`dispatch_table`] can be asserted to cover the protocol.
 pub fn dispatch_table() -> HashMap<&'static str, Handler> {
     let mut table: HashMap<&'static str, Handler> = HashMap::new();
-    table.insert("ping", handle_ping);
-    table.insert("status", handle_status);
-    table.insert("shutdown", handle_shutdown);
+    table.insert("ping", handler!(handle_ping));
+    table.insert("status", handler!(handle_status));
+    table.insert("shutdown", handler!(handle_shutdown));
+    table.insert("list_profiles", handler!(handle_list_profiles));
+    table.insert("show_profile", handler!(handle_show_profile));
+    table.insert("open_session", handler!(handle_open_session));
+    table.insert("close_session", handler!(handle_close_session));
     table
 }
 
-fn handle_ping(_state: &State) -> Response {
+async fn handle_ping(_request: Request, _state: Arc<State>) -> Response {
     Response::Pong
 }
 
-fn handle_status(state: &State) -> Response {
+async fn handle_status(_request: Request, state: Arc<State>) -> Response {
     Response::Status {
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
@@ -163,9 +222,149 @@ fn handle_status(state: &State) -> Response {
     }
 }
 
-fn handle_shutdown(state: &State) -> Response {
+async fn handle_shutdown(_request: Request, state: Arc<State>) -> Response {
     state.request_shutdown("request");
     Response::ShuttingDown
+}
+
+async fn handle_list_profiles(_request: Request, state: Arc<State>) -> Response {
+    Response::Profiles {
+        profiles: state.profiles.list().await.iter().map(summarise).collect(),
+    }
+}
+
+async fn handle_show_profile(request: Request, state: Arc<State>) -> Response {
+    let Request::ShowProfile { name } = request else {
+        return mismatched(&request);
+    };
+    match state.profiles.get(&name).await {
+        Some(profile) => Response::Profile {
+            profile: summarise(&profile),
+        },
+        None => Response::Error {
+            message: SessionError::NoSuchProfile(name).to_string(),
+        },
+    }
+}
+
+/// Prove presence, then fetch the masters the profile needs.
+///
+/// The order matters and is the whole point: nothing reaches a keychain until
+/// the unlock gate has said yes, so a refused prompt leaves no master in the
+/// daemon's memory at all.
+async fn handle_open_session(request: Request, state: Arc<State>) -> Response {
+    let Request::OpenSession { profile: name } = request else {
+        return mismatched(&request);
+    };
+    let Some(profile) = state.profiles.get(&name).await else {
+        return Response::Error {
+            message: SessionError::NoSuchProfile(name).to_string(),
+        };
+    };
+
+    let window = profile.unlock.cache_for();
+    if !state.unlock_cache.is_fresh(&name, window).await {
+        let reason = format!("briefcred: unlock the `{name}` profile");
+        if let Err(err) = state.unlock.unlock(profile.unlock.policy, &reason).await {
+            state.audit(&AuditEntry::UnlockDenied {
+                ts: OffsetDateTime::now_utc(),
+                profile: name,
+                policy: policy_name(profile.unlock.policy).to_string(),
+                reason: err.reason().to_string(),
+            });
+            return Response::Locked {
+                reason: err.reason().to_string(),
+                message: err.to_string(),
+            };
+        }
+        state.unlock_cache.record(&name).await;
+    }
+
+    match state
+        .sessions
+        .open(&profile, state.master_source.as_ref())
+        .await
+    {
+        Ok((session_id, expires_at)) => {
+            state.audit(&AuditEntry::SessionOpen {
+                ts: OffsetDateTime::now_utc(),
+                session_id: session_id.clone(),
+                profile: name,
+                credentials: profile.credentials.len(),
+            });
+            Response::SessionOpened {
+                session_id,
+                expires_at,
+            }
+        }
+        Err(err) => Response::Error {
+            message: err.to_string(),
+        },
+    }
+}
+
+async fn handle_close_session(request: Request, state: Arc<State>) -> Response {
+    let Request::CloseSession { session_id } = request else {
+        return mismatched(&request);
+    };
+    match state.sessions.close(&session_id).await {
+        Ok(profile) => {
+            state.audit(&AuditEntry::SessionClose {
+                ts: OffsetDateTime::now_utc(),
+                session_id: session_id.clone(),
+                profile,
+                reason: "request".to_string(),
+            });
+            Response::SessionClosed { session_id }
+        }
+        Err(err) => Response::Error {
+            message: err.to_string(),
+        },
+    }
+}
+
+/// Reduce a loaded profile to the shape a client is allowed to see.
+fn summarise(profile: &briefcred_core::Profile) -> ProfileSummary {
+    ProfileSummary {
+        name: profile.name.clone(),
+        description: profile.description.clone(),
+        unlock_policy: policy_name(profile.unlock.policy).to_string(),
+        unlock_cache_secs: profile.unlock.cache_secs,
+        credentials: profile
+            .credentials
+            .iter()
+            .map(|spec| CredentialSummary {
+                name: spec.name.clone(),
+                kind: spec.kind.clone(),
+                ttl_secs: spec.ttl_secs,
+                source_key: spec.source_key().to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// The wire name of an unlock policy, matching the profile schema's spelling.
+fn policy_name(policy: briefcred_core::profile::UnlockPolicy) -> &'static str {
+    use briefcred_core::profile::UnlockPolicy;
+    match policy {
+        UnlockPolicy::Biometric => "biometric",
+        UnlockPolicy::Passcode => "passcode",
+        UnlockPolicy::None => "none",
+    }
+}
+
+/// A handler was reached by a request of another kind.
+///
+/// Unreachable while [`dispatch_table`] is keyed on [`Request::name`], and kept
+/// as an error rather than a panic so a future table edit is a bad reply rather
+/// than a dead daemon.
+fn mismatched(request: &Request) -> Response {
+    Response::Error {
+        message: format!(
+            "internal error: `{}` reached the wrong handler",
+            request.name()
+        ),
+    }
 }
 
 /// Bind the listener, clearing a socket a dead daemon left behind.
@@ -291,8 +490,12 @@ async fn serve_connection(
 
         let name = request.name();
         state.metrics().record_request(name);
+        // The table is asserted to cover `Request::NAMES`, so the `None` arm
+        // is unreachable in a build whose tests pass. It stays because a
+        // daemon that answers "I do not know that request" is better than one
+        // that panics a connection task.
         let response = match table.get(name) {
-            Some(handler) => handler(&state),
+            Some(handler) => handler(request, Arc::clone(&state)).await,
             None => Response::Error {
                 message: format!("no handler for request `{name}`"),
             },

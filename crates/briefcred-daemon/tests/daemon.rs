@@ -22,8 +22,17 @@ struct Daemon {
 
 impl Daemon {
     fn start(config: &str) -> Daemon {
+        Daemon::start_with(config, |_| {})
+    }
+
+    /// Start a daemon whose home has been populated first.
+    ///
+    /// Profiles and master secrets have to exist before the process starts, or
+    /// the test is racing the daemon's own startup load.
+    fn start_with(config: &str, populate: impl FnOnce(&Path)) -> Daemon {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("daemon.toml"), config).unwrap();
+        populate(home.path());
         let child = Command::new(env!("CARGO_BIN_EXE_briefcred-daemon"))
             .env("BRIEFCRED_HOME", home.path())
             .stdout(Stdio::null())
@@ -361,4 +370,333 @@ async fn a_connection_racing_the_signal_does_not_hold_the_drain_open() {
             "attempt {attempt} took {elapsed:?}, the whole drain timeout"
         );
     }
+}
+
+/// A profile that needs no prompt and one master the file source can serve.
+const UNATTENDED_PROFILE: &str = "\
+name: dev
+description: unattended development profile
+unlock:
+  policy: none
+credentials:
+  - name: db
+    kind: postgres-dynamic
+    ttl_secs: 300
+    source_key: app-db
+    config:
+      host: 127.0.0.1
+      dbname: app
+      user: master
+      sslmode: disable
+      role_template: {}
+";
+
+/// Write a `0600` master file the way `briefcred master set` will.
+fn write_master(home: &Path, key: &str, value: &str) {
+    let dir = home.join("secrets");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(key);
+    std::fs::write(&path, value).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn write_profile(home: &Path, file: &str, yaml: &str) {
+    let dir = home.join("profiles");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(file), yaml).unwrap();
+}
+
+#[tokio::test]
+async fn the_daemon_lists_a_profile_opens_a_session_and_closes_it() {
+    let mut daemon = Daemon::start_with(
+        "metrics_enabled = false\nmaster_source = \"file\"\n",
+        |home| {
+            write_profile(home, "dev.yaml", UNATTENDED_PROFILE);
+            write_master(home, "app-db", "the-master-password\n");
+        },
+    );
+    let mut stream = daemon.connect().await;
+
+    let Response::Profiles { profiles } = call(&mut stream, Request::ListProfiles).await else {
+        panic!("expected a profile list");
+    };
+    assert_eq!(profiles.len(), 1, "{profiles:?}");
+    assert_eq!(profiles[0].name, "dev");
+    assert_eq!(profiles[0].unlock_policy, "none");
+    assert_eq!(profiles[0].credentials[0].source_key, "app-db");
+
+    let Response::Profile { profile } =
+        call(&mut stream, Request::ShowProfile { name: "dev".into() }).await
+    else {
+        panic!("expected one profile");
+    };
+    assert_eq!(profile.credentials[0].ttl_secs, 300);
+
+    let Response::SessionOpened { session_id, .. } = call(
+        &mut stream,
+        Request::OpenSession {
+            profile: "dev".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected a session");
+    };
+
+    assert_eq!(
+        call(
+            &mut stream,
+            Request::CloseSession {
+                session_id: session_id.clone(),
+            },
+        )
+        .await,
+        Response::SessionClosed {
+            session_id: session_id.clone()
+        }
+    );
+
+    // Closing twice must say so rather than silently succeed.
+    let Response::Error { message } = call(
+        &mut stream,
+        Request::CloseSession {
+            session_id: session_id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected an error for an already-closed session");
+    };
+    assert!(message.contains("no open session"), "{message}");
+
+    assert_eq!(
+        call(&mut stream, Request::Shutdown).await,
+        Response::ShuttingDown
+    );
+    assert!(daemon.wait());
+
+    let rows = audit_rows(&daemon.audit_dir());
+    let opened = rows.iter().any(|r| {
+        matches!(r, AuditEntry::SessionOpen { session_id: id, profile, credentials, .. }
+            if *id == session_id && profile == "dev" && *credentials == 1)
+    });
+    let closed = rows.iter().any(|r| {
+        matches!(r, AuditEntry::SessionClose { session_id: id, reason, .. }
+            if *id == session_id && reason == "request")
+    });
+    assert!(opened, "no SessionOpen row in {rows:#?}");
+    assert!(closed, "no SessionClose row in {rows:#?}");
+
+    // The master must never appear in the audit log, in any row.
+    let raw = std::fs::read_dir(daemon.audit_dir())
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect::<String>();
+    assert!(!raw.contains("the-master-password"), "{raw}");
+}
+
+#[tokio::test]
+async fn opening_a_session_for_an_unknown_profile_says_which_one() {
+    let mut daemon = Daemon::start("metrics_enabled = false\nmaster_source = \"file\"\n");
+    let mut stream = daemon.connect().await;
+
+    let Response::Error { message } = call(
+        &mut stream,
+        Request::OpenSession {
+            profile: "absent".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected an error");
+    };
+    assert!(message.contains("absent"), "{message}");
+
+    call(&mut stream, Request::Shutdown).await;
+    assert!(daemon.wait());
+}
+
+#[tokio::test]
+async fn a_missing_master_fails_the_open_and_names_where_it_looked() {
+    let mut daemon = Daemon::start_with(
+        "metrics_enabled = false\nmaster_source = \"file\"\n",
+        |home| write_profile(home, "dev.yaml", UNATTENDED_PROFILE),
+    );
+    let mut stream = daemon.connect().await;
+
+    let Response::Error { message } = call(
+        &mut stream,
+        Request::OpenSession {
+            profile: "dev".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected an error");
+    };
+    assert!(message.contains("app-db"), "{message}");
+    assert!(message.contains("secrets"), "{message}");
+
+    call(&mut stream, Request::Shutdown).await;
+    assert!(daemon.wait());
+}
+
+#[tokio::test]
+async fn a_profile_written_while_the_daemon_runs_is_picked_up() {
+    let mut daemon = Daemon::start("metrics_enabled = false\nmaster_source = \"file\"\n");
+    let mut stream = daemon.connect().await;
+
+    let Response::Profiles { profiles } = call(&mut stream, Request::ListProfiles).await else {
+        panic!("expected a profile list");
+    };
+    assert!(profiles.is_empty(), "{profiles:?}");
+
+    write_profile(daemon.home.path(), "late.yaml", "name: late\n");
+
+    let mut seen = false;
+    for _ in 0..200 {
+        if let Response::Profiles { profiles } = call(&mut stream, Request::ListProfiles).await {
+            if profiles.iter().any(|p| p.name == "late") {
+                seen = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(seen, "the watcher never picked up the new profile");
+
+    call(&mut stream, Request::Shutdown).await;
+    assert!(daemon.wait());
+}
+
+#[tokio::test]
+async fn a_broken_profile_is_audited_and_the_good_ones_survive() {
+    let mut daemon = Daemon::start_with(
+        "metrics_enabled = false\nmaster_source = \"file\"\n",
+        |home| write_profile(home, "dev.yaml", UNATTENDED_PROFILE),
+    );
+    let mut stream = daemon.connect().await;
+
+    write_profile(
+        daemon.home.path(),
+        "broken.yaml",
+        "name: broken\nbogus: 1\n",
+    );
+
+    let mut audited = false;
+    for _ in 0..200 {
+        // Keep the connection working while the reload happens: a broken file
+        // must not disturb service at all.
+        assert_eq!(call(&mut stream, Request::Ping).await, Response::Pong);
+        if daemon.audit_dir().exists()
+            && audit_rows(&daemon.audit_dir())
+                .iter()
+                .any(|r| matches!(r, AuditEntry::ProfileLoadError { .. }))
+        {
+            audited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(audited, "the broken file was never audited");
+
+    let Response::Profiles { profiles } = call(&mut stream, Request::ListProfiles).await else {
+        panic!("expected a profile list");
+    };
+    assert_eq!(profiles.len(), 1, "the good profile must survive");
+    assert_eq!(profiles[0].name, "dev");
+
+    call(&mut stream, Request::Shutdown).await;
+    assert!(daemon.wait());
+}
+
+#[tokio::test]
+async fn a_session_still_open_at_shutdown_is_closed_and_audited() {
+    let mut daemon = Daemon::start_with(
+        "metrics_enabled = false\nmaster_source = \"file\"\n",
+        |home| {
+            write_profile(home, "dev.yaml", UNATTENDED_PROFILE);
+            write_master(home, "app-db", "the-master-password");
+        },
+    );
+    let mut stream = daemon.connect().await;
+
+    let Response::SessionOpened { session_id, .. } = call(
+        &mut stream,
+        Request::OpenSession {
+            profile: "dev".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected a session");
+    };
+
+    call(&mut stream, Request::Shutdown).await;
+    assert!(daemon.wait());
+
+    let rows = audit_rows(&daemon.audit_dir());
+    assert!(
+        rows.iter().any(|r| matches!(
+            r,
+            AuditEntry::SessionClose { session_id: id, reason, .. }
+                if *id == session_id && reason == "shutdown"
+        )),
+        "no shutdown SessionClose row in {rows:#?}"
+    );
+}
+
+#[tokio::test]
+async fn an_idle_session_is_evicted_and_audited() {
+    // One second idle plus the 30-second sweep is the shortest this can be
+    // driven through the real binary; the exact boundary is unit-tested with
+    // a stopped clock in `session::tests`.
+    let mut daemon = Daemon::start_with(
+        "metrics_enabled = false\nmaster_source = \"file\"\nsession_idle_secs = 1\n",
+        |home| {
+            write_profile(home, "dev.yaml", UNATTENDED_PROFILE);
+            write_master(home, "app-db", "the-master-password");
+        },
+    );
+    let mut stream = daemon.connect().await;
+
+    let Response::SessionOpened { session_id, .. } = call(
+        &mut stream,
+        Request::OpenSession {
+            profile: "dev".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected a session");
+    };
+
+    let mut evicted = false;
+    for _ in 0..900 {
+        if audit_rows(&daemon.audit_dir()).iter().any(|r| {
+            matches!(r, AuditEntry::SessionClose { session_id: id, reason, .. }
+                if *id == session_id && reason == "idle")
+        }) {
+            evicted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(evicted, "the idle session was never evicted");
+
+    // And the handle is genuinely gone, not merely audited as gone.
+    let Response::Error { message } = call(
+        &mut stream,
+        Request::CloseSession {
+            session_id: session_id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected the evicted session to be unknown");
+    };
+    assert!(message.contains("no open session"), "{message}");
+
+    call(&mut stream, Request::Shutdown).await;
+    assert!(daemon.wait());
 }

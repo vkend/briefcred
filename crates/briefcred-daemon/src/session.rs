@@ -243,6 +243,16 @@ impl SessionStore {
             .collect()
     }
 
+    /// The `(id, profile)` of every open session, for shutdown auditing.
+    pub async fn open_sessions(&self) -> Vec<(String, String)> {
+        self.sessions
+            .read()
+            .await
+            .iter()
+            .map(|(id, s)| (id.clone(), s.profile.clone()))
+            .collect()
+    }
+
     /// Close every session, wiping every master. Used at shutdown.
     pub async fn close_all(&self) -> usize {
         let mut sessions = self.sessions.write().await;

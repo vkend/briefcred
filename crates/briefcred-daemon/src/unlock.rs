@@ -521,10 +521,10 @@ mod tests {
         let window = Duration::from_secs(300);
 
         for _ in 0..2 {
-            if !cache.is_fresh("dev", window).await {
-                if gate.unlock(UnlockPolicy::Biometric, "dev").await.is_ok() {
-                    cache.record("dev").await;
-                }
+            if !cache.is_fresh("dev", window).await
+                && gate.unlock(UnlockPolicy::Biometric, "dev").await.is_ok()
+            {
+                cache.record("dev").await;
             }
         }
         assert_eq!(

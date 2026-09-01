@@ -6,7 +6,10 @@
 
 use std::path::Path;
 
+use std::time::Duration;
+
 use briefcred_core::ca::CaConfig;
+use briefcred_core::SourceKind;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
@@ -16,6 +19,13 @@ pub const DEFAULT_RETENTION_DAYS: u32 = 90;
 
 /// The Prometheus port used when the file says nothing.
 pub const DEFAULT_METRICS_PORT: u16 = 9317;
+
+/// How long a session may sit unused before the daemon wipes it.
+///
+/// Thirty minutes: long enough to survive a lunch break mid-task, short enough
+/// that a laptop left open overnight is not still holding a database
+/// superuser password in the morning.
+pub const DEFAULT_SESSION_IDLE_SECS: u64 = 1800;
 
 /// The daemon's resolved configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -30,6 +40,15 @@ pub struct Config {
     pub metrics_port: u16,
     /// Whether to serve the Prometheus endpoint at all.
     pub metrics_enabled: bool,
+    /// Seconds a session may go untouched before it is evicted and wiped.
+    pub session_idle_secs: u64,
+    /// Where master credentials are read from.
+    ///
+    /// Absent means the platform default: the login keychain on macOS, files
+    /// under the secrets directory elsewhere. Never the environment, which has
+    /// to be asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_source: Option<SourceKind>,
     /// Where the root CA's private key is kept.
     ///
     /// Owned by `briefcred_core::ca` rather than parsed twice: the CLI reads
@@ -43,6 +62,8 @@ impl Default for Config {
             retention_days: DEFAULT_RETENTION_DAYS,
             metrics_port: DEFAULT_METRICS_PORT,
             metrics_enabled: true,
+            session_idle_secs: DEFAULT_SESSION_IDLE_SECS,
+            master_source: None,
             ca: CaConfig::default(),
         }
     }
@@ -74,7 +95,26 @@ impl Config {
                     .to_string(),
             );
         }
+        // Zero would evict a session in the same breath as opening it, which
+        // reads as "sessions are broken" rather than as a policy choice.
+        if config.session_idle_secs == 0 {
+            return Err(
+                "session_idle_secs must be at least 1; 0 would evict every session immediately"
+                    .to_string(),
+            );
+        }
         Ok(config)
+    }
+
+    /// The idle window as a [`Duration`].
+    pub fn session_idle(&self) -> Duration {
+        Duration::from_secs(self.session_idle_secs)
+    }
+
+    /// The master source to open, resolving the platform default.
+    pub fn master_source(&self, platform: briefcred_core::paths::Platform) -> SourceKind {
+        self.master_source
+            .unwrap_or_else(|| SourceKind::platform_default(platform))
     }
 }
 
@@ -88,6 +128,32 @@ mod tests {
         assert_eq!(config.retention_days, 90);
         assert_eq!(config.metrics_port, 9317);
         assert!(config.metrics_enabled);
+        assert_eq!(config.session_idle_secs, 1800);
+        assert_eq!(config.session_idle(), Duration::from_secs(1800));
+        assert_eq!(config.master_source, None);
+    }
+
+    #[test]
+    fn the_master_source_defaults_to_the_platform_and_can_be_overridden() {
+        use briefcred_core::paths::Platform;
+        let config = Config::from_toml_str("").unwrap();
+        assert_eq!(config.master_source(Platform::MacOs), SourceKind::Keychain);
+        assert_eq!(config.master_source(Platform::Linux), SourceKind::File);
+
+        let config = Config::from_toml_str("master_source = \"env\"").unwrap();
+        assert_eq!(config.master_source(Platform::MacOs), SourceKind::Env);
+    }
+
+    #[test]
+    fn a_zero_idle_window_is_rejected_rather_than_making_sessions_useless() {
+        let err = Config::from_toml_str("session_idle_secs = 0").unwrap_err();
+        assert!(err.contains("session_idle_secs"), "{err}");
+    }
+
+    #[test]
+    fn the_idle_window_is_configurable() {
+        let config = Config::from_toml_str("session_idle_secs = 60").unwrap();
+        assert_eq!(config.session_idle(), Duration::from_secs(60));
     }
 
     #[test]
