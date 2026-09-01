@@ -12,8 +12,23 @@ omitted — sequencing is the load-bearing part.
 
 ## Positioning
 
-- **Local, biometric-gated broker for dynamic credentials + Cedar policy.**
-  Placeholder-key swap over `HTTPS_PROXY` is table stakes, not the product.
+- **Local, biometric-gated broker that mints dynamic credentials *and*
+  enforces Cedar policy.** Placeholder-key swap over `HTTPS_PROXY` is
+  table stakes, not the product.
+- Landscape (reviewed 2026-09-01):
+  - Local placeholder-swap proxies are commoditised (Infisical Agent Proxy,
+    OneCLI, Authsome, AgentSecrets). None mint dynamic DB roles or STS
+    sessions, none ship biometric unlock.
+  - OpenFirma enforces Cedar locally but delegates minting to Vault/STS.
+    The differentiator is minting + policy in one local daemon, not Cedar
+    alone.
+  - Hosted brokers now use the same language: 1Password Credential Broker,
+    HashiCorp Vault MCP 2.0, Teleport, StrongDM. No local/OSS equivalent
+    for DB connection-auth injection.
+  - Anthropic Managed Agents and OpenAI Sandbox Agents ship first-party
+    proxy-outside-sandbox credential injection. briefcred's wedge is
+    local, non-hosted workloads and dynamic DB/STS credentials, not
+    "the agent never sees the key" in isolation.
 - Two halves, hybrid by backend:
   - **Identity broker** — mints real short-lived credentials (Postgres
     roles, AWS STS sessions, SSH certs) and revokes them after use.
@@ -63,8 +78,11 @@ cannot leak roles.
     the schema (the managed-Postgres default).
   - SQL errors surface in `RevokeOutcome::Failed { detail }`. An audit row
     with `outcome=failed` and no detail is a bug.
-- Integration test against Postgres 16 in Docker where the master does
-  **not** own `public`; a series of failed sessions leaves `\du` clean.
+- Integration test matrix against Postgres 16 and 18 in Docker where
+  the master does **not** own `public`; a series of failed sessions
+  leaves `\du` clean. PG18 changed `DROP OWNED BY` to also delete
+  `pg_auth_members` rows, so the REVOKE-loop-first ordering must be
+  asserted explicitly there.
 - `ARCHITECTURE.md` and `THREAT_MODEL.md` written up front, declaring the
   hybrid shape and the Model A/B/C mapping per phase.
 
@@ -187,8 +205,11 @@ async revoke, and reconciliation.
   `health`, `audit`, `profile bootstrap` (interactive wizard that writes
   YAML and stores the master in Keychain).
 - `briefcred-hook`: reads a PreToolUse JSON event from stdin, matches
-  `hook-rules.yaml`, consults the daemon, emits `permissionDecision` and
-  optional `commandOverride`.
+  `hook-rules.yaml`, consults the daemon, emits
+  `hookSpecificOutput.permissionDecision` (allow / deny / ask) with
+  `permissionDecisionReason`, and optionally `updatedInput` to rewrite
+  the command. Known limits: `updatedInput` is ignored for the Agent
+  tool and is last-writer-wins when several hooks fire.
 
 **Done when:** a profile declares two Postgres credentials in one
 envelope; `briefcred exec --profile=db-prod-ro -- psql -c "SELECT
@@ -251,7 +272,9 @@ Model A.
 **Work:**
 
 - Postgres startup-message parser.
-- SCRAM-SHA-256 and MD5 auth handlers using the daemon-held master.
+- SCRAM-SHA-256 auth handler using the daemon-held master. MD5 is
+  legacy-only behind a flag: deprecated in PG18, scheduled for removal
+  by PG21.
 - Byte-forward state after auth.
 - Audit row per connection: session, master role, start/stop, byte counts.
 - `postgres_proxy` credential kind in the profile schema.
@@ -373,7 +396,9 @@ direct.
 
 - **AWS STS** — `AssumeRole` with optional inline session policy;
   `RoleSessionName` derived from the mint id for audit correlation.
-  Precheck inline-policy headroom against the 10,240-char limit. Revoke by
+  Precheck inline session-policy plaintext against the 2,048-char
+  `AssumeRole` limit (the 10,240-char cap is for role inline policies,
+  a different quota). Revoke by
   advancing one rolling `aws:TokenIssueTime` deny policy per role (never
   one policy per mint). Record `RevokeOutcome::EventuallyConsistent
   { propagation_estimate: 5s }`.
@@ -390,7 +415,11 @@ direct.
 
 - Docs: profile schema reference, policy authoring guide, threat-model
   updates, CB4A-style conformance statement (which phases map to Model
-  A/B/C, DPoP status).
+  A/B/C, DPoP status). CB4A is still draft -00 (expires 2026-09-30, no
+  WG adoption); track for revisions.
+- MCP spec 2026-07-28 mandates RFC 8707 resource indicators and RFC 9728
+  protected-resource metadata; the transparent proxy must pass
+  audience-bound tokens through unchanged and never re-scope them.
 - Operator UX testing against managed, cloud, and on-prem Postgres.
 - Runtime compatibility matrix: Node, Python, Go, Rust, Ruby, AWS CLI,
   gcloud, gh, psql, curl.
@@ -423,7 +452,12 @@ direct.
 
 ## Open risks
 
-- `LAContext` from a Rust LaunchAgent — budget a binding spike.
+- `LAContext` from a Rust LaunchAgent — budget a binding spike, run it
+  on macOS 26.4+ (open reports of keychain `errSecAuthFailed` and CA
+  trust regressions on that release).
+- First-party sandbox brokering (Anthropic Managed Agents, OpenAI
+  Sandbox Agents) erodes the "agent never sees the key" pitch for hosted
+  workloads; keep dynamic DB/STS minting as the headline.
 - Notarisation toolchain: Developer ID + `notarytool` + key handling in CI.
 - First-time-after-reboot: `RunAtLoad` must reach the Aqua session before
   any user app launches.
