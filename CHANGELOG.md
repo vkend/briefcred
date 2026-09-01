@@ -80,6 +80,11 @@ All notable changes to briefcred are recorded here. The format follows
   `service_dir()`, `service_file()`, `service_label()`, `platform()`, and
   `ensure_layout()`. `BRIEFCRED_HOME` relocates the service unit too, so a test
   can never write into the real `~/Library/LaunchAgents`.
+- `install`, `daemon start`, `daemon stop`, and `daemon restart` wait for the
+  daemon to reach the requested state before returning. `launchctl` and
+  `systemctl` report success once they have accepted the job, which is before
+  the socket exists, so without the wait a `daemon status` typed immediately
+  afterwards would race the daemon and report it down.
 - `briefcred_core::audit`: `DaemonStart`, `DaemonStop`, and `AuthReject`
   variants. `AuditEntry::mint_id` now returns `Option<&MintId>`, because these
   rows describe the daemon rather than a minted principal.

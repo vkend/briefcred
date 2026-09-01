@@ -83,7 +83,10 @@ On Linux the unit is `~/.config/systemd/user/briefcred.service`.
 
 `briefcred daemon start | stop | restart` go through `launchctl` or
 `systemctl --user`. The CLI never spawns the daemon itself, so the service
-manager and the process tree cannot disagree about who owns it. If the daemon
+manager and the process tree cannot disagree about who owns it. Each of them,
+and `install`, waits for the daemon to actually reach the requested state
+before returning: the service manager reports success once it has accepted the
+job, which is well before the socket exists. If the daemon
 is down, `briefcred daemon status` prints
 `daemon is not running; run 'briefcred daemon start'` and exits **3**, which is
 distinct from the generic failure code 1.

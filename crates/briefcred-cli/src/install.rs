@@ -8,6 +8,7 @@
 //! trail on the way out is the one thing an audit trail must not do.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use briefcred_core::paths::Paths;
 
@@ -33,6 +34,46 @@ pub const STARTER_CONFIG: &str = "\
 # metrics_enabled = true
 ";
 
+/// How long `install` waits for the started daemon to start listening.
+pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether a daemon is listening on `sock` yet, polled until `timeout`.
+///
+/// `launchctl bootstrap` and `systemctl --user start` both return as soon as
+/// the service manager has accepted the job, not when the daemon has bound its
+/// socket. Without this wait, `install` would tell the user to run
+/// `briefcred daemon status` and that command would fail if they were quick.
+pub fn wait_until_listening(sock: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::os::unix::net::UnixStream::connect(sock).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Whether the socket has stopped answering, polled until `timeout`.
+///
+/// The mirror of [`wait_until_listening`], for `stop`: the service manager
+/// returns once it has signalled the daemon, not once the daemon has finished
+/// draining and removed its socket.
+pub fn wait_until_gone(sock: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::os::unix::net::UnixStream::connect(sock).is_err() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// What an install did, or would do under `--dry-run`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -44,6 +85,10 @@ pub struct Report {
     pub kept: Vec<PathBuf>,
     /// The service-manager commands that were, or would be, run.
     pub commands: Vec<String>,
+    /// Whether the daemon was listening before `install` returned.
+    ///
+    /// Always false for a dry run, which starts nothing.
+    pub ready: bool,
 }
 
 /// Provision the layout, write the unit, and start the daemon.
@@ -51,9 +96,10 @@ pub struct Report {
 /// With `dry_run` the report is filled in exactly as it would be, and nothing
 /// is written or executed.
 pub fn install(paths: &Paths, daemon_binary: &Path, dry_run: bool) -> Result<Report> {
-    let report = provision(paths, daemon_binary, dry_run)?;
+    let mut report = provision(paths, daemon_binary, dry_run)?;
     if !dry_run {
         lifecycle::run(&lifecycle::start_plan(paths))?;
+        report.ready = wait_until_listening(paths.sock(), READY_TIMEOUT);
     }
     Ok(report)
 }

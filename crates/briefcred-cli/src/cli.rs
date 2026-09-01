@@ -76,21 +76,48 @@ async fn run_daemon(paths: &Paths, action: DaemonAction) -> Result<()> {
             print_status(&status, paths.sock());
             Ok(())
         }
+        // Each of these waits for the daemon to actually reach the requested
+        // state. The service manager returns as soon as it has accepted the
+        // job, so without the wait a `status` typed straight afterwards races
+        // the daemon and reports it down.
         DaemonAction::Start => {
             lifecycle::run(&lifecycle::start_plan(paths))?;
-            println!("daemon started");
+            report_settled(
+                install::wait_until_listening(paths.sock(), install::READY_TIMEOUT),
+                "started",
+                "listening",
+            );
             Ok(())
         }
         DaemonAction::Stop => {
             lifecycle::run(&lifecycle::stop_plan(paths))?;
-            println!("daemon stopped");
+            report_settled(
+                install::wait_until_gone(paths.sock(), install::READY_TIMEOUT),
+                "stopped",
+                "gone",
+            );
             Ok(())
         }
         DaemonAction::Restart => {
             lifecycle::run(&lifecycle::restart_plan(paths))?;
-            println!("daemon restarted");
+            report_settled(
+                install::wait_until_listening(paths.sock(), install::READY_TIMEOUT),
+                "restarted",
+                "listening",
+            );
             Ok(())
         }
+    }
+}
+
+fn report_settled(settled: bool, done: &str, expected: &str) {
+    if settled {
+        println!("daemon {done}");
+    } else {
+        println!(
+            "the service manager accepted the job, but the daemon was not {expected} after {} s",
+            install::READY_TIMEOUT.as_secs()
+        );
     }
 }
 
@@ -116,8 +143,17 @@ fn print_install(report: &install::Report, dry_run: bool) {
     for command in &report.commands {
         println!("  {verb}run        {command}");
     }
-    if !dry_run {
-        println!("\nrun 'briefcred daemon status' to confirm it came up");
+    if dry_run {
+        return;
+    }
+    if report.ready {
+        println!("\nthe daemon is listening; 'briefcred daemon status' has the details");
+    } else {
+        println!(
+            "\nthe service manager accepted the job, but the daemon was not listening after {} s.",
+            install::READY_TIMEOUT.as_secs()
+        );
+        println!("check the daemon logs, then run 'briefcred daemon status'");
     }
 }
 

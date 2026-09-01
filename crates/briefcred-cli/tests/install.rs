@@ -9,7 +9,11 @@ use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use briefcred_cli::install::{provision, remove_files, STARTER_CONFIG};
+use std::time::Duration;
+
+use briefcred_cli::install::{
+    provision, remove_files, wait_until_gone, wait_until_listening, STARTER_CONFIG,
+};
 use briefcred_core::paths::{Paths, Platform};
 
 fn paths_at(root: &Path) -> Paths {
@@ -170,4 +174,67 @@ fn uninstalling_clears_a_socket_the_daemon_left_behind() {
     let removal = remove_files(&paths).unwrap();
     assert!(removal.removed.contains(&paths.sock().to_path_buf()));
     assert!(!paths.sock().exists());
+}
+
+#[test]
+fn waiting_for_a_socket_nothing_is_listening_on_gives_up() {
+    let temp = tempfile::tempdir().unwrap();
+    let sock = temp.path().join("sock");
+
+    let started = std::time::Instant::now();
+    assert!(!wait_until_listening(&sock, Duration::from_millis(200)));
+    let elapsed = started.elapsed();
+
+    assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "it must not overshoot: {elapsed:?}"
+    );
+}
+
+#[test]
+fn waiting_for_a_socket_that_is_listening_returns_at_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let sock = temp.path().join("sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let started = std::time::Instant::now();
+    assert!(wait_until_listening(&sock, Duration::from_secs(10)));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn a_socket_file_with_no_listener_is_not_mistaken_for_a_daemon() {
+    let temp = tempfile::tempdir().unwrap();
+    let sock = temp.path().join("sock");
+    // A plain file at the socket path, which is what a SIGKILLed daemon leaves.
+    std::fs::write(&sock, b"stale").unwrap();
+
+    assert!(!wait_until_listening(&sock, Duration::from_millis(150)));
+}
+
+#[test]
+fn a_dry_run_never_claims_the_daemon_is_ready() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+    let report = provision(&paths, Path::new("/opt/bin/briefcred-daemon"), true).unwrap();
+    assert!(!report.ready);
+}
+
+#[test]
+fn waiting_for_a_socket_to_go_quiet_returns_once_the_listener_is_gone() {
+    let temp = tempfile::tempdir().unwrap();
+    let sock = temp.path().join("sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    assert!(
+        !wait_until_gone(&sock, Duration::from_millis(150)),
+        "a live listener is not gone"
+    );
+
+    drop(listener);
+    std::fs::remove_file(&sock).unwrap();
+    let started = std::time::Instant::now();
+    assert!(wait_until_gone(&sock, Duration::from_secs(10)));
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
