@@ -82,6 +82,41 @@ pub enum AuditEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         propagation_estimate_ms: Option<u64>,
     },
+    /// The daemon finished starting and is accepting connections.
+    DaemonStart {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The daemon's process id.
+        pid: u32,
+        /// The daemon binary's crate version.
+        version: String,
+    },
+    /// The daemon stopped accepting connections and is shutting down.
+    DaemonStop {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The daemon's process id.
+        pid: u32,
+        /// How long it had been running.
+        uptime_secs: u64,
+        /// What asked it to stop: `sigterm`, `sigint`, or `request`.
+        reason: String,
+    },
+    /// A connection was refused because the peer is not the owning user.
+    ///
+    /// The socket lives in a `0700` directory at mode `0600`, so this row is
+    /// evidence of something worth investigating rather than routine noise.
+    AuthReject {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The uid the kernel reported for the connecting process.
+        peer_uid: u32,
+        /// The uid the daemon is running as, and the only one it serves.
+        expected_uid: u32,
+    },
 }
 
 impl AuditEntry {
@@ -104,13 +139,19 @@ impl AuditEntry {
         }
     }
 
-    /// The identifier this row is about.
-    pub fn mint_id(&self) -> &MintId {
+    /// The identifier this row is about, for the rows that are about one.
+    ///
+    /// Daemon-lifecycle and authentication rows describe the daemon rather
+    /// than a minted principal, so they return `None`.
+    pub fn mint_id(&self) -> Option<&MintId> {
         match self {
             AuditEntry::Mint { mint_id, .. }
             | AuditEntry::ExecStart { mint_id, .. }
             | AuditEntry::ExecEnd { mint_id, .. }
-            | AuditEntry::Revoke { mint_id, .. } => mint_id,
+            | AuditEntry::Revoke { mint_id, .. } => Some(mint_id),
+            AuditEntry::DaemonStart { .. }
+            | AuditEntry::DaemonStop { .. }
+            | AuditEntry::AuthReject { .. } => None,
         }
     }
 }
@@ -212,5 +253,56 @@ mod tests {
         let back: AuditEntry = serde_json::from_str(&line).unwrap();
         assert_eq!(back, entry);
         assert_eq!(back.mint_id(), entry.mint_id());
+    }
+
+    #[test]
+    fn an_auth_reject_row_records_both_uids_and_nothing_else() {
+        let entry = AuditEntry::AuthReject {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            peer_uid: 502,
+            expected_uid: 501,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["event"], "auth_reject");
+        assert_eq!(json["peer_uid"], 502);
+        assert_eq!(json["expected_uid"], 501);
+        assert!(entry.mint_id().is_none());
+    }
+
+    #[test]
+    fn daemon_lifecycle_rows_round_trip_and_carry_no_mint_id() {
+        for entry in [
+            AuditEntry::DaemonStart {
+                ts: OffsetDateTime::UNIX_EPOCH,
+                pid: 7,
+                version: "0.1.0".into(),
+            },
+            AuditEntry::DaemonStop {
+                ts: OffsetDateTime::UNIX_EPOCH,
+                pid: 7,
+                uptime_secs: 61,
+                reason: "sigterm".into(),
+            },
+        ] {
+            let line = serde_json::to_string(&entry).unwrap();
+            assert!(!line.contains('\n'));
+            let back: AuditEntry = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, entry);
+            assert!(back.mint_id().is_none());
+        }
+    }
+
+    #[test]
+    fn credential_rows_still_expose_their_mint_id() {
+        let entry = AuditEntry::Mint {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            mint_id: MintId::generate(),
+            profile: "dev".into(),
+            credential: "db".into(),
+            kind: "postgres-dynamic".into(),
+            ttl_secs: 900,
+        };
+        assert_eq!(entry.mint_id(), Some(entry.mint_id().unwrap()));
+        assert!(entry.mint_id().is_some());
     }
 }

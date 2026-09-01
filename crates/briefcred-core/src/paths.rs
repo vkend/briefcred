@@ -12,6 +12,9 @@ use crate::error::{Error, Result};
 /// Environment variable that relocates the whole layout, including the socket.
 pub const HOME_ENV: &str = "BRIEFCRED_HOME";
 
+/// The reverse-DNS label the macOS LaunchAgent is registered under.
+pub const SERVICE_LABEL: &str = "dev.briefcred.daemon";
+
 /// The platforms briefcred knows how to lay itself out on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -44,8 +47,10 @@ impl Platform {
 /// Resolved absolute locations of everything briefcred owns on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
+    platform: Platform,
     root: PathBuf,
     sock: PathBuf,
+    service_dir: PathBuf,
 }
 
 impl Paths {
@@ -65,22 +70,23 @@ impl Paths {
     /// Split out from [`Paths::discover`] so the Linux layout is unit-testable
     /// from a macOS host and vice versa.
     pub fn resolve(platform: Platform, env: &dyn Fn(&str) -> Option<OsString>) -> Result<Paths> {
-        if let Some(root) = non_empty(env(HOME_ENV)) {
-            let root = PathBuf::from(root);
-            let sock = root.join("sock");
-            return Ok(Paths { root, sock });
-        }
+        // `BRIEFCRED_HOME` stands in for the user's home directory as well as
+        // for the data root, so the generated LaunchAgent plist or systemd unit
+        // lands under the override too and a test can never write one into the
+        // real `~/Library/LaunchAgents`.
+        let override_root = non_empty(env(HOME_ENV)).map(PathBuf::from);
 
-        match platform {
-            Platform::MacOs => {
+        let (root, sock) = match (&override_root, platform) {
+            (Some(root), _) => (root.clone(), root.join("sock")),
+            (None, Platform::MacOs) => {
                 let root = home(env)?
                     .join("Library")
                     .join("Application Support")
                     .join("briefcred");
                 let sock = root.join("sock");
-                Ok(Paths { root, sock })
+                (root, sock)
             }
-            Platform::Linux => {
+            (None, Platform::Linux) => {
                 let root = match non_empty(env("XDG_DATA_HOME")) {
                     Some(data) => PathBuf::from(data).join("briefcred"),
                     None => home(env)?.join(".local").join("share").join("briefcred"),
@@ -89,9 +95,39 @@ impl Paths {
                     Some(run) => PathBuf::from(run).join("briefcred").join("sock"),
                     None => root.join("sock"),
                 };
-                Ok(Paths { root, sock })
+                (root, sock)
             }
-        }
+        };
+
+        let service_dir = match platform {
+            Platform::MacOs => {
+                let base = match &override_root {
+                    Some(root) => root.clone(),
+                    None => home(env)?,
+                };
+                base.join("Library").join("LaunchAgents")
+            }
+            Platform::Linux => {
+                let config = match (&override_root, non_empty(env("XDG_CONFIG_HOME"))) {
+                    (Some(root), _) => root.join(".config"),
+                    (None, Some(cfg)) => PathBuf::from(cfg),
+                    (None, None) => home(env)?.join(".config"),
+                };
+                config.join("systemd").join("user")
+            }
+        };
+
+        Ok(Paths {
+            platform,
+            root,
+            sock,
+            service_dir,
+        })
+    }
+
+    /// The platform this layout was resolved for.
+    pub fn platform(&self) -> Platform {
+        self.platform
     }
 
     /// The directory holding everything else.
@@ -119,9 +155,51 @@ impl Paths {
         self.root.join("ca")
     }
 
+    /// Directory holding the daemon's own stdout and stderr logs.
+    pub fn log_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
+    /// Directory for daemon state that survives a restart but is not audit.
+    pub fn state_dir(&self) -> PathBuf {
+        self.root.join("state")
+    }
+
+    /// Directory holding briefcred's configuration files.
+    pub fn config_dir(&self) -> &Path {
+        &self.root
+    }
+
     /// The daemon's configuration file.
     pub fn daemon_toml(&self) -> PathBuf {
-        self.root.join("daemon.toml")
+        self.config_dir().join("daemon.toml")
+    }
+
+    /// Directory the platform's service manager reads unit files from.
+    ///
+    /// `~/Library/LaunchAgents` on macOS, `$XDG_CONFIG_HOME/systemd/user` on
+    /// Linux, and a subdirectory of `BRIEFCRED_HOME` when that is set.
+    pub fn service_dir(&self) -> &Path {
+        &self.service_dir
+    }
+
+    /// The service unit file briefcred installs.
+    pub fn service_file(&self) -> PathBuf {
+        match self.platform {
+            Platform::MacOs => self.service_dir.join(format!("{SERVICE_LABEL}.plist")),
+            Platform::Linux => self.service_dir.join("briefcred.service"),
+        }
+    }
+
+    /// The label the platform's service manager knows the daemon by.
+    ///
+    /// `launchctl` addresses it as `gui/<uid>/dev.briefcred.daemon`; systemd
+    /// addresses the unit as `briefcred.service`.
+    pub fn service_label(&self) -> &'static str {
+        match self.platform {
+            Platform::MacOs => SERVICE_LABEL,
+            Platform::Linux => "briefcred.service",
+        }
     }
 }
 
@@ -216,5 +294,83 @@ mod tests {
         let env = env_of(&[]);
         let err = Paths::resolve(Platform::MacOs, &env).unwrap_err();
         assert!(err.to_string().contains(HOME_ENV), "{err}");
+    }
+
+    #[test]
+    fn logs_state_and_config_hang_off_the_root() {
+        let env = env_of(&[("HOME", "/Users/ada")]);
+        let paths = Paths::resolve(Platform::MacOs, &env).unwrap();
+        let root = Path::new("/Users/ada/Library/Application Support/briefcred");
+        assert_eq!(paths.log_dir(), root.join("logs"));
+        assert_eq!(paths.state_dir(), root.join("state"));
+        assert_eq!(paths.config_dir(), root);
+        assert_eq!(paths.daemon_toml(), paths.config_dir().join("daemon.toml"));
+    }
+
+    #[test]
+    fn the_macos_service_file_is_a_launch_agent_plist() {
+        let env = env_of(&[("HOME", "/Users/ada")]);
+        let paths = Paths::resolve(Platform::MacOs, &env).unwrap();
+        assert_eq!(
+            paths.service_dir(),
+            Path::new("/Users/ada/Library/LaunchAgents")
+        );
+        assert_eq!(
+            paths.service_file(),
+            Path::new("/Users/ada/Library/LaunchAgents/dev.briefcred.daemon.plist")
+        );
+        assert_eq!(paths.service_label(), "dev.briefcred.daemon");
+    }
+
+    #[test]
+    fn the_linux_service_file_is_a_systemd_user_unit() {
+        let env = env_of(&[("HOME", "/home/ada")]);
+        let paths = Paths::resolve(Platform::Linux, &env).unwrap();
+        assert_eq!(
+            paths.service_file(),
+            Path::new("/home/ada/.config/systemd/user/briefcred.service")
+        );
+
+        let env = env_of(&[("HOME", "/home/ada"), ("XDG_CONFIG_HOME", "/home/ada/.cfg")]);
+        let paths = Paths::resolve(Platform::Linux, &env).unwrap();
+        assert_eq!(
+            paths.service_file(),
+            Path::new("/home/ada/.cfg/systemd/user/briefcred.service")
+        );
+    }
+
+    #[test]
+    fn briefcred_home_relocates_the_service_file_too() {
+        let env = env_of(&[
+            ("HOME", "/Users/ada"),
+            ("XDG_CONFIG_HOME", "/home/ada/.cfg"),
+            (HOME_ENV, "/tmp/t2"),
+        ]);
+        let macos = Paths::resolve(Platform::MacOs, &env).unwrap();
+        assert!(
+            macos.service_file().starts_with("/tmp/t2"),
+            "{}",
+            macos.service_file().display()
+        );
+        let linux = Paths::resolve(Platform::Linux, &env).unwrap();
+        assert!(
+            linux.service_file().starts_with("/tmp/t2"),
+            "{}",
+            linux.service_file().display()
+        );
+        assert!(macos.log_dir().starts_with("/tmp/t2"));
+    }
+
+    #[test]
+    fn the_platform_is_remembered_so_callers_need_not_re_derive_it() {
+        let env = env_of(&[("HOME", "/Users/ada"), (HOME_ENV, "/tmp/t3")]);
+        assert_eq!(
+            Paths::resolve(Platform::MacOs, &env).unwrap().platform(),
+            Platform::MacOs
+        );
+        assert_eq!(
+            Paths::resolve(Platform::Linux, &env).unwrap().platform(),
+            Platform::Linux
+        );
     }
 }

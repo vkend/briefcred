@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use briefcred_proto::{
-    FrameError, MAX_FRAME_BYTES, Request, Response, decode_frame, encode_frame, read_frame,
-    write_frame,
+    decode_frame, encode_frame, read_frame, write_frame, FrameError, Request, Response,
+    MAX_FRAME_BYTES,
 };
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
@@ -51,7 +51,10 @@ async fn every_request_and_response_round_trips() {
         assert_eq!(&back, response);
     }
     assert!(
-        read_frame::<_, Request>(&mut server).await.unwrap().is_none(),
+        read_frame::<_, Request>(&mut server)
+            .await
+            .unwrap()
+            .is_none(),
         "a clean EOF is not an error"
     );
 }

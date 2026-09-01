@@ -1,7 +1,7 @@
 //! Length-prefixed JSON framing.
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The largest payload a single frame may carry, 16 MiB.

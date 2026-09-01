@@ -14,7 +14,5 @@
 mod frame;
 mod message;
 
-pub use frame::{
-    MAX_FRAME_BYTES, FrameError, decode_frame, encode_frame, read_frame, write_frame,
-};
+pub use frame::{decode_frame, encode_frame, read_frame, write_frame, FrameError, MAX_FRAME_BYTES};
 pub use message::{Request, Response};
