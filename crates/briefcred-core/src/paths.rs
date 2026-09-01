@@ -156,6 +156,12 @@ impl Paths {
         self.root.join("ca")
     }
 
+    /// The root CA certificate: the public half, and the file that gets
+    /// trusted and pointed at by the trust environment variables.
+    pub fn ca_cert(&self) -> PathBuf {
+        self.ca_dir().join("ca.pem")
+    }
+
     /// Directory holding the daemon's own stdout and stderr logs.
     pub fn log_dir(&self) -> PathBuf {
         self.root.join("logs")
