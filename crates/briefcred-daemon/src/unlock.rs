@@ -342,28 +342,9 @@ impl UnlockCache {
             .insert(profile.to_string(), now);
     }
 
-    /// Forget `profile`'s unlock, so the next session prompts again.
-    ///
-    /// Called when a profile is reloaded from disk: the file that was unlocked
-    /// for is not necessarily the file on disk now.
-    pub async fn forget(&self, profile: &str) {
-        self.unlocked_at.lock().await.remove(profile);
-    }
-
     /// Forget every profile's unlock.
     pub async fn clear(&self) {
         self.unlocked_at.lock().await.clear();
-    }
-}
-
-/// A gate that always succeeds. Tests only, and never constructed in `run`.
-#[derive(Debug, Default)]
-pub struct AlwaysUnlocked;
-
-#[async_trait]
-impl UnlockGate for AlwaysUnlocked {
-    async fn unlock(&self, _policy: UnlockPolicy, _reason: &str) -> Result<(), UnlockError> {
-        Ok(())
     }
 }
 
@@ -484,13 +465,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forgetting_a_profile_makes_the_next_session_prompt_again() {
+    async fn clearing_the_cache_makes_the_next_session_prompt_again() {
         let cache = UnlockCache::new(TestClock::new());
         let window = Duration::from_secs(300);
-        cache.record("dev").await;
-        cache.forget("dev").await;
-        assert!(!cache.is_fresh("dev", window).await);
-
         cache.record("dev").await;
         cache.clear().await;
         assert!(!cache.is_fresh("dev", window).await);

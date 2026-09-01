@@ -53,13 +53,6 @@ impl Registry {
         Registry::default()
     }
 
-    /// A registry holding exactly the factories given, for tests.
-    pub fn from_factories(factories: impl IntoIterator<Item = &'static MinterFactory>) -> Registry {
-        Registry {
-            factories: factories.into_iter().map(|f| (f.kind, f)).collect(),
-        }
-    }
-
     /// Every registered kind, sorted, for error messages and `ListProfiles`.
     pub fn kinds(&self) -> Vec<&'static str> {
         self.factories.keys().copied().collect()

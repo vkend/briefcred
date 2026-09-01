@@ -103,11 +103,6 @@ impl State {
         &self.profiles
     }
 
-    /// The open sessions.
-    pub fn sessions(&self) -> &Arc<SessionStore> {
-        &self.sessions
-    }
-
     /// The per-profile unlock cache, so a reload can invalidate it.
     pub fn unlock_cache(&self) -> &UnlockCache {
         &self.unlock_cache

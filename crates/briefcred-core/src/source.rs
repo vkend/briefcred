@@ -17,7 +17,7 @@
 //! [`Paths::secrets_dir`]: crate::paths::Paths::secrets_dir
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Once;
 
 use async_trait::async_trait;
@@ -373,27 +373,6 @@ impl std::fmt::Debug for dyn MasterSource {
     }
 }
 
-/// A source that fails every lookup, for a deployment with no masters yet.
-///
-/// Used by the daemon when a profile declares no credentials, so the session
-/// path does not need a `None` case.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoSource;
-
-#[async_trait]
-impl MasterSource for NoSource {
-    async fn fetch(&self, key: &str) -> Result<Zeroizing<String>> {
-        Err(Error::MasterNotFound {
-            key: key.to_string(),
-            location: self.location(),
-        })
-    }
-
-    fn location(&self) -> String {
-        "no master source configured".to_string()
-    }
-}
-
 /// A source backed by an in-memory map, for tests and for `--dry-run`.
 #[derive(Debug, Default, Clone)]
 pub struct MemorySource {
@@ -425,17 +404,6 @@ impl MasterSource for MemorySource {
     fn location(&self) -> String {
         "in-memory test source".to_string()
     }
-}
-
-/// Whether `path` is a file only its owner can read.
-///
-/// Exposed so `briefcred doctor` can report the same condition [`FileSource`]
-/// refuses on.
-pub fn is_owner_only(path: &Path) -> Result<bool> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| Error::Master(format!("cannot stat {}: {e}", path.display())))?;
-    Ok(metadata.permissions().mode() & 0o077 == 0)
 }
 
 #[cfg(test)]
@@ -515,7 +483,6 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "master file is {mode:o}");
-        assert!(is_owner_only(&source.path("k")).unwrap());
     }
 
     #[tokio::test]
@@ -561,12 +528,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_source_fails_every_lookup_without_panicking() {
-        let err = NoSource.fetch("k").await.unwrap_err();
-        assert!(matches!(err, Error::MasterNotFound { .. }), "{err}");
-    }
-
-    #[tokio::test]
     async fn a_source_never_prints_the_master_it_holds() {
         let (_dir, file) = temp_source();
         file.put("k", &Zeroizing::new("super-secret-master".into()))
@@ -577,7 +538,6 @@ mod tests {
                 "BRIEFCRED_MASTER_K".to_string(),
                 "super-secret-master".to_string(),
             )]))),
-            Box::new(NoSource),
         ];
         for source in &sources {
             let rendered = format!("{source:?} {}", source.location());
