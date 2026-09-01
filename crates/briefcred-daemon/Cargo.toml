@@ -32,4 +32,3 @@ toml.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
-briefcred-daemon = { path = "." }

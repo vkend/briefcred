@@ -158,7 +158,6 @@ name = "briefcred-daemon"
 version = "0.1.0"
 dependencies = [
  "briefcred-core",
- "briefcred-daemon",
  "briefcred-proto",
  "http-body-util",
  "hyper",

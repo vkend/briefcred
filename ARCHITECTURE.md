@@ -135,8 +135,16 @@ macOS:
   profiles/       *.yaml work envelopes
   audit/          append-only JSONL, daily rotation
   ca/             per-machine root CA material
+  logs/           daemon stdout and stderr, written by the service manager
+  state/          daemon state that survives a restart
   daemon.toml     daemon configuration
 ```
+
+Every directory is mode `0700`. The service unit lives outside this tree, at
+`~/Library/LaunchAgents/dev.briefcred.daemon.plist` or
+`~/.config/systemd/user/briefcred.service`, because launchd and systemd have to
+read it. `BRIEFCRED_HOME` relocates that too, which is what keeps tests out of
+the real `~/Library/LaunchAgents`.
 
 Linux uses `$XDG_DATA_HOME/briefcred` (default `~/.local/share/briefcred`) with
 the socket at `$XDG_RUNTIME_DIR/briefcred/sock`. `BRIEFCRED_HOME` relocates the
