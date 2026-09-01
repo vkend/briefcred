@@ -15,6 +15,12 @@ use crate::error::{Error, Result};
 /// Default credential lifetime when a spec does not set `ttl_secs`.
 pub const DEFAULT_TTL_SECS: u64 = 900;
 
+/// How long a successful unlock is honoured when a profile says nothing.
+///
+/// Five minutes: long enough that a burst of `briefcred exec` calls prompts
+/// once, short enough that an unattended laptop stops minting quickly.
+pub const DEFAULT_UNLOCK_CACHE_SECS: u64 = 300;
+
 /// One profile document.
 ///
 /// Unknown keys are rejected at every level: a typo in a profile must fail
@@ -50,12 +56,38 @@ pub struct Profile {
 }
 
 /// Per-profile unlock policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Unlock {
     /// The presence check to run. Defaults to [`UnlockPolicy::Biometric`].
     #[serde(default)]
     pub policy: UnlockPolicy,
+    /// How long a successful unlock is honoured for this profile, in seconds.
+    ///
+    /// Zero means every session prompts. The cache is per profile, so
+    /// unlocking a low-value profile never opens a high-value one.
+    #[serde(default = "default_unlock_cache_secs")]
+    pub cache_secs: u64,
+}
+
+impl Default for Unlock {
+    fn default() -> Unlock {
+        Unlock {
+            policy: UnlockPolicy::default(),
+            cache_secs: DEFAULT_UNLOCK_CACHE_SECS,
+        }
+    }
+}
+
+impl Unlock {
+    /// The configured cache window as a [`Duration`].
+    pub fn cache_for(&self) -> Duration {
+        Duration::from_secs(self.cache_secs)
+    }
+}
+
+fn default_unlock_cache_secs() -> u64 {
+    DEFAULT_UNLOCK_CACHE_SECS
 }
 
 /// How the user proves presence.
@@ -82,6 +114,14 @@ pub struct CredentialSpec {
     /// Lifetime of the minted credential in seconds.
     #[serde(default = "default_ttl_secs")]
     pub ttl_secs: u64,
+    /// Key this credential's master is filed under in the master source.
+    ///
+    /// Absent means the credential's own [`CredentialSpec::name`], which is
+    /// what a profile with one master per credential wants. Naming it
+    /// explicitly lets several credentials share one master, or lets a
+    /// credential be renamed without moving the secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_key: Option<String>,
     /// Minter-specific configuration, interpreted by the minter for `kind`.
     #[serde(default)]
     pub config: serde_yaml::Value,
@@ -91,6 +131,11 @@ impl CredentialSpec {
     /// The configured lifetime as a [`Duration`].
     pub fn ttl(&self) -> Duration {
         Duration::from_secs(self.ttl_secs)
+    }
+
+    /// The master-source key this credential's master is fetched under.
+    pub fn source_key(&self) -> &str {
+        self.source_key.as_deref().unwrap_or(&self.name)
     }
 }
 
@@ -199,19 +244,44 @@ fn parse_reference(reference: &str, value: &str) -> Result<EnvSegment> {
 }
 
 impl Profile {
-    /// Parse and validate one profile document.
+    /// Parse one profile document and check everything that does not need a
+    /// minter registry.
+    ///
+    /// The registry check is separate because the schema is meaningful on its
+    /// own: `briefcred profile lint` can validate a file without linking the
+    /// minters, and the daemon runs [`Profile::validate`] on top.
     pub fn from_yaml_str(yaml: &str) -> Result<Profile> {
         let profile: Profile =
             serde_yaml::from_str(yaml).map_err(|e| Error::profile(e.to_string()))?;
-        profile.validate()?;
+        profile.validate_schema()?;
         Ok(profile)
+    }
+
+    /// Check every credential against the minter registry.
+    ///
+    /// Resolving `kind` and building each minter here rather than at mint time
+    /// means a typo or a malformed `config` block is caught when the file is
+    /// loaded, while the user is still looking at it.
+    pub fn validate(&self, registry: &crate::registry::Registry) -> Result<()> {
+        self.validate_schema()?;
+        for spec in &self.credentials {
+            if !registry.contains(&spec.kind) {
+                return Err(Error::profile(registry.unknown_kind(&spec.kind)));
+            }
+            registry.build(&spec.kind, &spec.config)?;
+        }
+        Ok(())
     }
 
     /// Load every `*.yaml` file in `dir`, keyed by [`Profile::name`].
     ///
     /// A missing directory yields an empty map; the daemon provisions it
-    /// lazily. Any unreadable or invalid file is an error naming the file.
-    pub fn load_dir(dir: impl AsRef<Path>) -> Result<BTreeMap<String, Profile>> {
+    /// lazily. Any unreadable or invalid file is an error naming the file, and
+    /// every profile is checked against `registry`.
+    pub fn load_dir(
+        dir: impl AsRef<Path>,
+        registry: &crate::registry::Registry,
+    ) -> Result<BTreeMap<String, Profile>> {
         let dir = dir.as_ref();
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -244,6 +314,7 @@ impl Profile {
                 source,
             })?;
             let profile = Profile::from_yaml_str(&text).map_err(|e| e.at_path(&path))?;
+            profile.validate(registry).map_err(|e| e.at_path(&path))?;
             if let Some(previous) = out.insert(profile.name.clone(), profile) {
                 return Err(Error::Profile {
                     path: Some(path),
@@ -259,8 +330,9 @@ impl Profile {
         self.credentials.iter().find(|c| c.name == name)
     }
 
-    /// Check every invariant the type system does not already enforce.
-    fn validate(&self) -> Result<()> {
+    /// Check every invariant the type system does not already enforce and
+    /// that does not need the minter registry.
+    fn validate_schema(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             return Err(Error::profile("`name` must not be empty"));
         }
@@ -279,6 +351,16 @@ impl Profile {
             if spec.ttl_secs == 0 {
                 return Err(Error::profile(format!(
                     "credential `{}` has `ttl_secs: 0`",
+                    spec.name
+                )));
+            }
+            if spec
+                .source_key
+                .as_ref()
+                .is_some_and(|k| k.trim().is_empty())
+            {
+                return Err(Error::profile(format!(
+                    "credential `{}` has an empty `source_key`; omit the key to use the credential name",
                     spec.name
                 )));
             }
@@ -333,12 +415,19 @@ mod tests {
 
     const MINIMAL: &str = "name: dev\n";
 
+    /// Everything this binary registered, which includes `postgres-dynamic`.
+    fn registry() -> crate::registry::Registry {
+        crate::registry::Registry::discover()
+    }
+
     #[test]
     fn minimal_profile_applies_every_default() {
         let profile = Profile::from_yaml_str(MINIMAL).unwrap();
         assert_eq!(profile.name, "dev");
         assert_eq!(profile.description, None);
         assert_eq!(profile.unlock.policy, UnlockPolicy::Biometric);
+        assert_eq!(profile.unlock.cache_secs, DEFAULT_UNLOCK_CACHE_SECS);
+        assert_eq!(profile.unlock.cache_for(), Duration::from_secs(300));
         assert!(profile.credentials.is_empty());
         assert!(profile.exec.allow_argv0.is_empty());
         assert!(profile.env.is_empty());
@@ -357,6 +446,86 @@ credentials:
         assert_eq!(spec.ttl_secs, 900);
         assert_eq!(spec.ttl(), Duration::from_secs(900));
         assert_eq!(spec.config, serde_yaml::Value::Null);
+    }
+
+    #[test]
+    fn a_credentials_master_key_defaults_to_its_own_name() {
+        let yaml = "\
+name: dev
+credentials:
+  - name: db
+    kind: postgres-dynamic
+  - name: warehouse
+    kind: postgres-dynamic
+    source_key: shared-master
+";
+        let profile = Profile::from_yaml_str(yaml).unwrap();
+        assert_eq!(profile.credential("db").unwrap().source_key(), "db");
+        assert_eq!(
+            profile.credential("warehouse").unwrap().source_key(),
+            "shared-master"
+        );
+    }
+
+    #[test]
+    fn an_empty_source_key_is_rejected_rather_than_silently_ignored() {
+        let yaml =
+            "name: dev\ncredentials:\n  - name: db\n    kind: postgres-dynamic\n    source_key: ''\n";
+        let err = Profile::from_yaml_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("empty `source_key`"), "{err}");
+    }
+
+    #[test]
+    fn the_unlock_cache_window_is_configurable_including_off() {
+        let profile = Profile::from_yaml_str("name: dev\nunlock:\n  cache_secs: 0\n").unwrap();
+        assert_eq!(profile.unlock.cache_secs, 0);
+        assert_eq!(profile.unlock.cache_for(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_credential_naming_an_unregistered_minter_is_rejected_by_name() {
+        let yaml = "name: dev\ncredentials:\n  - name: db\n    kind: postgres-dynamik\n";
+        let profile = Profile::from_yaml_str(yaml).unwrap();
+        let registry = registry();
+        let err = profile.validate(&registry).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "unknown minter kind \"postgres-dynamik\" (registered: {})",
+                registry.kinds().join(", ")
+            )),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_registered_minter_with_a_malformed_config_is_rejected_at_load() {
+        let yaml = "\
+name: dev
+credentials:
+  - name: db
+    kind: postgres-dynamic
+    config:
+      host: 127.0.0.1
+";
+        let profile = Profile::from_yaml_str(yaml).unwrap();
+        let err = profile.validate(&registry()).unwrap_err();
+        assert!(
+            matches!(err, Error::MinterConfig { .. }),
+            "expected a minter config error, got {err}"
+        );
+    }
+
+    #[test]
+    fn load_dir_names_the_file_whose_minter_kind_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bad.yaml"),
+            "name: dev\ncredentials:\n  - name: db\n    kind: nope\n",
+        )
+        .unwrap();
+        let err = Profile::load_dir(dir.path(), &registry()).unwrap_err();
+        assert!(err.to_string().contains("bad.yaml"), "{err}");
+        assert!(err.to_string().contains("unknown minter kind"), "{err}");
     }
 
     #[test]
@@ -508,14 +677,14 @@ credentials:
         std::fs::write(dir.path().join("b.yaml"), "name: beta\n").unwrap();
         std::fs::write(dir.path().join("notes.txt"), "name: ignored\n").unwrap();
 
-        let profiles = Profile::load_dir(dir.path()).unwrap();
+        let profiles = Profile::load_dir(dir.path(), &registry()).unwrap();
         assert_eq!(profiles.keys().collect::<Vec<_>>(), vec!["alpha", "beta"]);
     }
 
     #[test]
     fn load_dir_on_a_missing_directory_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let profiles = Profile::load_dir(dir.path().join("profiles")).unwrap();
+        let profiles = Profile::load_dir(dir.path().join("profiles"), &registry()).unwrap();
         assert!(profiles.is_empty());
     }
 
@@ -524,7 +693,7 @@ credentials:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.yaml"), "name: alpha\n").unwrap();
         std::fs::write(dir.path().join("b.yaml"), "name: alpha\n").unwrap();
-        let err = Profile::load_dir(dir.path()).unwrap_err();
+        let err = Profile::load_dir(dir.path(), &registry()).unwrap_err();
         assert!(
             err.to_string().contains("duplicate profile name `alpha`"),
             "{err}"
@@ -535,7 +704,7 @@ credentials:
     fn load_dir_errors_name_the_offending_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("broken.yaml"), "name: dev\nbogus: 1\n").unwrap();
-        let err = Profile::load_dir(dir.path()).unwrap_err();
+        let err = Profile::load_dir(dir.path(), &registry()).unwrap_err();
         assert!(err.to_string().contains("broken.yaml"), "{err}");
     }
 }

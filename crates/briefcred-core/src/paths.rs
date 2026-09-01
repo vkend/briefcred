@@ -156,6 +156,14 @@ impl Paths {
         self.root.join("ca")
     }
 
+    /// Directory the file-backed master source reads from.
+    ///
+    /// One `0600` file per key inside a `0700` directory. On macOS the
+    /// keychain is used instead and this directory stays empty.
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.root.join("secrets")
+    }
+
     /// The root CA certificate: the public half, and the file that gets
     /// trusted and pointed at by the trust environment variables.
     pub fn ca_cert(&self) -> PathBuf {
@@ -208,6 +216,7 @@ impl Paths {
             self.profiles_dir(),
             self.audit_dir(),
             self.ca_dir(),
+            self.secrets_dir(),
             self.log_dir(),
             self.state_dir(),
         ] {
@@ -282,6 +291,7 @@ mod tests {
         assert!(paths.profiles_dir().ends_with("briefcred/profiles"));
         assert!(paths.audit_dir().ends_with("briefcred/audit"));
         assert!(paths.ca_dir().ends_with("briefcred/ca"));
+        assert!(paths.secrets_dir().ends_with("briefcred/secrets"));
         assert!(paths.daemon_toml().ends_with("briefcred/daemon.toml"));
     }
 
@@ -430,6 +440,7 @@ mod tests {
             paths.profiles_dir(),
             paths.audit_dir(),
             paths.ca_dir(),
+            paths.secrets_dir(),
             paths.log_dir(),
             paths.state_dir(),
         ] {

@@ -64,6 +64,24 @@ pub enum Error {
     /// The root CA could not be generated, loaded, or used to issue a leaf.
     #[error("ca: {0}")]
     Ca(String),
+
+    /// A master credential source could not be read, written, or opened.
+    ///
+    /// Carries the backend's complaint, never the master it was protecting.
+    #[error("master source: {0}")]
+    Master(String),
+
+    /// The master source has nothing filed under this key.
+    ///
+    /// Separate from [`Error::Master`] because it is the one failure the user
+    /// fixes themselves, and the message has to say where to put the secret.
+    #[error("no master credential `{key}` in {location}")]
+    MasterNotFound {
+        /// The key that was looked up.
+        key: String,
+        /// Where the source looked, from [`crate::MasterSource::location`].
+        location: String,
+    },
 }
 
 impl Error {

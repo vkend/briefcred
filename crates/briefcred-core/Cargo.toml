@@ -12,6 +12,7 @@ async-trait.workspace = true
 base64.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+inventory.workspace = true
 postgres-protocol.workspace = true
 rcgen.workspace = true
 regex.workspace = true

@@ -8,12 +8,22 @@ use crate::types::{MintCtx, MintedCredential, RevokeCtx, RevokeOutcome};
 
 /// Where a master credential comes from.
 ///
-/// Phase 3 supplies a Keychain-backed implementation. The returned string is
-/// zeroised when the caller drops it.
+/// Implementations live in [`crate::source`]. The returned string is zeroised
+/// when the caller drops it, and no implementation may log, `Debug`-print, or
+/// serialise what it returns.
 #[async_trait]
 pub trait MasterSource: Send + Sync {
     /// Fetch the master credential stored under `key`.
+    ///
+    /// A key that is simply absent must be
+    /// [`crate::Error::MasterNotFound`] rather than a generic failure, so the
+    /// daemon can tell "you have not set this up" from "the backend broke".
     async fn fetch(&self, key: &str) -> Result<Zeroizing<String>>;
+
+    /// Where this backend looks, for diagnostics and `briefcred doctor`.
+    ///
+    /// Must name the location only, never the secret kept there.
+    fn location(&self) -> String;
 }
 
 /// A backend that can create and destroy short-lived principals.
@@ -31,4 +41,12 @@ pub trait Minter: Send + Sync {
 
     /// Remove a principal previously created by [`Minter::mint`].
     async fn revoke(&self, ctx: RevokeCtx) -> RevokeOutcome;
+}
+
+impl std::fmt::Debug for dyn Minter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Minter")
+            .field("kind", &self.kind())
+            .finish()
+    }
 }

@@ -194,6 +194,19 @@ impl PostgresDynamicMinter {
     }
 }
 
+// Registered next to the implementation rather than in a central table, so a
+// new minter is one file. The `build` function parses the config eagerly so a
+// profile naming a malformed config fails at load rather than at first mint.
+inventory::submit! {
+    crate::registry::MinterFactory {
+        kind: KIND,
+        build: |config| {
+            PostgresConfig::from_value(config)?;
+            Ok(std::sync::Arc::new(PostgresDynamicMinter::new()))
+        },
+    }
+}
+
 #[async_trait]
 impl Minter for PostgresDynamicMinter {
     fn kind(&self) -> &'static str {
