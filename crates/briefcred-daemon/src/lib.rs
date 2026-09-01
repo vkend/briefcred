@@ -12,7 +12,9 @@ pub mod clock;
 pub mod config;
 pub mod error;
 pub mod metrics;
+pub mod profiles;
 pub mod server;
+pub mod session;
 pub mod unlock;
 
 use std::sync::Arc;

@@ -238,6 +238,8 @@ dependencies = [
  "block2",
  "briefcred-core",
  "briefcred-proto",
+ "getrandom 0.3.4",
+ "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
