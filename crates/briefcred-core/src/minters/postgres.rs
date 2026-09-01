@@ -221,7 +221,7 @@ impl Minter for PostgresDynamicMinter {
             .await
             .map_err(|e| Error::Postgres(describe(&e)))?;
         for grant in &config.role_template.grants {
-            tx.batch_execute(&grant_sql(grant, &ctx.mint_id))
+            tx.batch_execute(&grant_sql(grant, &ctx.mint_id)?)
                 .await
                 .map_err(|e| Error::Postgres(describe(&e)))?;
         }
@@ -259,14 +259,29 @@ impl Minter for PostgresDynamicMinter {
             Ok(config) => config,
             Err(e) => return RevokeOutcome::failed(e.to_string()),
         };
-        let template = match grants_from_token(&ctx.revoke_token) {
-            Some(template) => template,
-            None => config.role_template.clone(),
+        // The revoke token crosses a persistence boundary, so it is not
+        // trusted input. A token that does not parse, or whose grants do not
+        // survive validation, is discarded in favour of the profile's own
+        // template rather than being formatted into SQL.
+        let (template, token_note) = match template_from_token(&ctx.revoke_token) {
+            Ok(Some(template)) => (template, None),
+            Ok(None) => (config.role_template.clone(), None),
+            Err(why) => (
+                config.role_template.clone(),
+                Some(format!(
+                    "revoke token rejected ({why}); fell back to the profile template"
+                )),
+            ),
+        };
+
+        let plan = match revoke_plan(&ctx.mint_id, &template) {
+            Ok(plan) => plan,
+            Err(e) => return RevokeOutcome::failed(detail_with(&token_note, e.to_string())),
         };
 
         let client = match connect(&config, &ctx.master).await {
             Ok(client) => client,
-            Err(e) => return RevokeOutcome::failed(e.to_string()),
+            Err(e) => return RevokeOutcome::failed(detail_with(&token_note, e.to_string())),
         };
 
         match client
@@ -278,11 +293,11 @@ impl Minter for PostgresDynamicMinter {
         {
             Ok(None) => return RevokeOutcome::AlreadyGone,
             Ok(Some(_)) => {}
-            Err(e) => return RevokeOutcome::failed(describe(&e)),
+            Err(e) => return RevokeOutcome::failed(detail_with(&token_note, describe(&e))),
         }
 
         let mut owned_error: Option<String> = None;
-        for step in revoke_plan(&ctx.mint_id, &template) {
+        for step in plan {
             let result = client.batch_execute(step.sql()).await;
             match (step, result) {
                 (_, Ok(())) => {}
@@ -299,10 +314,13 @@ impl Minter for PostgresDynamicMinter {
                         ),
                         None => format!("DROP ROLE failed: {}", describe(&e)),
                     };
-                    return RevokeOutcome::failed(detail);
+                    return RevokeOutcome::failed(detail_with(&token_note, detail));
                 }
                 (RevokeStep::Revoke(sql), Err(e)) => {
-                    return RevokeOutcome::failed(format!("`{sql}` failed: {}", describe(&e)));
+                    return RevokeOutcome::failed(detail_with(
+                        &token_note,
+                        format!("`{sql}` failed: {}", describe(&e)),
+                    ));
                 }
             }
         }
@@ -339,15 +357,16 @@ impl RevokeStep {
 /// `DROP ROLE` then fails. PostgreSQL 18 additionally made `DROP OWNED BY`
 /// delete `pg_auth_members` rows, which would strip the master's membership of
 /// the minted role and make a later `REVOKE` fail outright.
-fn revoke_plan(mint_id: &MintId, template: &RoleTemplate) -> Vec<RevokeStep> {
-    let mut plan: Vec<RevokeStep> = template
-        .grants
-        .iter()
-        .map(|grant| RevokeStep::Revoke(revoke_sql(grant, mint_id)))
-        .collect();
+/// A grant that fails validation aborts the whole plan, so an unvalidated
+/// grant can never reach the database however it arrived.
+fn revoke_plan(mint_id: &MintId, template: &RoleTemplate) -> Result<Vec<RevokeStep>> {
+    let mut plan: Vec<RevokeStep> = Vec::with_capacity(template.grants.len() + 2);
+    for grant in &template.grants {
+        plan.push(RevokeStep::Revoke(revoke_sql(grant, mint_id)?));
+    }
     plan.push(RevokeStep::DropOwned(drop_owned_sql(mint_id)));
     plan.push(RevokeStep::DropRole(drop_role_sql(mint_id)));
-    plan
+    Ok(plan)
 }
 
 /// `CREATE ROLE ... LOGIN PASSWORD ... VALID UNTIL ...`.
@@ -372,22 +391,30 @@ fn grant_membership_sql(mint_id: &MintId) -> String {
     )
 }
 
-fn grant_sql(grant: &Grant, mint_id: &MintId) -> String {
-    format!(
+/// `GRANT ... ON ... TO <role>`.
+///
+/// Validation lives here rather than only at the caller so the builder cannot
+/// be reached with a grant that has not been checked, whatever route the grant
+/// arrived by.
+fn grant_sql(grant: &Grant, mint_id: &MintId) -> Result<String> {
+    grant.validate()?;
+    Ok(format!(
         "GRANT {} ON {} TO {}",
         grant.privileges_sql(),
         grant.on,
         escape_identifier(mint_id.as_str()),
-    )
+    ))
 }
 
-fn revoke_sql(grant: &Grant, mint_id: &MintId) -> String {
-    format!(
+/// The exact inverse of [`grant_sql`], and validated on the same terms.
+fn revoke_sql(grant: &Grant, mint_id: &MintId) -> Result<String> {
+    grant.validate()?;
+    Ok(format!(
         "REVOKE {} ON {} FROM {}",
         grant.privileges_sql(),
         grant.on,
         escape_identifier(mint_id.as_str()),
-    )
+    ))
 }
 
 fn drop_owned_sql(mint_id: &MintId) -> String {
@@ -398,8 +425,31 @@ fn drop_role_sql(mint_id: &MintId) -> String {
     format!("DROP ROLE {}", escape_identifier(mint_id.as_str()))
 }
 
-fn grants_from_token(token: &str) -> Option<RoleTemplate> {
-    serde_json::from_str(token).ok()
+/// Parse and validate a revoke token.
+///
+/// The token is state the daemon persisted between mint and revoke, so by the
+/// time it comes back it has crossed a trust boundary and is treated as
+/// untrusted input, exactly like a profile's own config. `Ok(None)` means
+/// there was no token, which is the ordinary "use the profile's template"
+/// case. `Err` says why the token was rejected.
+fn template_from_token(token: &str) -> std::result::Result<Option<RoleTemplate>, String> {
+    if token.trim().is_empty() {
+        return Ok(None);
+    }
+    let template: RoleTemplate =
+        serde_json::from_str(token).map_err(|e| format!("not a valid template: {e}"))?;
+    for grant in &template.grants {
+        grant.validate().map_err(|e| e.to_string())?;
+    }
+    Ok(Some(template))
+}
+
+/// Prefix a failure detail with a note about the revoke token, if there is one.
+fn detail_with(note: &Option<String>, detail: String) -> String {
+    match note {
+        Some(note) => format!("{note}; {detail}"),
+        None => detail,
+    }
 }
 
 fn random_password() -> Zeroizing<String> {
@@ -587,11 +637,11 @@ role_template:
     fn grant_and_revoke_are_symmetric() {
         let g = grant();
         assert_eq!(
-            grant_sql(&g, &mint_id()),
+            grant_sql(&g, &mint_id()).unwrap(),
             "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO \"briefcred_t_0123456789ab\""
         );
         assert_eq!(
-            revoke_sql(&g, &mint_id()),
+            revoke_sql(&g, &mint_id()).unwrap(),
             "REVOKE SELECT, INSERT ON ALL TABLES IN SCHEMA public FROM \"briefcred_t_0123456789ab\""
         );
     }
@@ -623,12 +673,12 @@ role_template:
                 },
             ],
         };
-        let plan = revoke_plan(&mint_id(), &template);
+        let plan = revoke_plan(&mint_id(), &template).unwrap();
         assert_eq!(
             plan,
             vec![
-                RevokeStep::Revoke(revoke_sql(&template.grants[0], &mint_id())),
-                RevokeStep::Revoke(revoke_sql(&template.grants[1], &mint_id())),
+                RevokeStep::Revoke(revoke_sql(&template.grants[0], &mint_id()).unwrap()),
+                RevokeStep::Revoke(revoke_sql(&template.grants[1], &mint_id()).unwrap()),
                 RevokeStep::DropOwned(drop_owned_sql(&mint_id())),
                 RevokeStep::DropRole(drop_role_sql(&mint_id())),
             ]
@@ -651,7 +701,7 @@ role_template:
 
     #[test]
     fn a_template_with_no_grants_still_drops_the_role() {
-        let plan = revoke_plan(&mint_id(), &RoleTemplate { grants: vec![] });
+        let plan = revoke_plan(&mint_id(), &RoleTemplate { grants: vec![] }).unwrap();
         assert_eq!(
             plan,
             vec![
@@ -667,8 +717,45 @@ role_template:
             grants: vec![grant()],
         };
         let token = serde_json::to_string(&template).unwrap();
-        assert_eq!(grants_from_token(&token), Some(template));
-        assert_eq!(grants_from_token("not json"), None);
+        assert_eq!(template_from_token(&token), Ok(Some(template)));
+        assert_eq!(template_from_token(""), Ok(None));
+        assert_eq!(template_from_token("   "), Ok(None));
+        assert!(template_from_token("not json").is_err());
+    }
+
+    #[test]
+    fn a_tampered_revoke_token_never_reaches_sql() {
+        let tampered = r#"{"grants":[{"privileges":["SELECT"],"on":"TABLE x; DROP TABLE y"}]}"#;
+
+        // The token is rejected outright rather than being trusted because it
+        // was written by an earlier run of briefcred itself.
+        let why = template_from_token(tampered).unwrap_err();
+        assert!(why.contains("TABLE x; DROP TABLE y"), "{why}");
+
+        // And even if it were handed straight to the statement builders, they
+        // refuse it: validation lives in the builder, not only at the caller.
+        let tampered_template: RoleTemplate = serde_json::from_str(tampered).unwrap();
+        let grant = &tampered_template.grants[0];
+        assert!(revoke_sql(grant, &mint_id()).is_err());
+        assert!(grant_sql(grant, &mint_id()).is_err());
+        assert!(revoke_plan(&mint_id(), &tampered_template).is_err());
+    }
+
+    #[test]
+    fn a_rejected_token_falls_back_to_the_profile_template() {
+        // The fallback path a revoke takes: the token is discarded, the
+        // profile's own template still produces a usable plan, and the
+        // rejection is carried into any failure detail.
+        let note =
+            Some("revoke token rejected (bad); fell back to the profile template".to_string());
+        assert!(detail_with(&note, "DROP ROLE failed: 42501".into())
+            .starts_with("revoke token rejected"));
+        assert_eq!(detail_with(&None, "boom".into()), "boom");
+
+        let fallback = RoleTemplate {
+            grants: vec![grant()],
+        };
+        assert_eq!(revoke_plan(&mint_id(), &fallback).unwrap().len(), 3);
     }
 
     #[test]
