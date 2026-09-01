@@ -10,11 +10,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use briefcred_core::ca::{machine_hostname, CertificateAuthority};
+use briefcred_core::keystore::KeyStore;
 use briefcred_core::paths::Paths;
 
 use crate::error::{Error, Result};
 use crate::lifecycle;
 use crate::service::{unit_text, ServiceSpec};
+use crate::trust;
 
 /// The `daemon.toml` written on a first install.
 ///
@@ -74,6 +77,28 @@ pub fn wait_until_gone(sock: &Path, timeout: Duration) -> bool {
     }
 }
 
+/// The switches `briefcred install` accepts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InstallOptions {
+    /// Print what would be written and run, and change nothing.
+    pub dry_run: bool,
+    /// Also add the root CA to the system trust store, which needs `sudo`.
+    pub trust_ca: bool,
+}
+
+/// The root CA an install found or created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaSummary {
+    /// Where the certificate is.
+    pub cert: PathBuf,
+    /// Whether this install generated it, as opposed to finding it.
+    pub generated: bool,
+    /// Its SHA-256 fingerprint, so the user can check what they are trusting.
+    pub fingerprint: String,
+    /// Which key store holds the private key.
+    pub keystore: String,
+}
+
 /// What an install did, or would do under `--dry-run`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -89,18 +114,49 @@ pub struct Report {
     ///
     /// Always false for a dry run, which starts nothing.
     pub ready: bool,
+    /// The root CA. `None` for a dry run, which generates nothing.
+    pub ca: Option<CaSummary>,
+    /// The trust-store commands. Empty unless `--trust-ca` was given.
+    pub trust: Vec<String>,
+    /// Whether the trust step succeeded. `None` when it was not run.
+    pub trusted: Option<bool>,
+    /// What the trust step complained about, if it failed.
+    ///
+    /// A failure here does not fail the install: the daemon is provisioned
+    /// and running either way, and the user can retry the one command.
+    pub trust_error: Option<String>,
 }
 
 /// Provision the layout, write the unit, and start the daemon.
 ///
 /// With `dry_run` the report is filled in exactly as it would be, and nothing
 /// is written or executed.
-pub fn install(paths: &Paths, daemon_binary: &Path, dry_run: bool) -> Result<Report> {
-    let mut report = provision(paths, daemon_binary, dry_run)?;
-    if !dry_run {
-        lifecycle::run(&lifecycle::start_plan(paths))?;
-        report.ready = wait_until_listening(paths.sock(), READY_TIMEOUT);
+pub fn install(
+    paths: &Paths,
+    daemon_binary: &Path,
+    options: InstallOptions,
+    store: &dyn KeyStore,
+) -> Result<Report> {
+    let mut report = provision(paths, daemon_binary, options, store)?;
+    if options.dry_run {
+        return Ok(report);
     }
+
+    // Trusting comes before starting: it is the step that can fail on a
+    // mistyped password, and failing it after the daemon is up would leave
+    // the user unsure which half of the install took.
+    if options.trust_ca {
+        match trust::run(&trust::trust_plan(paths)) {
+            Ok(()) => report.trusted = Some(true),
+            Err(err) => {
+                report.trusted = Some(false);
+                report.trust_error = Some(err.to_string());
+            }
+        }
+    }
+
+    lifecycle::run(&lifecycle::start_plan(paths))?;
+    report.ready = wait_until_listening(paths.sock(), READY_TIMEOUT);
     Ok(report)
 }
 
@@ -109,7 +165,13 @@ pub fn install(paths: &Paths, daemon_binary: &Path, dry_run: bool) -> Result<Rep
 /// Separate from [`install`] so it can be tested without a service manager;
 /// a test that ran `launchctl bootstrap` would load a real agent for the
 /// developer running it.
-pub fn provision(paths: &Paths, daemon_binary: &Path, dry_run: bool) -> Result<Report> {
+pub fn provision(
+    paths: &Paths,
+    daemon_binary: &Path,
+    options: InstallOptions,
+    store: &dyn KeyStore,
+) -> Result<Report> {
+    let dry_run = options.dry_run;
     let mut report = Report::default();
 
     let dirs = [
@@ -147,6 +209,29 @@ pub fn provision(paths: &Paths, daemon_binary: &Path, dry_run: bool) -> Result<R
         set_mode(&unit, 0o644)?;
     }
     report.files.push((unit, "service unit"));
+
+    if !dry_run {
+        // Idempotent: a reinstall keeps the CA the machine already trusts,
+        // because replacing it would silently break every trusted copy.
+        let (ca, generated) = CertificateAuthority::ensure(paths, store, &machine_hostname())?;
+        report.ca = Some(CaSummary {
+            cert: paths.ca_cert(),
+            generated,
+            fingerprint: ca.info()?.fingerprint_sha256,
+            keystore: store.kind().to_string(),
+        });
+        if generated {
+            report.files.push((paths.ca_cert(), "root CA certificate"));
+        } else {
+            report.kept.push(paths.ca_cert());
+        }
+    } else {
+        report.files.push((paths.ca_cert(), "root CA certificate"));
+    }
+
+    if options.trust_ca {
+        report.trust = trust::trust_plan(paths).lines();
+    }
 
     report.commands = lifecycle::start_plan(paths).lines();
     Ok(report)
@@ -194,6 +279,9 @@ pub fn remove_files(paths: &Paths) -> Result<Removal> {
     removal
         .retained
         .push((paths.audit_dir(), "the audit trail is never deleted"));
+    removal
+        .retained
+        .push((paths.ca_dir(), "the CA this machine already trusts"));
     removal
         .retained
         .push((paths.root().to_path_buf(), "profiles and configuration"));

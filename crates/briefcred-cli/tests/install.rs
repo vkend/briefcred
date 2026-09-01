@@ -12,9 +12,33 @@ use std::path::Path;
 use std::time::Duration;
 
 use briefcred_cli::install::{
-    provision, remove_files, wait_until_gone, wait_until_listening, STARTER_CONFIG,
+    provision, remove_files, wait_until_gone, wait_until_listening, InstallOptions, Report,
+    STARTER_CONFIG,
 };
+use briefcred_core::ca::CertificateAuthority;
+use briefcred_core::keystore::{FileKeyStore, KeyStore, CA_KEY_ITEM};
 use briefcred_core::paths::{Paths, Platform};
+
+/// A key store under the test's own temporary directory.
+///
+/// Never the platform default: on macOS that is the developer's real login
+/// keychain, and a test suite has no business writing into it.
+fn store_for(paths: &Paths) -> FileKeyStore {
+    FileKeyStore::new(paths.ca_dir())
+}
+
+fn run_provision(paths: &Paths, binary: &str, dry_run: bool) -> Report {
+    provision(
+        paths,
+        Path::new(binary),
+        InstallOptions {
+            dry_run,
+            trust_ca: false,
+        },
+        &store_for(paths),
+    )
+    .unwrap()
+}
 
 fn paths_at(root: &Path) -> Paths {
     let root = root.to_path_buf();
@@ -34,7 +58,7 @@ fn a_dry_run_writes_nothing_but_reports_everything() {
     let root = temp.path().join("home");
     let paths = paths_at(&root);
 
-    let report = provision(&paths, Path::new("/opt/bin/briefcred-daemon"), true).unwrap();
+    let report = run_provision(&paths, "/opt/bin/briefcred-daemon", true);
 
     assert!(!root.exists(), "a dry run must not create the home");
     assert!(report.directories.contains(&paths.audit_dir()));
@@ -53,7 +77,7 @@ fn provisioning_creates_a_private_layout_and_a_readable_unit() {
     let root = temp.path().join("home");
     let paths = paths_at(&root);
 
-    provision(&paths, Path::new("/opt/bin/briefcred-daemon"), false).unwrap();
+    run_provision(&paths, "/opt/bin/briefcred-daemon", false);
 
     for dir in [
         paths.root().to_path_buf(),
@@ -91,7 +115,7 @@ fn the_starter_config_is_all_comments_so_it_changes_no_behaviour() {
     // It must still parse as the defaults once written.
     let temp = tempfile::tempdir().unwrap();
     let paths = paths_at(&temp.path().join("home"));
-    provision(&paths, Path::new("/opt/bin/briefcred-daemon"), false).unwrap();
+    run_provision(&paths, "/opt/bin/briefcred-daemon", false);
     let written = std::fs::read_to_string(paths.daemon_toml()).unwrap();
     assert_eq!(written, STARTER_CONFIG);
 }
@@ -100,12 +124,12 @@ fn the_starter_config_is_all_comments_so_it_changes_no_behaviour() {
 fn provisioning_twice_is_a_no_op_that_keeps_an_edited_config() {
     let temp = tempfile::tempdir().unwrap();
     let paths = paths_at(&temp.path().join("home"));
-    let binary = Path::new("/opt/bin/briefcred-daemon");
+    let binary = "/opt/bin/briefcred-daemon";
 
-    provision(&paths, binary, false).unwrap();
+    run_provision(&paths, binary, false);
     std::fs::write(paths.daemon_toml(), "retention_days = 7\n").unwrap();
 
-    let second = provision(&paths, binary, false).unwrap();
+    let second = run_provision(&paths, binary, false);
 
     assert_eq!(
         std::fs::read_to_string(paths.daemon_toml()).unwrap(),
@@ -121,8 +145,8 @@ fn a_reinstall_rewrites_the_unit_so_a_moved_binary_is_picked_up() {
     let temp = tempfile::tempdir().unwrap();
     let paths = paths_at(&temp.path().join("home"));
 
-    provision(&paths, Path::new("/old/briefcred-daemon"), false).unwrap();
-    provision(&paths, Path::new("/new/briefcred-daemon"), false).unwrap();
+    run_provision(&paths, "/old/briefcred-daemon", false);
+    run_provision(&paths, "/new/briefcred-daemon", false);
 
     let plist = std::fs::read_to_string(paths.service_file()).unwrap();
     assert!(plist.contains("/new/briefcred-daemon"), "{plist}");
@@ -133,7 +157,7 @@ fn a_reinstall_rewrites_the_unit_so_a_moved_binary_is_picked_up() {
 fn uninstalling_removes_the_unit_and_keeps_the_audit_trail() {
     let temp = tempfile::tempdir().unwrap();
     let paths = paths_at(&temp.path().join("home"));
-    provision(&paths, Path::new("/opt/bin/briefcred-daemon"), false).unwrap();
+    run_provision(&paths, "/opt/bin/briefcred-daemon", false);
     std::fs::write(paths.audit_dir().join("audit-2026-09-01.jsonl"), "{}\n").unwrap();
 
     let removal = remove_files(&paths).unwrap();
@@ -158,7 +182,7 @@ fn uninstalling_removes_the_unit_and_keeps_the_audit_trail() {
 fn uninstalling_twice_is_not_an_error() {
     let temp = tempfile::tempdir().unwrap();
     let paths = paths_at(&temp.path().join("home"));
-    provision(&paths, Path::new("/opt/bin/briefcred-daemon"), false).unwrap();
+    run_provision(&paths, "/opt/bin/briefcred-daemon", false);
 
     assert_eq!(remove_files(&paths).unwrap().removed.len(), 1);
     assert!(remove_files(&paths).unwrap().removed.is_empty());
@@ -168,7 +192,7 @@ fn uninstalling_twice_is_not_an_error() {
 fn uninstalling_clears_a_socket_the_daemon_left_behind() {
     let temp = tempfile::tempdir().unwrap();
     let paths = paths_at(&temp.path().join("home"));
-    provision(&paths, Path::new("/opt/bin/briefcred-daemon"), false).unwrap();
+    run_provision(&paths, "/opt/bin/briefcred-daemon", false);
     std::fs::write(paths.sock(), b"stale").unwrap();
 
     let removal = remove_files(&paths).unwrap();
@@ -217,7 +241,7 @@ fn a_socket_file_with_no_listener_is_not_mistaken_for_a_daemon() {
 fn a_dry_run_never_claims_the_daemon_is_ready() {
     let temp = tempfile::tempdir().unwrap();
     let paths = paths_at(&temp.path().join("home"));
-    let report = provision(&paths, Path::new("/opt/bin/briefcred-daemon"), true).unwrap();
+    let report = run_provision(&paths, "/opt/bin/briefcred-daemon", true);
     assert!(!report.ready);
 }
 
@@ -237,4 +261,117 @@ fn waiting_for_a_socket_to_go_quiet_returns_once_the_listener_is_gone() {
     let started = std::time::Instant::now();
     assert!(wait_until_gone(&sock, Duration::from_secs(10)));
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn provisioning_creates_the_root_ca_and_reports_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+
+    let report = run_provision(&paths, "/opt/bin/briefcred-daemon", false);
+
+    let ca = report.ca.expect("provisioning must create a CA");
+    assert!(ca.generated, "the first install generates one");
+    assert_eq!(ca.cert, paths.ca_cert());
+    assert_eq!(ca.keystore, "file");
+    assert_eq!(ca.fingerprint.len(), 64);
+
+    // Present, usable, and with its private key kept out of the public half.
+    let loaded = CertificateAuthority::load(&paths, &store_for(&paths))
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.info().unwrap().fingerprint_sha256, ca.fingerprint);
+    loaded.issue_leaf(&["localhost".to_string()]).unwrap();
+    let on_disk = std::fs::read_to_string(paths.ca_cert()).unwrap();
+    assert!(!on_disk.contains("PRIVATE KEY"), "{on_disk}");
+}
+
+#[test]
+fn the_ca_certificate_is_readable_by_the_runtimes_that_need_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+    run_provision(&paths, "/opt/bin/briefcred-daemon", false);
+
+    assert_eq!(mode(&paths.ca_cert()), 0o644);
+    assert_eq!(mode(&store_for(&paths).path(CA_KEY_ITEM)), 0o600);
+}
+
+#[test]
+fn reinstalling_keeps_the_ca_that_the_machine_already_trusts() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+    let first = run_provision(&paths, "/opt/bin/briefcred-daemon", false)
+        .ca
+        .unwrap();
+
+    let second = run_provision(&paths, "/opt/bin/briefcred-daemon", false)
+        .ca
+        .unwrap();
+
+    assert!(!second.generated, "a reinstall must not replace the CA");
+    assert_eq!(second.fingerprint, first.fingerprint);
+}
+
+#[test]
+fn a_dry_run_creates_no_ca_and_touches_no_key_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+
+    let report = run_provision(&paths, "/opt/bin/briefcred-daemon", true);
+
+    assert!(report.ca.is_none(), "{:?}", report.ca);
+    assert!(!paths.ca_cert().exists());
+    assert!(!temp.path().join("home").exists());
+}
+
+#[test]
+fn trust_ca_reports_the_command_it_would_run_without_running_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+
+    let report = provision(
+        &paths,
+        Path::new("/opt/bin/briefcred-daemon"),
+        InstallOptions {
+            dry_run: false,
+            trust_ca: true,
+        },
+        &store_for(&paths),
+    )
+    .unwrap();
+
+    assert_eq!(report.trust.len(), 1, "{:?}", report.trust);
+    assert!(report.trust[0].starts_with("sudo security add-trusted-cert"));
+    assert!(
+        report.trust[0].ends_with(&paths.ca_cert().display().to_string()),
+        "{:?}",
+        report.trust
+    );
+    // Provisioning plans the trust step; only `install` may execute it.
+    assert_eq!(report.trusted, None);
+}
+
+#[test]
+fn an_install_without_trust_ca_plans_no_privileged_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+    let report = run_provision(&paths, "/opt/bin/briefcred-daemon", false);
+    assert!(report.trust.is_empty(), "{:?}", report.trust);
+}
+
+#[test]
+fn uninstalling_keeps_the_ca_so_a_reinstall_stays_trusted() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+    run_provision(&paths, "/opt/bin/briefcred-daemon", false);
+
+    let removal = remove_files(&paths).unwrap();
+
+    assert!(paths.ca_cert().exists(), "uninstall must not delete the CA");
+    assert!(store_for(&paths).get(CA_KEY_ITEM).unwrap().is_some());
+    assert!(
+        removal.retained.iter().any(|(p, _)| *p == paths.ca_dir()),
+        "and must say so: {:?}",
+        removal.retained
+    );
 }

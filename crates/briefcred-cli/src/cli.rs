@@ -2,12 +2,13 @@
 
 use std::path::Path;
 
+use briefcred_core::ca::machine_hostname;
 use briefcred_core::paths::Paths;
 use briefcred_proto::Response;
 use clap::{Parser, Subcommand};
 
 use crate::error::{Error, Result};
-use crate::{client, install, lifecycle};
+use crate::{ca, client, install, lifecycle, trust};
 
 /// A local, biometric-gated credential broker for AI agents and tooling.
 #[derive(Debug, Parser)]
@@ -26,15 +27,39 @@ pub enum Command {
         /// Print what would be written and run, and change nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Also add the root CA to the system trust store. Needs sudo.
+        #[arg(long)]
+        trust_ca: bool,
     },
     /// Stop the daemon and remove the service unit. Leaves the audit log.
     Uninstall,
+    /// Inspect and manage the per-machine root certificate authority.
+    Ca {
+        /// What to do with the CA.
+        #[command(subcommand)]
+        action: CaAction,
+    },
     /// Inspect and control the running daemon.
     Daemon {
         /// The lifecycle action.
         #[command(subcommand)]
         action: DaemonAction,
     },
+}
+
+/// The `briefcred ca` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum CaAction {
+    /// Print the CA's subject, fingerprint, validity, and trust state.
+    Show,
+    /// Replace the CA with a new one. Every issued leaf stops being trusted.
+    Regenerate {
+        /// Add the new CA to the system trust store. Needs sudo.
+        #[arg(long)]
+        trust_ca: bool,
+    },
+    /// Remove the CA from the system trust store, keeping the files. Needs sudo.
+    Untrust,
 }
 
 /// The `briefcred daemon` subcommands.
@@ -54,9 +79,10 @@ pub enum DaemonAction {
 pub async fn run(cli: Cli) -> Result<()> {
     let paths = Paths::discover()?;
     match cli.command {
-        Command::Install { dry_run } => {
+        Command::Install { dry_run, trust_ca } => {
             let binary = lifecycle::daemon_binary(&current_exe()?)?;
-            let report = install::install(&paths, &binary, dry_run)?;
+            let options = install::InstallOptions { dry_run, trust_ca };
+            let report = install::install(&paths, &binary, options, keystore(&paths)?.as_ref())?;
             print_install(&report, dry_run);
             Ok(())
         }
@@ -65,7 +91,57 @@ pub async fn run(cli: Cli) -> Result<()> {
             print_uninstall(&removal);
             Ok(())
         }
+        Command::Ca { action } => run_ca(&paths, action),
         Command::Daemon { action } => run_daemon(&paths, action).await,
+    }
+}
+
+/// The key store the CA's private key lives in, as configured.
+fn keystore(paths: &Paths) -> Result<Box<dyn briefcred_core::KeyStore>> {
+    Ok(briefcred_core::ca::CaConfig::load(paths)?.open_keystore(paths)?)
+}
+
+fn run_ca(paths: &Paths, action: CaAction) -> Result<()> {
+    let store = keystore(paths)?;
+    match action {
+        CaAction::Show => {
+            let status = ca::describe(paths, store.as_ref(), trust::is_trusted(paths))?;
+            print_ca(&status);
+            Ok(())
+        }
+        CaAction::Regenerate { trust_ca } => {
+            // The old certificate has to be untrusted while the file still
+            // holds it: `security remove-trusted-cert` matches on content,
+            // and after the replacement there is nothing left to match.
+            let untrusted = if paths.ca_cert().exists() {
+                trust::run(&trust::untrust_plan(paths)).err()
+            } else {
+                None
+            };
+
+            let result = ca::regenerate(paths, store.as_ref(), &machine_hostname())?;
+            print_regenerated(&result, untrusted.as_ref());
+
+            if trust_ca {
+                trust::run(&trust::trust_plan(paths))?;
+                println!("  trusted    the new CA is in the system trust store");
+            } else {
+                println!("\nthe new CA is not trusted yet; run:");
+                for line in trust::trust_plan(paths).lines() {
+                    println!("  {line}");
+                }
+            }
+            Ok(())
+        }
+        CaAction::Untrust => {
+            trust::run(&trust::untrust_plan(paths))?;
+            println!("the CA is no longer in the system trust store");
+            println!(
+                "  kept       {} (run 'briefcred install --trust-ca' to trust it again)",
+                paths.ca_cert().display()
+            );
+            Ok(())
+        }
     }
 }
 
@@ -143,8 +219,30 @@ fn print_install(report: &install::Report, dry_run: bool) {
     for command in &report.commands {
         println!("  {verb}run        {command}");
     }
+    for command in &report.trust {
+        println!("  {verb}run        {command}");
+    }
+    if let Some(ca) = &report.ca {
+        println!(
+            "  ca         {} ({}, key in the {} store)",
+            ca.fingerprint,
+            if ca.generated {
+                "generated"
+            } else {
+                "existing"
+            },
+            ca.keystore
+        );
+    }
     if dry_run {
         return;
+    }
+    if let Some(detail) = &report.trust_error {
+        println!("\nthe CA could not be trusted: {detail}");
+        println!("run this yourself, then 'briefcred ca show' to confirm:");
+        for line in &report.trust {
+            println!("  {line}");
+        }
     }
     if report.ready {
         println!("\nthe daemon is listening; 'briefcred daemon status' has the details");
@@ -168,6 +266,50 @@ fn print_uninstall(removal: &install::Removal) {
     if let Some(note) = &removal.note {
         println!("  note       the service manager said: {note}");
     }
+}
+
+fn print_ca(status: &ca::Status) {
+    let rfc3339 = &time::format_description::well_known::Rfc3339;
+    println!("briefcred root CA");
+    println!("  subject      {}", status.info.common_name);
+    println!("  fingerprint  sha256:{}", status.info.fingerprint_sha256);
+    println!(
+        "  valid        {} to {}",
+        status
+            .info
+            .not_before
+            .format(rfc3339)
+            .unwrap_or_else(|_| status.info.not_before.to_string()),
+        status
+            .info
+            .not_after
+            .format(rfc3339)
+            .unwrap_or_else(|_| status.info.not_after.to_string())
+    );
+    println!("  certificate  {}", status.cert.display());
+    println!(
+        "  private key  {} ({} store)",
+        status.key_location, status.keystore
+    );
+    match status.trusted {
+        Some(true) => println!("  trusted      yes"),
+        Some(false) => println!("  trusted      no; run 'briefcred install --trust-ca' to add it"),
+        None => println!("  trusted      unknown"),
+    }
+}
+
+fn print_regenerated(result: &ca::Regenerated, untrust_error: Option<&crate::Error>) {
+    println!("briefcred ca regenerate");
+    match &result.previous_fingerprint {
+        Some(old) => println!("  replaced     sha256:{old}"),
+        None => println!("  replaced     nothing; there was no CA"),
+    }
+    println!("  fingerprint  sha256:{}", result.info.fingerprint_sha256);
+    println!("  certificate  {}", result.cert.display());
+    if let Some(err) = untrust_error {
+        println!("  note         the old CA could not be untrusted: {err}");
+    }
+    println!("\nevery certificate the old CA issued is now untrusted.");
 }
 
 fn print_status(status: &Response, sock: &Path) {
@@ -229,6 +371,12 @@ mod tests {
         for argv in [
             vec!["briefcred", "install"],
             vec!["briefcred", "install", "--dry-run"],
+            vec!["briefcred", "install", "--trust-ca"],
+            vec!["briefcred", "install", "--dry-run", "--trust-ca"],
+            vec!["briefcred", "ca", "show"],
+            vec!["briefcred", "ca", "regenerate"],
+            vec!["briefcred", "ca", "regenerate", "--trust-ca"],
+            vec!["briefcred", "ca", "untrust"],
             vec!["briefcred", "uninstall"],
             vec!["briefcred", "daemon", "status"],
             vec!["briefcred", "daemon", "start"],
@@ -243,6 +391,8 @@ mod tests {
     fn an_unknown_daemon_action_is_rejected_rather_than_guessed() {
         assert!(Cli::try_parse_from(["briefcred", "daemon", "reboot"]).is_err());
         assert!(Cli::try_parse_from(["briefcred", "instal"]).is_err());
+        assert!(Cli::try_parse_from(["briefcred", "ca", "trust"]).is_err());
+        assert!(Cli::try_parse_from(["briefcred", "ca"]).is_err());
     }
 
     #[test]
