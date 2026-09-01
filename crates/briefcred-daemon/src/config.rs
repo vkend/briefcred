@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use briefcred_core::ca::CaConfig;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
@@ -29,6 +30,11 @@ pub struct Config {
     pub metrics_port: u16,
     /// Whether to serve the Prometheus endpoint at all.
     pub metrics_enabled: bool,
+    /// Where the root CA's private key is kept.
+    ///
+    /// Owned by `briefcred_core::ca` rather than parsed twice: the CLI reads
+    /// the same table out of this file without needing the rest of the schema.
+    pub ca: CaConfig,
 }
 
 impl Default for Config {
@@ -37,6 +43,7 @@ impl Default for Config {
             retention_days: DEFAULT_RETENTION_DAYS,
             metrics_port: DEFAULT_METRICS_PORT,
             metrics_enabled: true,
+            ca: CaConfig::default(),
         }
     }
 }
@@ -81,6 +88,13 @@ mod tests {
         assert_eq!(config.retention_days, 90);
         assert_eq!(config.metrics_port, 9317);
         assert!(config.metrics_enabled);
+    }
+
+    #[test]
+    fn the_ca_table_is_part_of_the_schema_rather_than_an_unknown_key() {
+        let config = Config::from_toml_str("[ca]\nkeystore = \"file\"\n").unwrap();
+        assert_eq!(config.ca.keystore, Some(briefcred_core::KeystoreKind::File));
+        assert_eq!(Config::from_toml_str("").unwrap().ca.keystore, None);
     }
 
     #[test]

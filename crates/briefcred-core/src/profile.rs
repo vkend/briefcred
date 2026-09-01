@@ -39,6 +39,14 @@ pub struct Profile {
     /// Environment handed to the subprocess, with `${...}` templates.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Which of [`crate::ca::TRUST_ENV_VARS`] to set for the subprocess.
+    ///
+    /// Absent means all of them, which is what almost every profile wants. An
+    /// explicit list narrows it, and an explicit empty list opts the profile
+    /// out of the trust environment entirely — useful for a subprocess that
+    /// must keep talking to the real internet through its own trust store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_env: Option<Vec<String>>,
 }
 
 /// Per-profile unlock policy.
@@ -288,6 +296,19 @@ impl Profile {
                     "`exec.allow_args` entry `{pattern}` is not a valid regex: {e}"
                 ))
             })?;
+        }
+
+        // A name briefcred does not know is a typo, not a feature: silently
+        // ignoring it would leave the user believing a runtime was covered.
+        if let Some(names) = &self.trust_env {
+            for name in names {
+                if !crate::ca::TRUST_ENV_VARS.contains(&name.as_str()) {
+                    return Err(Error::profile(format!(
+                        "`trust_env` entry `{name}` is not one of {}",
+                        crate::ca::TRUST_ENV_VARS.join(", ")
+                    )));
+                }
+            }
         }
 
         for (key, value) in &self.env {
