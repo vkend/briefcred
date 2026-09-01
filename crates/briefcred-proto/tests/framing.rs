@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use briefcred_proto::{
-    decode_frame, encode_frame, read_frame, write_frame, FrameError, Request, Response,
-    MAX_FRAME_BYTES,
+    decode_frame, encode_frame, read_frame, write_frame, CredentialSummary, FrameError,
+    ProfileSummary, Request, Response, MAX_FRAME_BYTES,
 };
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
@@ -21,13 +21,59 @@ fn sample_status() -> Response {
     }
 }
 
+fn sample_profile() -> ProfileSummary {
+    ProfileSummary {
+        name: "analytics".into(),
+        description: Some("read-only analytics shell".into()),
+        unlock_policy: "biometric".into(),
+        unlock_cache_secs: 300,
+        credentials: vec![CredentialSummary {
+            name: "db".into(),
+            kind: "postgres-dynamic".into(),
+            ttl_secs: 900,
+            source_key: "analytics-db".into(),
+        }],
+    }
+}
+
 #[tokio::test]
 async fn every_request_and_response_round_trips() {
-    let requests = [Request::Ping, Request::Status, Request::Shutdown];
+    let requests = [
+        Request::Ping,
+        Request::Status,
+        Request::Shutdown,
+        Request::ListProfiles,
+        Request::ShowProfile {
+            name: "analytics".into(),
+        },
+        Request::OpenSession {
+            profile: "analytics".into(),
+        },
+        Request::CloseSession {
+            session_id: "s-1".into(),
+        },
+    ];
     let responses = [
         Response::Pong,
         sample_status(),
         Response::ShuttingDown,
+        Response::Profiles {
+            profiles: vec![sample_profile()],
+        },
+        Response::Profile {
+            profile: sample_profile(),
+        },
+        Response::SessionOpened {
+            session_id: "s-1".into(),
+            expires_at: OffsetDateTime::UNIX_EPOCH,
+        },
+        Response::SessionClosed {
+            session_id: "s-1".into(),
+        },
+        Response::Locked {
+            reason: "cancelled".into(),
+            message: "the Touch ID prompt was cancelled".into(),
+        },
         Response::Error {
             message: "nope".into(),
         },
@@ -118,4 +164,57 @@ fn a_request_names_its_own_variant_for_the_dispatch_table() {
     assert_eq!(Request::Ping.name(), "ping");
     assert_eq!(Request::Status.name(), "status");
     assert_eq!(Request::Shutdown.name(), "shutdown");
+    assert_eq!(Request::ListProfiles.name(), "list_profiles");
+    assert_eq!(
+        Request::ShowProfile { name: "x".into() }.name(),
+        "show_profile"
+    );
+    assert_eq!(
+        Request::OpenSession {
+            profile: "x".into()
+        }
+        .name(),
+        "open_session"
+    );
+    assert_eq!(
+        Request::CloseSession {
+            session_id: "x".into()
+        }
+        .name(),
+        "close_session"
+    );
+}
+
+/// The dispatch table is keyed on `NAMES`, so a variant missing from it would
+/// be a request the daemon silently has no handler for.
+#[test]
+fn the_name_list_covers_every_request_variant_exactly_once() {
+    let variants = [
+        Request::Ping,
+        Request::Status,
+        Request::Shutdown,
+        Request::ListProfiles,
+        Request::ShowProfile { name: "x".into() },
+        Request::OpenSession {
+            profile: "x".into(),
+        },
+        Request::CloseSession {
+            session_id: "x".into(),
+        },
+    ];
+    let mut names: Vec<&str> = variants.iter().map(|r| r.name()).collect();
+    names.sort_unstable();
+    let mut declared = Request::NAMES.to_vec();
+    declared.sort_unstable();
+    assert_eq!(names, declared);
+}
+
+/// A summary is the only profile shape that crosses the socket, so its JSON is
+/// where an accidentally exposed field would show up.
+#[test]
+fn a_profile_summary_carries_key_names_and_never_a_secret() {
+    let json = serde_json::to_string(&sample_profile()).unwrap();
+    assert!(json.contains("analytics-db"), "{json}");
+    assert!(!json.contains("password"), "{json}");
+    assert!(!json.contains("config"), "{json}");
 }

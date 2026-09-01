@@ -19,6 +19,27 @@ pub enum Request {
     Status,
     /// Ask the daemon to shut down gracefully.
     Shutdown,
+    /// List the profiles the daemon currently has loaded.
+    ListProfiles,
+    /// Ask for one profile as the daemon parsed it.
+    ShowProfile {
+        /// The profile's `name`.
+        name: String,
+    },
+    /// Prove presence and open a session for a profile.
+    ///
+    /// Opening a session runs the profile's unlock gate and fetches the master
+    /// credential for every credential it declares. It mints nothing yet:
+    /// minting is Phase 3b, and it happens against an already-open session.
+    OpenSession {
+        /// The profile to open a session for.
+        profile: String,
+    },
+    /// Close a session, zeroising its master credentials at once.
+    CloseSession {
+        /// The identifier from [`Response::SessionOpened`].
+        session_id: String,
+    },
 }
 
 impl Request {
@@ -31,11 +52,23 @@ impl Request {
             Request::Ping => "ping",
             Request::Status => "status",
             Request::Shutdown => "shutdown",
+            Request::ListProfiles => "list_profiles",
+            Request::ShowProfile { .. } => "show_profile",
+            Request::OpenSession { .. } => "open_session",
+            Request::CloseSession { .. } => "close_session",
         }
     }
 
     /// Every variant name the daemon must have a handler for.
-    pub const NAMES: &'static [&'static str] = &["ping", "status", "shutdown"];
+    pub const NAMES: &'static [&'static str] = &[
+        "ping",
+        "status",
+        "shutdown",
+        "list_profiles",
+        "show_profile",
+        "open_session",
+        "close_session",
+    ];
 }
 
 /// A message from the daemon back to a client.
@@ -63,9 +96,83 @@ pub enum Response {
     },
     /// Acknowledgement of [`Request::Shutdown`], sent before the daemon stops.
     ShuttingDown,
+    /// Answer to [`Request::ListProfiles`], in name order.
+    Profiles {
+        /// One summary per loaded profile.
+        profiles: Vec<ProfileSummary>,
+    },
+    /// Answer to [`Request::ShowProfile`].
+    Profile {
+        /// The profile, as the daemon parsed it.
+        profile: ProfileSummary,
+    },
+    /// Answer to [`Request::OpenSession`].
+    ///
+    /// Carries no credential material: the session id is a handle the client
+    /// presents on later requests, and the minted secrets never leave the
+    /// daemon on this path.
+    SessionOpened {
+        /// Opaque handle for this session.
+        session_id: String,
+        /// When the daemon will evict the session if it goes idle.
+        #[serde(with = "time::serde::rfc3339")]
+        expires_at: OffsetDateTime,
+    },
+    /// Answer to [`Request::CloseSession`].
+    SessionClosed {
+        /// The session that was closed.
+        session_id: String,
+    },
+    /// The unlock gate refused, so nothing was opened.
+    ///
+    /// Distinct from [`Response::Error`] because a cancelled Touch ID prompt is
+    /// a normal outcome the client reports calmly rather than a daemon fault.
+    Locked {
+        /// Machine-readable reason: `cancelled`, `failed`, `no_aqua_session`,
+        /// or `unsupported`.
+        reason: String,
+        /// What the user should do about it.
+        message: String,
+    },
     /// The request could not be served. Carries no credential material.
     Error {
         /// What went wrong, in operator-readable terms.
         message: String,
     },
+}
+
+/// A loaded profile, reduced to what a client is allowed to see.
+///
+/// Deliberately a wire type of its own rather than the daemon's `Profile`:
+/// this struct can only ever grow fields somebody chose to expose, so a future
+/// profile field holding a secret cannot leak across the socket by default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSummary {
+    /// The profile's name, as passed to `briefcred exec`.
+    pub name: String,
+    /// Its description, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The unlock policy: `biometric`, `passcode`, or `none`.
+    pub unlock_policy: String,
+    /// How long a successful unlock is honoured, in seconds.
+    pub unlock_cache_secs: u64,
+    /// The credentials the profile declares, in declaration order.
+    pub credentials: Vec<CredentialSummary>,
+}
+
+/// One declared credential, reduced to what a client is allowed to see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialSummary {
+    /// The credential's name within its profile.
+    pub name: String,
+    /// The minter kind that serves it.
+    pub kind: String,
+    /// Its configured lifetime in seconds.
+    pub ttl_secs: u64,
+    /// The master-source key its master is filed under.
+    ///
+    /// The key, never the master: naming where a secret lives is what makes
+    /// `briefcred profile show` useful for diagnosing a missing one.
+    pub source_key: String,
 }
