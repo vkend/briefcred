@@ -20,13 +20,17 @@
 //! 2. **Check the proof, if there is one.** A `DPoP` header is verified against
 //!    the session's key. Absent is accepted — see [`crate::proxy::token`] — but
 //!    present-and-wrong is a refusal, never a shrug.
-//! 3. **Ask the policy.** Method, scheme, host, and path, against the profile's
-//!    Cedar source. Default deny.
-//! 4. **Swap.** The real credential goes in and the synthetic token comes out.
+//! 3. **Charge the quota.** One token off the session's bucket, if its profile
+//!    set one. Before the policy on purpose: a denied request is still work,
+//!    and a loop that is being denied is still a loop.
+//! 4. **Ask the policy.** Method, scheme, host, and path, plus a context
+//!    carrying the session's totals and the clock, against the profile's Cedar
+//!    source. Default deny.
+//! 5. **Swap.** The real credential goes in and the synthetic token comes out.
 //!    Only now does the request hold anything worth stealing.
-//! 5. **Forward, streaming.** Bodies are passed through in both directions and
+//! 6. **Forward, streaming.** Bodies are passed through in both directions and
 //!    counted as they go; nothing is buffered whole.
-//! 6. **Audit and count.** One `ProxyRequest` row when the response body ends.
+//! 7. **Audit and count.** One `ProxyRequest` row when the response body ends.
 //!
 //! # What each refusal is recorded as
 //!
@@ -45,6 +49,7 @@
 //! | `allow` | the policy permitted it and it was forwarded |
 //! | `deny` | the policy refused it, or the token did not authorise |
 //! | `would_deny` | the policy refused it and the profile is observing |
+//! | `quota` | the session's budget was spent; the policy was never asked |
 //! | `swap_error` | the policy **allowed** it; the credential would not go in |
 //! | `upstream_error` | the policy **allowed** it; the upstream was unreachable |
 //!
@@ -67,6 +72,7 @@ use briefcred_core::types::MintId;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Frame, Incoming};
+use hyper::header::HeaderValue;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -79,7 +85,9 @@ use crate::proxy::issuer::ProxyIssuer;
 use crate::proxy::policy::PolicyCache;
 use crate::proxy::swap::{self, Credential};
 use crate::proxy::token::{self, TokenError};
+use crate::quota::TokenBucket;
 use crate::server::State;
+use crate::session::HttpCounters;
 
 /// The body type every response out of this module has.
 type OutBody = BoxBody<Bytes, hyper::Error>;
@@ -102,6 +110,26 @@ const DECISION_SWAP_ERROR: &str = "swap_error";
 /// down" from "briefcred is refusing me", which are the two things a user
 /// staring at a failing agent cannot otherwise tell apart.
 const DECISION_UPSTREAM_ERROR: &str = "upstream_error";
+
+/// The session's quota was spent, so the policy was never asked.
+///
+/// Distinct from `deny` because the request may well have been one the policy
+/// permits: a profile whose `deny` count is climbing has a policy that is too
+/// narrow, and one whose `quota` count is climbing has an agent doing too much.
+const DECISION_QUOTA: &str = "quota";
+
+/// The body a throttled client gets back.
+///
+/// The one response out of this module with a body at all. Everything else
+/// refuses in silence, because explaining a refusal to a subprocess tells it
+/// which of briefcred's checks it failed — but a quota is not a secret, it is a
+/// number the profile's own author chose, and a client that cannot tell "you
+/// are going too fast" from "you are not allowed here" will retry the one case
+/// where retrying is exactly wrong.
+const QUOTA_BODY: &str = r#"{"error":"briefcred quota exceeded"}"#;
+
+/// The content type of [`QUOTA_BODY`].
+const APPLICATION_JSON: &str = "application/json";
 
 /// Everything one proxied request needs, shared across every connection.
 pub struct Proxy {
@@ -403,7 +431,36 @@ async fn forward(
         }
     }
 
-    // 4. May this session make this request?
+    // 4. Is there budget left? Before the policy, not after: the expensive
+    // thing to defend against is a loop, and a loop that is being denied is
+    // still a loop. Charging afterwards would give a request the profile
+    // forbids an unmetered retry channel.
+    if let Err(refusal) = crate::quota::charge(
+        session.quota.as_deref(),
+        &session.profile.name,
+        crate::quota::SURFACE_HTTP,
+        proxy.state.metrics(),
+    ) {
+        return refuse_quota(
+            &proxy,
+            refusal,
+            started,
+            &session.mint_id,
+            &method,
+            &host,
+            &path,
+        );
+    }
+
+    // 5. May this session make this request?
+    //
+    // The context is the session's totals *before* this request, so a policy
+    // written as `context.requests_so_far < 100` permits exactly a hundred.
+    let context = briefcred_core::policy::RequestContext::new(
+        OffsetDateTime::now_utc(),
+        session.http.begin_request(),
+        session.http.resp_bytes(),
+    );
     let decision = proxy.policies.decide(
         &session.profile,
         &claims.sid,
@@ -412,6 +469,7 @@ async fn forward(
             scheme,
             host: &host,
             path: &path,
+            context,
         },
     );
     if !decision.forwards() {
@@ -433,7 +491,7 @@ async fn forward(
         return status(StatusCode::FORBIDDEN);
     }
 
-    // 5. The real credential goes in.
+    // 6. The real credential goes in.
     let (mut parts, body) = request.into_parts();
     if let Err(err) = swap::apply(
         &mut parts.headers,
@@ -468,7 +526,7 @@ async fn forward(
     let counted = Counting::new(body, Arc::clone(&req_bytes), None);
     let upstream_request = Request::from_parts(parts, counted);
 
-    // 6. Forward, streaming.
+    // 7. Forward, streaming.
     let response = match send_upstream(&proxy, scheme, &host, port, upstream_request).await {
         Ok(response) => response,
         Err(err) => {
@@ -486,7 +544,7 @@ async fn forward(
         }
     };
 
-    // 7. The row is written when the response body ends, because that is when
+    // 8. The row is written when the response body ends, because that is when
     // `resp_bytes` is known. Streaming a gigabyte and then reporting zero would
     // make the byte counts worse than useless.
     let status_code = response.status().as_u16();
@@ -496,8 +554,13 @@ async fn forward(
         let mint_id = session.mint_id.clone();
         let decision = decision.label();
         let req_bytes = Arc::clone(&req_bytes);
+        let counters = Arc::clone(&session.http);
         move |resp_bytes: u64| {
             let elapsed = started.elapsed();
+            // Added when the body ends, which is the only moment the size is
+            // known. So a policy's `context.resp_bytes_so_far` counts what the
+            // session has already been given, never the response in flight.
+            counters.add_resp_bytes(resp_bytes);
             proxy.state.audit(&proxy_row(
                 &mint_id,
                 &method,
@@ -583,6 +646,10 @@ struct ResolvedSession {
     authorized: Credential,
     pubkey: Option<[u8; 32]>,
     mint_id: MintId,
+    /// The session's token bucket, when its profile sets a `quota`.
+    quota: Option<Arc<TokenBucket>>,
+    /// The session's running totals, for the policy's `context`.
+    http: Arc<HttpCounters>,
 }
 
 /// Find the session a token names and everything it can swap in.
@@ -595,7 +662,7 @@ async fn resolve_session(
     sid: &str,
     credential: &str,
 ) -> Option<Box<ResolvedSession>> {
-    let (profile_name, masters, pubkey, mint_id) = proxy
+    let (profile_name, masters, pubkey, mint_id, quota, http) = proxy
         .state
         .sessions()
         .with_session(sid, |session| {
@@ -608,6 +675,8 @@ async fn resolve_session(
                     .values()
                     .find(|mint| mint.credential == credential)
                     .map(|mint| mint.mint_id.clone()),
+                session.quota.clone(),
+                Arc::clone(&session.http),
             )
         })
         .await
@@ -640,6 +709,8 @@ async fn resolve_session(
         // and a fresh identifier would claim a mint that never happened, so the
         // request is refused instead.
         mint_id: mint_id?,
+        quota,
+        http,
     }))
 }
 
@@ -688,6 +759,62 @@ fn refuse(
         .metrics()
         .record_proxy_request(decision, None, elapsed);
     status(code)
+}
+
+/// Audit and count a throttled request, then answer `429`.
+///
+/// Audited rather than merely counted, unlike the token failures above: the
+/// session is known, so the row can name a `mint_id`, and "the quota refused
+/// this" is exactly the row somebody reading the log to work out why an agent
+/// stalled needs to find.
+#[allow(clippy::too_many_arguments)]
+fn refuse_quota(
+    proxy: &Proxy,
+    refusal: crate::quota::Refusal,
+    started: std::time::Instant,
+    mint_id: &MintId,
+    method: &str,
+    host: &str,
+    path: &str,
+) -> Response<OutBody> {
+    let elapsed = started.elapsed();
+    proxy.state.audit(&proxy_row(
+        mint_id,
+        method,
+        host,
+        path,
+        None,
+        0,
+        0,
+        elapsed,
+        DECISION_QUOTA,
+    ));
+    proxy
+        .state
+        .metrics()
+        .record_proxy_request(DECISION_QUOTA, None, elapsed);
+
+    let mut response = Response::new(
+        Full::new(Bytes::from_static(QUOTA_BODY.as_bytes()))
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    response.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        HeaderValue::from_static(APPLICATION_JSON),
+    );
+    // Absent where no wait would help: a session that has spent its `total`
+    // needs a new session, and a `Retry-After` would send it round the loop
+    // that got it here.
+    if let Some(retry_after) = refusal.retry_after() {
+        if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().to_string()) {
+            response
+                .headers_mut()
+                .insert(hyper::header::RETRY_AFTER, value);
+        }
+    }
+    response
 }
 
 /// One `ProxyRequest` audit row. Metadata only, by construction.

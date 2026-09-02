@@ -135,6 +135,7 @@ when { resource.host == "api.openai.com" && resource.path == "/v1/models" };
             scheme: "https",
             host: "api.openai.com",
             path: "/v1/models",
+            context: briefcred_core::policy::RequestContext::default(),
         }
     }
 
