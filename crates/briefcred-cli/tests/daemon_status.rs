@@ -21,6 +21,28 @@ fn daemon_binary() -> PathBuf {
     path
 }
 
+/// Every port a daemon started by a test must bind to `0`.
+///
+/// A daemon under test must not bind any of the real ports: a developer, or
+/// the launchd agent this same machine has installed, may already hold
+/// `9317`/`9318`/`9319`, and losing that race is what "the daemon never came
+/// up" actually means.
+fn with_ephemeral_ports(config: &str) -> String {
+    let mut config = config.to_string();
+    for line in ["metrics_port = 0", "proxy_port = 0", "pg_proxy_port = 0"] {
+        let key = line.split_whitespace().next().expect("a key");
+        if !config
+            .lines()
+            .any(|existing| existing.trim_start().starts_with(key))
+        {
+            config.push('\n');
+            config.push_str(line);
+        }
+    }
+    config.push('\n');
+    config
+}
+
 fn briefcred(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_briefcred"))
         .env("BRIEFCRED_HOME", home)
@@ -73,11 +95,7 @@ fn status_without_a_daemon_says_how_to_start_one_and_exits_three() {
 #[test]
 fn status_against_a_running_daemon_reports_its_health() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        temp.path().join("daemon.toml"),
-        "metrics_port = 0\nproxy_port = 0\n",
-    )
-    .unwrap();
+    std::fs::write(temp.path().join("daemon.toml"), with_ephemeral_ports("")).unwrap();
     let _daemon = start_daemon(temp.path());
 
     let output = briefcred(temp.path(), &["daemon", "status"]);

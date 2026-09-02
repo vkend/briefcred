@@ -268,6 +268,10 @@ async fn a_socket_left_behind_by_a_dead_daemon_is_cleared_on_start() {
     let home = tempfile::tempdir().unwrap();
     // A plain file where the socket belongs: what a SIGKILLed daemon leaves.
     std::fs::write(home.path().join("sock"), b"stale").unwrap();
+    // Without this, the daemon binds the real ports and loses the race to
+    // whichever daemon this machine already has installed, never reaching
+    // the point of replacing the stale socket at all.
+    std::fs::write(home.path().join("daemon.toml"), with_ephemeral_ports("")).unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_briefcred-daemon"))
         .env("BRIEFCRED_HOME", home.path())
