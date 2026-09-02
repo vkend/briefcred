@@ -13,6 +13,12 @@
 //! Both converge on [`forward`], which is the only place a credential is ever
 //! attached to anything.
 //!
+//! Inside a tunnel the client may also pick HTTP/2, by ALPN. Then [`forward`]
+//! is called once per stream instead of once per request, over the same
+//! pipeline and with the same rows — a stream *is* a request. See
+//! [`crate::proxy::http2`] for the two things that only exist once framing is
+//! multiplexed: the connection's own row, and the upstream connection cache.
+//!
 //! # The order, and why it is that order
 //!
 //! 1. **Authorize the token.** Signature, expiry, revocation. Before anything
