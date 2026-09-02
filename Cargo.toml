@@ -55,8 +55,8 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
-rustls-pemfile = "2"
 rustls-pki-types = "1"
+schemars = "1"
 security-framework = "3"
 sendfd = { version = "0.4", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }

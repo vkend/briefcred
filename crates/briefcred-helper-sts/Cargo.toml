@@ -25,11 +25,17 @@ serde_yaml_ng.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "rt-multi-thread"] }
 zeroize.workspace = true
-aws-config = "1.11.0"
-aws-sdk-sts = "1.113.0"
+aws-config = { version = "1.11.0", default-features = false, features = ["rt-tokio", "default-https-client", "credentials-process", "sso", "behavior-version-latest"] }
+# `default-features = false` on the two SDK clients, then the modern HTTPS
+# client back on by hand. Their default feature set enables `rustls`, which in
+# the smithy runtime means `connector-hyper-0-14-x`: hyper 0.14, rustls 0.21
+# and rustls-webpki 0.101, all of which carry open advisories and none of
+# which briefcred uses. `default-https-client` is the hyper 1.x + rustls 0.23
+# path the SDK reaches for anyway.
+aws-sdk-sts = { version = "1.113.0", default-features = false, features = ["rt-tokio", "default-https-client", "sigv4a", "behavior-version-latest"] }
 aws-smithy-runtime-api = "1"
 sha2.workspace = true
-aws-sdk-iam = "1.122.0"
+aws-sdk-iam = { version = "1.122.0", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 
 [features]
 # Exposes `AwsStsMinter::with_http_client`, which replaces the HTTP layer so a

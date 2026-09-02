@@ -26,6 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use rustls_pki_types::pem::PemObject as _;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
 use futures_util::StreamExt as _;
 use hyper::body::Bytes;
 // The `http` types both `hyper` and `tonic` are built on, reached through
@@ -87,12 +90,10 @@ pub struct Server {
 /// that offers no ALPN is how the other tests exercise the proxy's HTTP/1.1
 /// fallback, and this one is how they exercise HTTP/2 upstream.
 pub async fn start(leaf: &briefcred_core::ca::Leaf) -> Server {
-    let chain: Vec<_> = rustls_pemfile::certs(&mut leaf.cert_pem().as_bytes())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(leaf.cert_pem().as_bytes())
         .collect::<Result<_, _>>()
         .unwrap();
-    let key = rustls_pemfile::private_key(&mut leaf.key_pem().as_bytes())
-        .unwrap()
-        .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(leaf.key_pem().as_bytes()).unwrap();
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -312,7 +313,7 @@ pub async fn through_the_proxy(client: &ProxyClient, port: u16, token: &str) -> 
 /// The baseline the latency assertion is a ratio against.
 pub async fn direct(port: u16, ca_pem: &str) -> Transport {
     let mut roots = rustls::RootCertStore::empty();
-    for certificate in rustls_pemfile::certs(&mut ca_pem.as_bytes()) {
+    for certificate in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
         roots.add(certificate.unwrap()).unwrap();
     }
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(

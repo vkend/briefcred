@@ -24,6 +24,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
+use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -493,7 +494,7 @@ fn seconds_precision(at: OffsetDateTime) -> OffsetDateTime {
 
 /// The first certificate in a PEM bundle, as DER.
 fn first_certificate(pem: &str) -> Result<CertificateDer<'static>> {
-    rustls_pemfile::certs(&mut pem.as_bytes())
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .next()
         .ok_or_else(|| Error::Ca("ca.pem contains no certificate".to_string()))?
         .map_err(|e| Error::Ca(format!("ca.pem is not valid PEM: {e}")))
@@ -541,7 +542,7 @@ mod tests {
     }
 
     fn pem_to_der(pem: &str) -> CertificateDer<'static> {
-        rustls_pemfile::certs(&mut pem.as_bytes())
+        CertificateDer::pem_slice_iter(pem.as_bytes())
             .next()
             .unwrap()
             .unwrap()

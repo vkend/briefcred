@@ -19,6 +19,9 @@ mod grpc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustls_pki_types::pem::PemObject as _;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
 use briefcred_e2e::daemon_harness::Daemon;
 use briefcred_proto::{Request, Response};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -170,12 +173,10 @@ async fn start_upstream() -> Upstream {
 
     let ca = briefcred_core::CertificateAuthority::generate("test-upstream").unwrap();
     let leaf = ca.issue_leaf(&[UPSTREAM_HOST.to_string()]).unwrap();
-    let chain: Vec<_> = rustls_pemfile::certs(&mut leaf.cert_pem().as_bytes())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(leaf.cert_pem().as_bytes())
         .collect::<Result<_, _>>()
         .unwrap();
-    let key = rustls_pemfile::private_key(&mut leaf.key_pem().as_bytes())
-        .unwrap()
-        .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(leaf.key_pem().as_bytes()).unwrap();
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -566,7 +567,7 @@ impl ProxyClient {
         }
 
         let mut roots = rustls::RootCertStore::empty();
-        for certificate in rustls_pemfile::certs(&mut self.briefcred_ca.as_bytes()) {
+        for certificate in CertificateDer::pem_slice_iter(self.briefcred_ca.as_bytes()) {
             roots.add(certificate.map_err(|e| e.to_string())?).unwrap();
         }
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(

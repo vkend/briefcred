@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use briefcred_core::ca::CertificateAuthority;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject as _;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::error::{Error, Result};
 
@@ -54,12 +55,11 @@ pub fn server_config(ca: &CertificateAuthority, hostname: &str) -> Result<Arc<Se
         .map_err(|e| Error::Proxy(format!("cannot issue a leaf for `{hostname}`: {e}")))?;
 
     let chain: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut leaf.cert_pem().as_bytes())
+        CertificateDer::pem_slice_iter(leaf.cert_pem().as_bytes())
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| Error::Proxy(format!("the issued leaf is not valid PEM: {e}")))?;
-    let key = rustls_pemfile::private_key(&mut leaf.key_pem().as_bytes())
-        .map_err(|e| Error::Proxy(format!("the issued leaf key is not valid PEM: {e}")))?
-        .ok_or_else(|| Error::Proxy("the issued leaf carries no private key".to_string()))?;
+    let key = PrivateKeyDer::from_pem_slice(leaf.key_pem().as_bytes())
+        .map_err(|e| Error::Proxy(format!("the issued leaf key is not valid PEM: {e}")))?;
 
     let mut config = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
@@ -105,7 +105,7 @@ pub fn client_config(extra_roots: Option<&Path>) -> Result<Arc<ClientConfig>> {
 
     if let Some(path) = extra_roots {
         let pem = std::fs::read(path).map_err(|e| Error::io("read", path, e))?;
-        let extra: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut pem.as_slice())
+        let extra: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem)
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| Error::Proxy(format!("{} is not valid PEM: {e}", path.display())))?;
         if extra.is_empty() {

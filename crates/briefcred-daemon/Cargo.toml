@@ -40,7 +40,6 @@ hyper.workspace = true
 hyper-util.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
-rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true

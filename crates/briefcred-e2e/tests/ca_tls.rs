@@ -15,7 +15,8 @@ use briefcred_core::ca::CertificateAuthority;
 use briefcred_core::keystore::FileKeyStore;
 use briefcred_core::paths::{Paths, Platform};
 use rustls::ServerConfig;
-use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject as _;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -43,12 +44,10 @@ fn server_config(ca: &CertificateAuthority) -> ServerConfig {
     let leaf = ca.issue_leaf(&["localhost".to_string()]).unwrap();
 
     let chain: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut leaf.cert_pem().as_bytes())
+        CertificateDer::pem_slice_iter(leaf.cert_pem().as_bytes())
             .collect::<Result<_, _>>()
             .unwrap();
-    let key = rustls_pemfile::private_key(&mut leaf.key_pem().as_bytes())
-        .unwrap()
-        .expect("an issued leaf always carries its key");
+    let key = PrivateKeyDer::from_pem_slice(leaf.key_pem().as_bytes()).unwrap();
 
     ServerConfig::builder()
         .with_no_client_auth()
