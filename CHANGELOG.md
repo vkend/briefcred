@@ -8,6 +8,12 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Fixed
 
+- **The hook no longer auto-approves a compound command.** An `allow` rule with
+  `rewrite: true` answered `allow` for `psql … | tee /etc/passwd`, wrapping the
+  whole line in a `briefcred exec` on the strength of a policy check that had
+  only seen the words. It now answers `ask` for any line containing `|`, `;`,
+  `&&`, `||`, `>`, `<`, `$(` or a backtick, and rewrites nothing.
+
 - **Placeholder substitution is bounded by what the run minted.** The proxy
   filled in a `__name__` placeholder for every HTTP credential the profile
   declared, so a `briefcred exec --cred openai` could still have a second

@@ -77,6 +77,7 @@ easier of the two to get wrong.
 | --- | --- | --- |
 | `deny` | *not asked* | `deny` |
 | `allow` | permitted | `allow`, rewritten if `rewrite: true` |
+| `allow` + `rewrite`, compound line | permitted | `ask`, and nothing is rewritten |
 | `allow` | refused | `deny`, quoting the profile's own complaint |
 | `allow` | unreachable | `ask`, saying it could not check |
 | `ask` | permitted | `ask` |
@@ -127,8 +128,22 @@ briefcred. Say so in the profile description and in your agent's instructions.
 line as one string after `--`. That works for a simple command. It does **not**
 do what you want for a pipeline, a redirect, or a `&&` chain: only the first
 command ends up under briefcred, and the rest run in the wrapper's environment.
-Write `match` patterns tight enough that they cannot match a compound command,
-or use `decision: ask` and let a person look at it.
+
+So an `allow` rule with `rewrite: true` never answers `allow` for a line that
+contains any of
+
+```text
+|    ;    &&    ||    >    <    $(    `
+```
+
+It answers `ask` instead, and rewrites nothing. The daemon was asked about the
+command's *words*, and on a compound line those words are not the whole of what
+would run; answering `allow` would put briefcred's name on a second program it
+never saw. The check is deliberately naive — an operator inside a quoted
+argument counts — because being wrong in the other direction would mean deciding
+the quoting rules of whatever shell eventually runs the line.
+
+A `deny` rule is unaffected: it denies whatever else is on the line.
 
 **Quoting survives, escaping is the caller's problem.** The command is passed
 through unchanged. Whatever quoting the agent wrote is what the shell running

