@@ -4,8 +4,8 @@ briefcred is a local credential broker for AI agents and developer tooling. It
 has two halves that share one daemon, one policy engine, and one audit log.
 
 - **Identity broker.** Mints real, short-lived backend credentials — dynamic
-  PostgreSQL roles today, AWS STS sessions and SSH certificates later — and
-  takes them away again when the work is done.
+  PostgreSQL roles, AWS STS sessions and SSH certificates — and takes them away
+  again when the work is done.
 - **Credential-exchange proxy.** Terminates TLS locally so a subprocess can
   hold a synthetic placeholder while the real secret is substituted on the
   wire.
@@ -25,26 +25,35 @@ subprocess can see.
 | **B** | A short-lived credential minted for this run. | Middle |
 | **C** | The real credential, revoked afterwards. | Weakest |
 
-Model C is a stepping stone, never a destination. Where a phase ships Model C,
-`THREAT_MODEL.md` says so explicitly and names the phase that closes it.
+Model C is a stepping stone, never a destination, and briefcred ships none of
+it: every credential kind is A or B. `docs/cb4a-conformance.md` gives the
+per-kind mapping, and `THREAT_MODEL.md` states what a Model B credential in a
+subprocess's environment is still exposed to.
+
+Listed in the roadmap's build order, which is not its numbering.
 
 | Phase | Capability | Model |
 | --- | --- | --- |
 | 0 | Postgres dynamic role minting (library only) | B |
 | 1 | Daemon foundation: IPC, lifecycle, audit, metrics | n/a |
 | 2 | Per-machine root CA, trust install | n/a |
-| 3 | Daemon-orchestrated minting, biometric gate, `exec` wrapper | C |
+| 3 | Daemon-orchestrated minting, biometric gate, `exec` wrapper | B |
 | 4 | Thin TLS-terminating proxy, placeholder swap for HTTP APIs | A |
 | 10 | Postgres connection-auth injection at the proxy | A |
-| 5 | Cedar policy engine | n/a |
-| 6 | Agent hook integration | inherits |
-| 7 | AWS STS and SSH certificate minters | B |
-| 8 | Reconciliation, retention, and operational hardening | n/a |
-| 9 | Packaging and distribution | n/a |
+| 5 | Quotas and Cedar policy refinement | n/a |
+| 8 | Signed profile distribution | n/a |
+| 6 | Streaming: server-sent events and WebSocket | inherits |
+| 7 | Concurrent sessions and zero-downtime upgrades | n/a |
+| 9 | HTTP/2 and gRPC | inherits |
+| — | Cross-cutting: supply chain, CI, release, reference docs | n/a |
+
+The AWS STS and SSH certificate minters (Model B) and the agent hook slot in
+after Phase 3 rather than carrying phase numbers of their own.
 
 Phase 3 hands a minted Postgres role to the subprocess through environment
-variables, which is Model C for that credential: the process can read
-`PGPASSWORD`. Phase 10 moves PostgreSQL to Model A with the `postgres-proxy`
+variables. The credential is short-lived and revoked on close, which is Model
+B, but the process can read `PGPASSWORD`, so what it holds is a real password
+rather than a placeholder. Phase 10 moves PostgreSQL to Model A with the `postgres-proxy`
 kind, where the daemon completes the authentication handshake itself and the
 subprocess holds a synthetic token instead of any password. That is why Phase 10
 is sequenced immediately after the thin proxy rather than at the end.
@@ -67,14 +76,20 @@ session it was issued to, the profile's Cedar policy, and its own expiry.
 
 ```
 briefcred-core      types, profile schema, minter contracts, audit rows, minters
-briefcred-proto     wire types for daemon IPC                        (Phase 1)
-briefcred-daemon    the per-user daemon                              (Phase 1)
-briefcred-cli       the `briefcred` binary                           (Phase 1)
-briefcred-hook      the `briefcred-hook` agent shim                  (Phase 6)
-briefcred-helper-postgres  the PostgreSQL minting helper              (Phase 3)
-briefcred-helper-sts       the AWS STS minting helper                 (Phase 7)
+briefcred-proto     wire types for daemon IPC
+briefcred-daemon    the per-user daemon: IPC, both proxies, MCP, handoff
+briefcred-cli       the `briefcred` binary
+briefcred-hook      the `briefcred-hook` agent shim
+briefcred-helper-postgres  the PostgreSQL minting helper
+briefcred-helper-sts       the AWS STS minting helper
 briefcred-e2e       test-only: Postgres and daemon harnesses, e2e tests
 ```
+
+Five binaries ship: `briefcred`, `briefcred-daemon`, `briefcred-hook`,
+`briefcred-helper-postgres-dynamic`, and `briefcred-helper-aws-sts`. An install
+that leaves out a helper is a broker that starts and cannot mint, which is why
+the Homebrew formula's `test do` block checks for all five and the end-to-end
+harness refuses to start when one is absent.
 
 A helper's **binary** is
 named for the minter kind it serves rather than for its crate —

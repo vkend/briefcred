@@ -3,12 +3,27 @@
 ## Before you start
 
 ```sh
-just check   # cargo fmt --check, then clippy with -D warnings
-just test    # the whole workspace
+cargo install cargo-deny cargo-vet --locked   # once
+
+just check   # fmt, clippy with -D warnings, cargo deny, cargo vet
+just test    # builds every binary, then the whole workspace
 ```
 
 Both must pass before a commit lands. Clippy warnings are errors here; there is
 no "fix it later" tier.
+
+`just check` includes the two supply-chain gates because a dependency is added
+on the same afternoon somebody runs it, and a gate nobody runs until release is
+one that fails at release. `cargo deny` enforces `deny.toml`; `cargo vet check
+--locked` is offline and asserts that `supply-chain/config.toml`'s exemption
+list still covers the lockfile. Adding a dependency therefore adds a line
+somebody has to look at, which is the point.
+
+`just test` builds the workspace's binaries first. `cargo test` does not build
+a package's binaries unless a test target asks for them, so on a clean checkout
+the daemon and every `briefcred-helper-*` would be absent and the end-to-end
+tests would fail for a reason that looks nothing like the cause. The harness
+refuses to start when a helper is missing and names it.
 
 Two rules override everything else in this document:
 
@@ -178,6 +193,22 @@ confusing failure.
   a row in the minter matrix above it.
 - A `CHANGELOG.md` entry under `## Unreleased`.
 - The residual risks in `THREAT_MODEL.md` if your backend adds any.
+- A row in `docs/cb4a-conformance.md` saying which model the new kind is and
+  what the subprocess actually holds. If it is Model B, say why it cannot be A
+  — "there is no proxy for this protocol" is a real answer, and an unstated
+  weakening is not.
+- If the minter needs its own environment variable in the subprocess, a note in
+  `docs/compatibility.md` about which runtimes honour it.
+
+A new binary needs three more edits, and forgetting any one of them ships a
+broker that starts and cannot mint:
+
+- `HELPERS` in `crates/briefcred-e2e/src/daemon_harness.rs`, so the harness
+  refuses to run without it. A test reads the workspace's manifests and fails
+  if the list and the binaries disagree, so this one cannot be forgotten
+  quietly.
+- `BINARIES` in `release/scripts/build-universal.sh`.
+- The `install` and `test do` blocks in `release/Formula/briefcred.rb`.
 
 ## Adding a request to the protocol
 
@@ -199,6 +230,28 @@ could never run.
 Responses that carry data from the daemon's own types get a wire type of their
 own, the way `ProfileSummary` does. Serialising an internal type across the
 socket means the next field somebody adds to it is exposed by default.
+
+A new field on an existing response gets `#[serde(default)]`, so a CLI built
+against the old shape still parses an answer from a newer daemon. The two are
+upgraded separately by definition: `briefcred daemon upgrade` replaces the
+daemon underneath a CLI nobody has restarted.
+
+## Changing the profile schema
+
+`docs/profile-schema.md` is generated. After changing any type under
+`Profile`, regenerate it:
+
+```sh
+cargo run -p briefcred-cli --bin briefcred -- profile schema
+```
+
+and paste the output into the document's single fenced `json` block. A test in
+`briefcred-core` compares the two and fails otherwise. Never hand-edit the
+block — the failure message says the same thing.
+
+The descriptions in the schema are the doc comments on the fields, so a field
+whose doc comment is written for a Rust reader will read that way to somebody
+authoring a profile.
 
 ## Tests
 

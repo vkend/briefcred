@@ -8,7 +8,7 @@ weakens a guarantee has to say so out loud before it ships.
 | Asset | Where it lives | Why an attacker wants it |
 | --- | --- | --- |
 | Master credentials | macOS Keychain; Linux kernel keyring or an encrypted file | Long-lived, broadly scoped. The whole point of the product is that these never leave the daemon. |
-| Minted credentials | Daemon memory, and for Model C the subprocess environment | Short-lived and narrowly scoped, but real. |
+| Minted credentials | Daemon memory, and under Model B the subprocess environment | Short-lived and narrowly scoped, but real. |
 | Root CA private key | macOS login keychain (`dev.briefcred.ca`), or `ca/ca.key` at 0600 | Signs certificates the machine's TLS clients trust. Compromise means transparent interception of every proxied connection. |
 | Audit log | `.../briefcred/audit/*.jsonl` | Tampering hides an incident; reading it reveals what ran and when. |
 | Profiles | `.../briefcred/profiles/*.yaml` | Write access is privilege escalation: a profile decides what gets minted and what may run. |
@@ -121,10 +121,20 @@ after the replacement there would be nothing left to match, leaving a stale
 trust entry for a key nobody holds.
 
 **Phase 3: minting, `exec`, and revoke.** This is the first phase where a real
-credential reaches a subprocess, and it is **Model C**: the child can read
-`PGPASSWORD`. Phase 10 moves the same credential to Model A by completing the
-PostgreSQL handshake at the proxy. Until then, what bounds the exposure is that
-the credential is *short* and *narrow*, not that it is hidden.
+credential reaches a subprocess. It is **Model B** — the role is created for
+this run and dropped after it — but a Model B credential is still a credential
+the child can read, in this case out of `PGPASSWORD`. Phase 10 moves the same
+database to Model A with `postgres-proxy`, by completing the PostgreSQL
+handshake at the proxy. Where Model B is what a profile uses, what bounds the
+exposure is that the credential is *short* and *narrow*, not that it is hidden.
+
+A note on the vocabulary, because the distinction does the work in three
+sections below. **Model C** means the subprocess holds the *real, long-lived*
+credential; briefcred ships none of it. **Model B** means it holds a real
+credential minted for this run. **Model A** means it holds a synthetic token
+and the real credential never leaves the daemon. What follows is about Model B,
+and everything it says about a secret in an environment would be worse under
+Model C, not better.
 
 What the design buys:
 
@@ -263,9 +273,9 @@ Residual risks, stated plainly:
   existing master. The directory is `0700`, which means that attacker is
   already the user — the same boundary as everything else here.
 
-**Phase 3: Model C exposure.** This is the weakest point in the plan and it is
-deliberate. `briefcred exec` hands the subprocess a minted role through
-`PGUSER` / `PGPASSWORD` / `DATABASE_URL`. Consequences:
+**Phase 3: a readable secret in the environment.** This is the weakest point in
+the plan and it is deliberate. `briefcred exec` hands the subprocess a minted
+role through `PGUSER` / `PGPASSWORD` / `DATABASE_URL`. Consequences:
 
 - The subprocess can read the credential out of its own environment and copy it
   anywhere before it expires.
@@ -366,9 +376,9 @@ process of the same user, a core dump, a log line that prints `env` — can use
 it, for as long as it lives, from this machine.
 
 This is a real weakening and it is stated rather than hidden. What it still buys
-over Model C:
+over the Model B handoff it replaces:
 
-| | Model C (`PGPASSWORD`) | Model A with a bare token |
+| | Model B (`PGPASSWORD` in the environment) | Model A with a bare token |
 | --- | --- | --- |
 | Usable off the machine | yes | no |
 | Usable after the session closes | until revoked at the backend | no |
@@ -493,7 +503,7 @@ them — runs under the same one-second liveness poll an event stream and a
 WebSocket do, and expiry, revocation, or the session closing ends it. Without
 that, a `briefcred exec` that had finished would leave a bidirectional gRPC call
 delivering for as long as its client held the stream open, which is precisely
-the Model C exposure revocation exists to close.
+the exposure revocation exists to close.
 
 The `ProxyH2Connection` row carries no path, no status, and nothing from any
 stream's headers, body, or trailers. It is a shape — how many streams, how long,
@@ -656,9 +666,10 @@ dangerous state, so it is worth being exact about what protects it.
   immediate. The outcome type says so rather than pretending otherwise.
 - A subprocess can copy the credential it was given anywhere before it exits.
   Revoking afterwards ends the credential's usefulness; it does not undo what
-  was done with it while it was live. This is the whole of what Model C means.
-  For PostgreSQL, `postgres-proxy` closes it: see **Phase 10** below. It remains
-  true of every `postgres-dynamic` credential, which is Model B by design.
+  was done with it while it was live. This is the whole of what any handoff
+  weaker than Model A means. For PostgreSQL, `postgres-proxy` closes it: see
+  **Phase 10** below. It remains true of every `postgres-dynamic`, `aws-sts`
+  and `ssh-cert` credential, all of which are Model B by design.
 - A synthetic token used without a `DPoP` proof is a bearer credential for the
   session that holds it. Every runtime `briefcred exec` wraps is on that path,
   because an environment variable is the only channel it has. See **Phase 4**

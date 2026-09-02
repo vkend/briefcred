@@ -5,17 +5,33 @@ It hands subprocesses short-lived, narrowly scoped credentials, swaps
 placeholder keys for real ones at a local proxy, and records every mint,
 request, and revoke in an append-only audit log.
 
-This is a greenfield build in progress. See `ROADMAP.md` for the plan,
-`ARCHITECTURE.md` for the shape, and `THREAT_MODEL.md` for what each phase does
-and does not guarantee.
+See `ROADMAP.md` for the plan, `ARCHITECTURE.md` for the shape, and
+`THREAT_MODEL.md` for what is and is not guaranteed.
 
-**Status: Phase 3.** Credentials now flow end to end.
-`briefcred exec --profile=db-ro -- psql -c "SELECT 1"` proves presence with
-Touch ID, mints a short-lived PostgreSQL role through a helper process, runs
-the command with a cleared environment, and revokes the role when it exits. A
-persistent queue retries a revoke that fails, and a reconciler sweeps up
-anything a `SIGKILL` stranded. `briefcred-hook` answers an agent's
-`PreToolUse` so the whole thing can be wired into Claude Code.
+**Status: every roadmap phase is implemented.** In one sentence each:
+
+- **Minting.** `postgres-dynamic` roles, `aws-sts` sessions and `ssh-cert`
+  certificates, each minted for one session and revoked when it closes, behind
+  a Touch ID gate with a per-profile unlock cache.
+- **The HTTP proxy.** A local TLS-terminating proxy that swaps a synthetic
+  token for the real API key, over HTTP/1.1, HTTP/2, server-sent events,
+  WebSocket and gRPC, with the profile's Cedar policy deciding every request
+  and a per-session quota bounding how many there may be.
+- **The PostgreSQL proxy.** The same handoff for databases: the subprocess
+  holds a token, the daemon completes the real authentication, and a connection
+  does not outlive the grant it was opened under.
+- **Operations.** An append-only JSONL audit log, a Prometheus endpoint, a
+  persistent revoke queue with a reconciler behind it, signed profile
+  distribution over three registry schemes, MCP tools for an agent, an agent
+  hook, and `briefcred daemon upgrade`, which replaces a running daemon without
+  closing a socket or dropping a stream.
+
+Three reference pages sit alongside this one:
+[`docs/profile-schema.md`](docs/profile-schema.md), generated from the types
+the loader uses; [`docs/compatibility.md`](docs/compatibility.md), which says
+what each runtime needs; and
+[`docs/cb4a-conformance.md`](docs/cb4a-conformance.md), which says how much of
+a credential each kind lets a subprocess see.
 
 ## Requirements
 
@@ -27,19 +43,41 @@ anything a `SIGKILL` stranded. `briefcred-hook` answers an agent's
 ## Build and test
 
 ```sh
-just check    # cargo fmt --check, then clippy with warnings denied
+just check    # fmt, clippy with warnings denied, cargo deny, cargo vet
 just test     # the whole workspace, unit and end-to-end
 just e2e      # only the end-to-end tests, with output shown
 just fmt      # rewrite formatting in place
 ```
+
+`just check` runs two supply-chain gates as well as the lints, so install them
+once:
+
+```sh
+cargo install cargo-deny cargo-vet --locked
+```
+
+`cargo deny` enforces `deny.toml`: permissive licences only, nothing from a
+registry other than crates.io, and no open advisory. `cargo vet check --locked`
+is offline — `supply-chain/` imports no third-party audit sets — and asserts
+that the exemption list still covers the lockfile, which turns a new dependency
+into a diff somebody has to look at.
 
 Without `just`:
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo deny check
+cargo vet check --locked
+cargo build --workspace
 cargo test --workspace
 ```
+
+`cargo build --workspace` before `cargo test` is not optional on a clean
+checkout: `cargo test` does not build a package's binaries unless a test target
+asks for them, so the daemon and the `briefcred-helper-*` binaries the
+end-to-end tests spawn would simply be absent. The harness refuses to start
+when one is missing and says which.
 
 ### End-to-end tests
 
@@ -373,6 +411,7 @@ always run whatever you liked with it. `THREAT_MODEL.md` says this at length.
 | `briefcred profile sign <file> --key <path>` | Sign a profile, writing `<file>.minisig` beside it. |
 | `briefcred profile verify <file> --pub <path>` | Check a profile against its `.minisig`. Accepts signatures from stock `minisign` too. |
 | `briefcred profile sync` | Fetch every registry in `daemon.toml`, verifying as it goes. |
+| `briefcred profile schema` | The profile schema as a JSON Schema document, generated from the types the loader uses. |
 | `briefcred mcp` | Serve the Model Context Protocol tools on stdin and stdout, for an agent. |
 | `briefcred daemon upgrade [--binary <path>]` | Replace the running daemon in place, keeping every socket and session. |
 
@@ -1222,6 +1261,34 @@ built into a shipping daemon: a same-uid caller who could ask a daemon to search
 its own memory for a digest would have a confirmation oracle for guessed
 secrets.
 
+## Releases and packaging
+
+A tag matching `v*` runs `.github/workflows/release.yml` on a macOS runner. It
+builds every binary for `aarch64-apple-darwin` and `x86_64-apple-darwin`, joins
+each pair with `lipo` into one universal Mach-O, signs and notarises them when
+Apple credentials are configured, and publishes a tarball with its SHA-256 sum
+as a GitHub release. The three steps are ordinary scripts under
+`release/scripts/`, so a release can be built by hand.
+
+**Without Apple credentials the release still happens, unsigned.** That is
+deliberate: a release only one person can build is one that stops being built.
+The release notes say which kind it is, and an unsigned build is quarantined by
+macOS on first launch. The signing path wants six secrets —
+`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
+`APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` — and skips cleanly
+when any is missing.
+
+Note that a notarisation ticket cannot be stapled to a bare command line
+executable: stapling applies to bundles, disk images and installer packages.
+A notarised briefcred binary is checked against Apple's service the first time
+it runs.
+
+`release/Formula/briefcred.rb` is the Homebrew formula. It installs all five
+binaries — the two a user types and the three the daemon spawns — and carries a
+`service` block so `brew services start briefcred` runs the daemon as a
+LaunchAgent, equivalently to what `briefcred install` writes.
+
 ## Licence
 
-MIT OR Apache-2.0.
+MIT OR Apache-2.0. The licence texts are not yet in the tree; the release
+tarball ships them once they are.
