@@ -94,9 +94,20 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           BRIEFCRED_REPO: ${{ github.repository }}
         run: |
+          # The tarball is found rather than named. `package.sh` owns that
+          # filename, and spelling it a second time here would be two strings
+          # that have to agree with nobody checking that they do. It writes
+          # exactly one archive, so a glob that finds anything else is a
+          # packaging change this step should fail on.
+          shopt -s nullglob
+          tarballs=(dist/*.tar.gz)
+          if [[ ${#tarballs[@]} -ne 1 ]]; then
+            echo "expected one tarball in dist/, found ${#tarballs[@]}" >&2
+            exit 1
+          fi
           release/scripts/stamp-formula.sh \
             "$VERSION" \
-            "dist/briefcred-$VERSION-macos-universal.tar.gz" \
+            "${tarballs[0]}" \
             release/Formula/briefcred.rb \
             dist/briefcred.rb
 
