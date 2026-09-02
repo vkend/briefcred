@@ -42,5 +42,6 @@ objc2-foundation.workspace = true
 objc2-local-authentication.workspace = true
 
 [dev-dependencies]
+briefcred-core = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }

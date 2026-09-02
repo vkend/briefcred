@@ -373,28 +373,49 @@ impl std::fmt::Debug for dyn MasterSource {
     }
 }
 
-/// A source backed by an in-memory map, for tests and for `--dry-run`.
-#[derive(Debug, Default, Clone)]
+/// A source backed by an in-memory map.
+///
+/// Test scaffolding, not a backend: it is compiled only under `cfg(test)` or
+/// the `test-util` feature, so it cannot reach a production binary. It still
+/// holds its masters in [`Zeroizing<String>`] and redacts its own `Debug`,
+/// because a type that models a master source has to obey the same rules as
+/// one — a test helper that leaks in a panic message leaks just as loudly.
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Default, Clone)]
 pub struct MemorySource {
-    entries: BTreeMap<String, String>,
+    entries: BTreeMap<String, Zeroizing<String>>,
 }
 
+#[cfg(any(test, feature = "test-util"))]
+impl std::fmt::Debug for MemorySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemorySource")
+            .field("keys", &self.entries.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
 impl MemorySource {
     /// A source holding exactly `entries`.
     pub fn new(entries: impl IntoIterator<Item = (String, String)>) -> MemorySource {
         MemorySource {
-            entries: entries.into_iter().collect(),
+            entries: entries
+                .into_iter()
+                .map(|(k, v)| (k, Zeroizing::new(v)))
+                .collect(),
         }
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 #[async_trait]
 impl MasterSource for MemorySource {
     async fn fetch(&self, key: &str) -> Result<Zeroizing<String>> {
         validate_key(key)?;
         self.entries
             .get(key)
-            .map(|v| Zeroizing::new(v.clone()))
+            .cloned()
             .ok_or_else(|| Error::MasterNotFound {
                 key: key.to_string(),
                 location: self.location(),
@@ -532,12 +553,20 @@ mod tests {
         let (_dir, file) = temp_source();
         file.put("k", &Zeroizing::new("super-secret-master".into()))
             .unwrap();
+        let memory = MemorySource::new([("k".to_string(), "super-secret-master".to_string())]);
+        // `MemorySource` is checked through its own `Debug` as well as through
+        // the trait object's, because it is the one that holds the value.
+        let direct = format!("{memory:?}");
+        assert!(!direct.contains("super-secret-master"), "{direct}");
+        assert!(direct.contains("\"k\""), "{direct}");
+
         let sources: Vec<Box<dyn MasterSource>> = vec![
             Box::new(FileSource::new(file.path("").parent().unwrap())),
             Box::new(EnvSource::with_vars(BTreeMap::from([(
                 "BRIEFCRED_MASTER_K".to_string(),
                 "super-secret-master".to_string(),
             )]))),
+            Box::new(memory),
         ];
         for source in &sources {
             let rendered = format!("{source:?} {}", source.location());
