@@ -38,7 +38,7 @@ getrandom = "0.3"
 hex = "0.4"
 hmac = "0.12"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 inventory = "0.3"
 libc = "0.2"

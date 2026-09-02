@@ -379,6 +379,8 @@ pub struct StreamRow {
     pub started: OffsetDateTime,
     /// The same instant, for a duration that a clock change cannot distort.
     pub since: std::time::Instant,
+    /// The client's HTTP/2 connection, when the stream was one stream of one.
+    pub connection_id: Option<String>,
 }
 
 impl StreamRow {
@@ -398,6 +400,7 @@ impl StreamRow {
             events_or_frames,
             bytes_up,
             bytes_down,
+            connection_id: self.connection_id,
         });
         self.state
             .metrics()

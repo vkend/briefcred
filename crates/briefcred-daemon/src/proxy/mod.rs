@@ -14,11 +14,13 @@
 //! | [`policy`] | is this session allowed to make this request |
 //! | [`swap`] | what does the outgoing request carry instead |
 //!
-//! [`tls`] terminates the subprocess's TLS and re-encrypts upstream, and
+//! [`tls`] terminates the subprocess's TLS and re-encrypts upstream,
+//! [`http2`] holds what only exists once framing is multiplexed, and
 //! [`listener`] is the loop that puts all of it in order.
 
 use std::collections::BTreeMap;
 
+pub mod http2;
 pub mod issuer;
 pub mod listener;
 pub mod policy;

@@ -25,6 +25,24 @@ use rustls_pki_types::CertificateDer;
 
 use crate::error::{Error, Result};
 
+/// The ALPN identifier for HTTP/2, as it goes on the wire.
+pub const ALPN_H2: &[u8] = b"h2";
+
+/// The ALPN identifier for HTTP/1.1.
+pub const ALPN_HTTP11: &[u8] = b"http/1.1";
+
+/// What the proxy offers, in preference order, at both ends.
+///
+/// `h2` first because a client that speaks it should get it: HTTP/2 is what
+/// gRPC needs, and a proxy that quietly answered `http/1.1` to a gRPC runtime
+/// would be one that broke it rather than one that was merely slower.
+///
+/// Both ends offer the same two and negotiate **separately**. A client on
+/// HTTP/2 talking to an upstream that only offers HTTP/1.1 is an ordinary
+/// request either way — the pipeline in between decides one request at a time
+/// and does not care which framing carried it.
+const ALPN: [&[u8]; 2] = [ALPN_H2, ALPN_HTTP11];
+
 /// A `ServerConfig` presenting a fresh leaf for `hostname`.
 ///
 /// Built per connection rather than cached alongside the leaf: a `ServerConfig`
@@ -43,12 +61,13 @@ pub fn server_config(ca: &CertificateAuthority, hostname: &str) -> Result<Arc<Se
         .map_err(|e| Error::Proxy(format!("the issued leaf key is not valid PEM: {e}")))?
         .ok_or_else(|| Error::Proxy("the issued leaf carries no private key".to_string()))?;
 
-    let config = ServerConfig::builder_with_provider(provider())
+    let mut config = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Proxy(format!("cannot build a TLS server config: {e}")))?
         .with_no_client_auth()
         .with_single_cert(chain, key)
         .map_err(|e| Error::Proxy(format!("cannot serve TLS for `{hostname}`: {e}")))?;
+    config.alpn_protocols = ALPN.iter().map(|name| name.to_vec()).collect();
     Ok(Arc::new(config))
 }
 
@@ -108,13 +127,26 @@ pub fn client_config(extra_roots: Option<&Path>) -> Result<Arc<ClientConfig>> {
         }
     }
 
-    Ok(Arc::new(
-        ClientConfig::builder_with_provider(provider())
-            .with_safe_default_protocol_versions()
-            .map_err(|e| Error::Proxy(format!("cannot build a TLS client config: {e}")))?
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    ))
+    let mut config = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Proxy(format!("cannot build a TLS client config: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = ALPN.iter().map(|name| name.to_vec()).collect();
+    Ok(Arc::new(config))
+}
+
+/// The same trust configuration, offering only HTTP/1.1.
+///
+/// For the one request shape HTTP/2 cannot carry: a WebSocket handshake is an
+/// HTTP/1.1 `Upgrade`, and RFC 8441's HTTP/2 spelling of it is a different
+/// protocol that neither this proxy nor `hyper`'s client speaks. Offering `h2`
+/// on that connection would risk negotiating a framing the handshake about to
+/// go over it cannot use.
+pub fn without_http2(config: &ClientConfig) -> Arc<ClientConfig> {
+    let mut config = config.clone();
+    config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
+    Arc::new(config)
 }
 
 /// The cryptographic provider both halves use.
@@ -151,6 +183,29 @@ mod tests {
     #[test]
     fn the_client_verifies_against_real_roots_by_default() {
         assert!(client_config(None).is_ok());
+    }
+
+    #[test]
+    fn both_ends_offer_http2_first_and_http1_after_it() {
+        let ca = CertificateAuthority::generate("mac.local").unwrap();
+        let server = server_config(&ca, "api.openai.com").unwrap();
+        assert_eq!(
+            server.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+
+        let client = client_config(None).unwrap();
+        assert_eq!(
+            client.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn a_websocket_upstream_is_offered_http1_and_nothing_else() {
+        let client = client_config(None).unwrap();
+        let downgraded = without_http2(&client);
+        assert_eq!(downgraded.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 
     #[test]

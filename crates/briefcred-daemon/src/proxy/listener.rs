@@ -86,6 +86,7 @@ use tokio::net::{TcpListener, TcpStream};
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
+use crate::proxy::http2;
 use crate::proxy::issuer::ProxyIssuer;
 use crate::proxy::policy::PolicyCache;
 use crate::proxy::stream;
@@ -151,7 +152,13 @@ const APPLICATION_JSON: &str = "application/json";
 pub struct Proxy {
     state: Arc<State>,
     issuer: Arc<ProxyIssuer>,
+    /// The upstream trust configuration, offering `h2` and `http/1.1`.
     upstream: Arc<rustls::ClientConfig>,
+    /// The same trust, offering only `http/1.1`, for a WebSocket handshake.
+    upstream_http1: Arc<rustls::ClientConfig>,
+    /// One multiplexed upstream connection per session, credential, and
+    /// destination, for the streams that negotiated HTTP/2.
+    upstreams: http2::Upstreams,
     policies: PolicyCache,
     ca: std::sync::Mutex<Option<Arc<CertificateAuthority>>>,
 }
@@ -176,7 +183,9 @@ impl Proxy {
         Arc::new(Proxy {
             state,
             issuer,
+            upstream_http1: crate::proxy::tls::without_http2(&upstream),
             upstream,
+            upstreams: http2::Upstreams::default(),
             policies: PolicyCache::new(),
             ca: std::sync::Mutex::new(None),
         })
@@ -259,7 +268,7 @@ async fn serve_connection(stream: TcpStream, proxy: Arc<Proxy>) {
             Ok::<_, std::convert::Infallible>(if request.method() == Method::CONNECT {
                 begin_tunnel(request, proxy)
             } else {
-                forward(request, proxy, "http", None).await
+                forward(request, proxy, "http", None, None).await
             })
         }
     });
@@ -322,12 +331,20 @@ where
         .await
         .map_err(|e| Error::Proxy(format!("the client would not complete a handshake: {e}")))?;
 
+    // What the two ends negotiated separately. The client picked this one; the
+    // upstream picks its own when the first stream is forwarded, and the
+    // pipeline in between is the same either way.
+    let http2 = stream.get_ref().1.alpn_protocol() == Some(crate::proxy::tls::ALPN_H2);
+    if http2 {
+        return serve_tunnel_http2(stream, host, port, proxy).await;
+    }
+
     let service = service_fn(move |request: Request<Incoming>| {
         let proxy = Arc::clone(&proxy);
         let host = host.clone();
         async move {
             Ok::<_, std::convert::Infallible>(
-                forward(request, proxy, "https", Some((host, port))).await,
+                forward(request, proxy, "https", Some((host, port)), None).await,
             )
         }
     });
@@ -342,6 +359,49 @@ where
     Ok(())
 }
 
+/// Serve HTTP/2 inside a tunnel whose client negotiated it.
+///
+/// The same service as HTTP/1.1, called once per stream instead of once per
+/// request. Nothing in the pipeline changes and nothing needs to: a stream is a
+/// request, and the token, quota, policy, swap, and row it gets are the ones
+/// any other request gets. No `with_upgrades`, because HTTP/2 has no `Upgrade`
+/// — a WebSocket handshake arrives on an `http/1.1` connection or not at all.
+///
+/// The connection's own row is written after `serve_connection` returns, which
+/// is the one moment every stream on it has finished and its totals are final.
+async fn serve_tunnel_http2<I>(io: I, host: String, port: u16, proxy: Arc<Proxy>) -> Result<()>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let connection = Arc::new(http2::Connection::new(host.clone()));
+    let service = {
+        let connection = Arc::clone(&connection);
+        let proxy = Arc::clone(&proxy);
+        service_fn(move |request: Request<Incoming>| {
+            let proxy = Arc::clone(&proxy);
+            let host = host.clone();
+            let connection = Arc::clone(&connection);
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    forward(
+                        request,
+                        proxy,
+                        "https",
+                        Some((host, port)),
+                        Some(connection),
+                    )
+                    .await,
+                )
+            }
+        })
+    };
+    let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+        .serve_connection(TokioIo::new(io), service)
+        .await;
+    connection.finish(&proxy.state);
+    Ok(())
+}
+
 /// The whole of one proxied request: authorize, decide, swap, forward, audit.
 ///
 /// `tunnel` is the host and port the `CONNECT` named, when there was one.
@@ -349,14 +409,23 @@ where
 /// to come from the tunnel rather than from a `Host` header the client
 /// controls: a request that could name its own host would be one that could get
 /// a certificate for one vendor and a connection to somewhere else entirely.
+///
+/// `connection` is the client's HTTP/2 connection, when the request is one
+/// stream of one. Every row this writes names it, so a hundred streams can be
+/// read back as the one connection they were.
 async fn forward(
     request: Request<Incoming>,
     proxy: Arc<Proxy>,
     scheme: &str,
     tunnel: Option<(String, u16)>,
+    connection: Option<Arc<http2::Connection>>,
 ) -> Response<OutBody> {
     let started = std::time::Instant::now();
     let method = request.method().to_string();
+    if let Some(connection) = connection.as_deref() {
+        connection.began_stream(&proxy.state);
+    }
+    let connection_id = connection.as_deref().map(|c| c.id().to_string());
 
     let Some((host, port)) = tunnel.or_else(|| {
         let host_header = request
@@ -375,32 +444,38 @@ async fn forward(
             .unwrap_or(default_port(scheme));
         Some((host, port))
     }) else {
-        return refuse(
-            &proxy,
-            StatusCode::BAD_REQUEST,
+        return Attempt {
+            proxy: &proxy,
             started,
-            None,
-            &method,
-            "",
-            "",
-            DECISION_DENY,
-        );
+            method: &method,
+            host: "",
+            path: "",
+            connection_id: connection_id.as_deref(),
+        }
+        .refuse(StatusCode::BAD_REQUEST, None, DECISION_DENY);
     };
     // The query string is dropped here and never picked up again: it routinely
     // carries an API key, so neither the policy nor the audit row may see one.
     let path = request.uri().path().to_string();
 
+    // Everything a row or a metric for this request needs, whatever becomes of
+    // it. Assembled once so a refusal three checks further down cannot record a
+    // different host from the one that was decided.
+    let attempt = Attempt {
+        proxy: &proxy,
+        started,
+        method: &method,
+        host: &host,
+        path: &path,
+        connection_id: connection_id.as_deref(),
+    };
+
     // 1. Which session and credential is this?
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let Some(presented) = find_token(request.headers()) else {
-        return refuse(
-            &proxy,
+        return attempt.refuse(
             StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-            started,
             None,
-            &method,
-            &host,
-            &path,
             DECISION_DENY,
         );
     };
@@ -408,17 +483,12 @@ async fn forward(
         Ok(claims) => claims,
         Err(err) => {
             eprintln!("briefcred-daemon: proxy refused a token for `{host}`: {err}");
-            return refuse(
-                &proxy,
+            return attempt.refuse(
                 match err {
                     TokenError::Revoked => StatusCode::FORBIDDEN,
                     _ => StatusCode::UNAUTHORIZED,
                 },
-                started,
                 None,
-                &method,
-                &host,
-                &path,
                 DECISION_DENY,
             );
         }
@@ -426,16 +496,7 @@ async fn forward(
 
     // 2. The session it names, and everything it holds.
     let Some(session) = resolve_session(&proxy, &claims.sid, &claims.cred).await else {
-        return refuse(
-            &proxy,
-            StatusCode::UNAUTHORIZED,
-            started,
-            None,
-            &method,
-            &host,
-            &path,
-            DECISION_DENY,
-        );
+        return attempt.refuse(StatusCode::UNAUTHORIZED, None, DECISION_DENY);
     };
 
     // 3. A proof, if the client made one.
@@ -453,16 +514,7 @@ async fn forward(
         };
         if let Err(err) = outcome {
             eprintln!("briefcred-daemon: proxy refused a DPoP proof for `{host}`: {err}");
-            return refuse(
-                &proxy,
-                StatusCode::UNAUTHORIZED,
-                started,
-                None,
-                &method,
-                &host,
-                &path,
-                DECISION_DENY,
-            );
+            return attempt.refuse(StatusCode::UNAUTHORIZED, None, DECISION_DENY);
         }
     }
 
@@ -485,15 +537,7 @@ async fn forward(
         crate::quota::SURFACE_HTTP,
         proxy.state.metrics(),
     ) {
-        return refuse_quota(
-            &proxy,
-            refusal,
-            started,
-            &session.mint_id,
-            &method,
-            &host,
-            &path,
-        );
+        return attempt.refuse_quota(refusal, &session.mint_id);
     }
 
     // 5. May this session make this request?
@@ -517,17 +561,9 @@ async fn forward(
         },
     );
     if !decision.forwards() {
-        proxy.state.audit(&proxy_row(
-            &session.mint_id,
-            &method,
-            &host,
-            &path,
-            None,
-            0,
-            0,
-            started.elapsed(),
-            decision.label(),
-        ));
+        proxy
+            .state
+            .audit(&attempt.row(&session.mint_id, None, 0, 0, decision.label()));
         proxy
             .state
             .metrics()
@@ -561,14 +597,9 @@ async fn forward(
             eprintln!(
                 "briefcred-daemon: proxy refused a malformed websocket handshake for `{host}`"
             );
-            return refuse(
-                &proxy,
+            return attempt.refuse(
                 StatusCode::BAD_REQUEST,
-                started,
                 Some(&session.mint_id),
-                &method,
-                &host,
-                &path,
                 DECISION_BAD_REQUEST,
             );
         }
@@ -580,14 +611,9 @@ async fn forward(
         Some(&session.authorized),
     ) {
         eprintln!("briefcred-daemon: proxy will not forward to `{host}`: {err}");
-        return refuse(
-            &proxy,
+        return attempt.refuse(
             StatusCode::BAD_GATEWAY,
-            started,
             Some(&session.mint_id),
-            &method,
-            &host,
-            &path,
             DECISION_SWAP_ERROR,
         );
     }
@@ -599,8 +625,9 @@ async fn forward(
     parts.headers.remove(hyper::header::PROXY_AUTHORIZATION);
     parts.headers.remove("proxy-connection");
 
-    // The upstream is a fresh HTTP/1.1 connection, so the request line has to
-    // be origin-form: an absolute URI is a proxy's spelling, not a server's.
+    // Origin-form, because an absolute URI is a proxy's spelling and not a
+    // server's. An HTTP/2 upstream needs the authority back and gets it in
+    // `send_upstream`, which is the only place that knows what was negotiated.
     parts.uri = origin_form(&parts.uri);
 
     let req_bytes = Arc::new(AtomicU64::new(0));
@@ -613,6 +640,12 @@ async fn forward(
         scheme,
         &host,
         port,
+        http2::UpstreamKey {
+            sid: claims.sid.clone(),
+            credential: claims.cred.clone(),
+            host: host.clone(),
+            port,
+        },
         upstream_request,
         handshake.is_some(),
     )
@@ -621,14 +654,9 @@ async fn forward(
         Ok(response) => response,
         Err(err) => {
             eprintln!("briefcred-daemon: proxy could not reach `{host}`: {err}");
-            return refuse(
-                &proxy,
+            return attempt.refuse(
                 StatusCode::BAD_GATEWAY,
-                started,
                 Some(&session.mint_id),
-                &method,
-                &host,
-                &path,
                 DECISION_UPSTREAM_ERROR,
             );
         }
@@ -655,9 +683,14 @@ async fn forward(
     // it would be the same lie as reporting zero for any other response.
     let completed = handshake.filter(|_| response.status() == StatusCode::SWITCHING_PROTOCOLS);
     if let Some((client_upgrade, key)) = completed {
+        // Only reachable on HTTP/1.1: HTTP/2 has no `Upgrade`, so a stream on
+        // an h2 connection never gets here and `connection_id` is always
+        // `None`. Carried anyway rather than hardcoded, so the day RFC 8441
+        // arrives the row is already right.
         return upgrade_websocket(
             response,
             Handshake {
+                connection_id,
                 proxy,
                 mint_id: session.mint_id.clone(),
                 method,
@@ -685,22 +718,31 @@ async fn forward(
         let method = method.clone();
         let host = host.clone();
         let path = path.clone();
+        let connection = connection.clone();
+        let connection_id = connection_id.clone();
         move |resp_bytes: u64| {
             let elapsed = started.elapsed();
             // Added when the body ends, which is the only moment the size is
             // known. So a policy's `context.resp_bytes_so_far` counts what the
             // session has already been given, never the response in flight.
             counters.add_resp_bytes(resp_bytes);
+            let req_bytes = req_bytes.load(Ordering::Relaxed);
+            // The connection's totals are its streams' totals, added as each
+            // one finishes for the same reason: this is when they are known.
+            if let Some(connection) = connection.as_deref() {
+                connection.add_bytes(req_bytes, resp_bytes);
+            }
             proxy.state.audit(&proxy_row(
                 &mint_id,
                 &method,
                 &host,
                 &path,
                 Some(status_code),
-                req_bytes.load(Ordering::Relaxed),
+                req_bytes,
                 resp_bytes,
                 elapsed,
                 decision,
+                connection_id.clone(),
             ));
             proxy
                 .state
@@ -729,6 +771,7 @@ async fn forward(
         path,
         started: OffsetDateTime::now_utc(),
         since: std::time::Instant::now(),
+        connection_id,
     };
     let watch = stream::watch(Arc::clone(&proxy.state), Arc::clone(&proxy.issuer), live);
     Response::from_parts(
@@ -743,6 +786,9 @@ const WEBSOCKET_KEY: &str = "sec-websocket-key";
 /// What the WebSocket branch of [`forward`] needs and the response does not
 /// carry.
 struct Handshake {
+    /// The client's HTTP/2 connection, when there is one. See the note at the
+    /// call site for why there never is one today.
+    connection_id: Option<String>,
     proxy: Arc<Proxy>,
     mint_id: MintId,
     method: String,
@@ -772,6 +818,7 @@ struct Handshake {
 /// upgrade and never reached here.
 fn upgrade_websocket(response: Response<Incoming>, hand: Handshake) -> Response<OutBody> {
     let Handshake {
+        connection_id,
         proxy,
         mint_id,
         method,
@@ -795,18 +842,21 @@ fn upgrade_websocket(response: Response<Incoming>, hand: Handshake) -> Response<
     let upstream_upgrade = response
         .extensions_mut()
         .remove::<hyper::upgrade::OnUpgrade>();
+    let attempt = Attempt {
+        proxy: &proxy,
+        started,
+        method: &method,
+        host: &host,
+        path: &path,
+        connection_id: connection_id.as_deref(),
+    };
     let Some(upstream_upgrade) = upstream_upgrade.filter(|_| accepted) else {
         eprintln!(
             "briefcred-daemon: `{host}` answered 101 without completing the handshake; not relaying"
         );
-        return refuse(
-            &proxy,
+        return attempt.refuse(
             StatusCode::BAD_GATEWAY,
-            started,
             Some(&mint_id),
-            &method,
-            &host,
-            &path,
             DECISION_UPSTREAM_ERROR,
         );
     };
@@ -814,15 +864,11 @@ fn upgrade_websocket(response: Response<Incoming>, hand: Handshake) -> Response<
     // The handshake is a request like any other and gets its row now: the
     // stream that follows gets one of its own when it closes.
     let elapsed = started.elapsed();
-    proxy.state.audit(&proxy_row(
+    proxy.state.audit(&attempt.row(
         &mint_id,
-        &method,
-        &host,
-        &path,
         Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
         0,
         0,
-        elapsed,
         decision,
     ));
     proxy.state.metrics().record_proxy_request(
@@ -839,6 +885,7 @@ fn upgrade_websocket(response: Response<Incoming>, hand: Handshake) -> Response<
         path,
         started: OffsetDateTime::now_utc(),
         since: std::time::Instant::now(),
+        connection_id: connection_id.clone(),
     };
     let watch = stream::watch(Arc::clone(&proxy.state), Arc::clone(&proxy.issuer), live);
     // A relay of its own again: the handshake response completes the tunnel's
@@ -881,55 +928,160 @@ fn upgrade_websocket(response: Response<Incoming>, hand: Handshake) -> Response<
     switching
 }
 
-/// Open a connection to the upstream and send one request on it.
+/// Send one request upstream, over HTTP/2 where the upstream offers it.
 ///
-/// A connection per request rather than a pool. That is the honest MVP: pooling
-/// would have to key on `(host, port, credential)` — two sessions with two
-/// different keys must never share a connection an upstream might treat as
-/// authenticated — and getting that wrong is a credential mix-up rather than a
-/// slow proxy.
-/// `upgrades` is set for a WebSocket handshake, and is what makes the
-/// connection survive its own `101` so both halves can be taken over.
-async fn send_upstream<B>(
+/// The upstream's protocol is negotiated separately from the client's, by ALPN
+/// on the connection this opens. A client on HTTP/2 whose upstream only speaks
+/// HTTP/1.1 still gets its request forwarded, and an HTTP/1.1 client whose
+/// upstream speaks HTTP/2 gets the benefit of the multiplexing without knowing
+/// about it.
+///
+/// # Which connections are reused, and which are not
+///
+/// An HTTP/2 upstream connection is kept and multiplexed, keyed on the session
+/// and credential as well as the destination — see [`crate::proxy::http2`] for
+/// why the key has to be that narrow. HTTP/1.1 gets a fresh connection per
+/// request, as it always has: one request at a time over a new connection is
+/// already correct, and pooling it would carry the same credential-mix-up risk
+/// for a smaller prize.
+///
+/// `upgrades` is set for a WebSocket handshake. It forces HTTP/1.1 outright —
+/// an `Upgrade` has no HTTP/2 spelling this proxy speaks — and is what makes
+/// the connection survive its own `101` so both halves can be taken over.
+async fn send_upstream(
     proxy: &Proxy,
     scheme: &str,
     host: &str,
     port: u16,
-    request: Request<B>,
+    key: http2::UpstreamKey,
+    request: Request<http2::UpstreamBody>,
     upgrades: bool,
-) -> Result<Response<Incoming>>
-where
-    B: Body<Data = Bytes> + Send + Unpin + 'static,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
+) -> Result<Response<Incoming>> {
+    // A WebSocket handshake, or a plain `http://` upstream where there is no
+    // ALPN to negotiate with and h2c is not something to guess at.
+    if upgrades || scheme != "https" {
+        let io = connect_upstream(proxy, scheme, host, port, upgrades).await?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(io.stream)
+            .await
+            .map_err(|e| Error::Proxy(format!("upstream handshake failed: {e}")))?;
+        spawn_http1(connection, upgrades);
+        return sender
+            .send_request(request)
+            .await
+            .map_err(|e| Error::Proxy(format!("upstream refused the request: {e}")));
+    }
+
+    let mut request = request;
+    let dialled = proxy
+        .upstreams
+        .connect(key, || dial(proxy, scheme, host, port))
+        .await?;
+    match dialled {
+        http2::Dialled::Http2(mut sender) => {
+            // Connection-specific headers an HTTP/1.1 client may have sent are
+            // forbidden on an HTTP/2 stream, and an upstream that sees one
+            // resets the stream rather than answering it.
+            http2::strip_connection_specific(request.headers_mut());
+            // HTTP/2 carries the destination in `:scheme` and `:authority`,
+            // which hyper takes from the URI. Origin-form is an HTTP/1.1
+            // spelling and leaves it with nothing to put there.
+            *request.uri_mut() = absolute_form(scheme, host, port, request.uri());
+            http2::Upstreams::send(&mut sender, request).await
+        }
+        http2::Dialled::Http1(mut sender) => sender
+            .send_request(request)
+            .await
+            .map_err(|e| Error::Proxy(format!("upstream refused the request: {e}"))),
+    }
+}
+
+/// Open one upstream connection and complete whichever handshake ALPN chose.
+async fn dial(proxy: &Proxy, scheme: &str, host: &str, port: u16) -> Result<http2::Dialled> {
+    let io = connect_upstream(proxy, scheme, host, port, false).await?;
+    if io.http2 {
+        let (sender, connection) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io.stream)
+                .await
+                .map_err(|e| Error::Proxy(format!("upstream handshake failed: {e}")))?;
+        // Driven in its own task, and for longer than an HTTP/1.1 connection's:
+        // this one outlives the request that opened it and carries every later
+        // stream the cache hands the same sender to.
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        return Ok(http2::Dialled::Http2(sender));
+    }
+    let (sender, connection) = hyper::client::conn::http1::handshake(io.stream)
+        .await
+        .map_err(|e| Error::Proxy(format!("upstream handshake failed: {e}")))?;
+    spawn_http1(connection, false);
+    Ok(http2::Dialled::Http1(sender))
+}
+
+/// A connected upstream, and what its ALPN said it speaks.
+struct Upstream {
+    stream: TokioIo<UpstreamStream>,
+    http2: bool,
+}
+
+/// Either half of what an upstream connection may be underneath.
+enum UpstreamStream {
+    /// A `https://` upstream, verified against the real trust store.
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    /// A plain `http://` upstream, which briefcred forwards to as it is asked.
+    Plain(TcpStream),
+}
+
+/// Connect to the upstream, terminating in TLS where the scheme calls for it.
+///
+/// `upgrades` picks the trust configuration that offers only `http/1.1`, so a
+/// WebSocket handshake cannot end up on a connection that negotiated HTTP/2.
+async fn connect_upstream(
+    proxy: &Proxy,
+    scheme: &str,
+    host: &str,
+    port: u16,
+    upgrades: bool,
+) -> Result<Upstream> {
     let stream = TcpStream::connect((host, port))
         .await
         .map_err(|e| Error::Proxy(format!("cannot connect to `{host}:{port}`: {e}")))?;
 
-    if scheme == "https" {
-        let name = rustls_pki_types::ServerName::try_from(host.to_string())
-            .map_err(|_| Error::Proxy(format!("`{host}` is not a server name")))?;
-        let tls = tokio_rustls::TlsConnector::from(Arc::clone(&proxy.upstream))
-            .connect(name, stream)
-            .await
-            .map_err(|e| Error::Proxy(format!("`{host}` did not verify: {e}")))?;
-        send_on(TokioIo::new(tls), request, upgrades).await
-    } else {
-        send_on(TokioIo::new(stream), request, upgrades).await
+    if scheme != "https" {
+        return Ok(Upstream {
+            stream: TokioIo::new(UpstreamStream::Plain(stream)),
+            http2: false,
+        });
     }
+    let name = rustls_pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| Error::Proxy(format!("`{host}` is not a server name")))?;
+    let config = if upgrades {
+        Arc::clone(&proxy.upstream_http1)
+    } else {
+        Arc::clone(&proxy.upstream)
+    };
+    let tls = tokio_rustls::TlsConnector::from(config)
+        .connect(name, stream)
+        .await
+        .map_err(|e| Error::Proxy(format!("`{host}` did not verify: {e}")))?;
+    let http2 = tls.get_ref().1.alpn_protocol() == Some(crate::proxy::tls::ALPN_H2);
+    Ok(Upstream {
+        stream: TokioIo::new(UpstreamStream::Tls(Box::new(tls))),
+        http2,
+    })
 }
 
-async fn send_on<I, B>(io: I, request: Request<B>, upgrades: bool) -> Result<Response<Incoming>>
-where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+/// Drive one HTTP/1.1 upstream connection in a task of its own.
+///
+/// It has to keep pumping while the response body is being read, so awaiting it
+/// at the call site would deadlock.
+fn spawn_http1<B>(
+    connection: hyper::client::conn::http1::Connection<TokioIo<UpstreamStream>, B>,
+    upgrades: bool,
+) where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| Error::Proxy(format!("upstream handshake failed: {e}")))?;
-    // Driven in its own task: the connection has to keep pumping while the
-    // response body is being read, and awaiting it here would deadlock.
     if upgrades {
         tokio::spawn(async move {
             let _ = connection.with_upgrades().await;
@@ -939,10 +1091,46 @@ where
             let _ = connection.await;
         });
     }
-    sender
-        .send_request(request)
-        .await
-        .map_err(|e| Error::Proxy(format!("upstream refused the request: {e}")))
+}
+
+impl tokio::io::AsyncRead for UpstreamStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpstreamStream::Tls(tls) => Pin::new(tls.as_mut()).poll_read(cx, buf),
+            UpstreamStream::Plain(plain) => Pin::new(plain).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for UpstreamStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            UpstreamStream::Tls(tls) => Pin::new(tls.as_mut()).poll_write(cx, buf),
+            UpstreamStream::Plain(plain) => Pin::new(plain).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpstreamStream::Tls(tls) => Pin::new(tls.as_mut()).poll_flush(cx),
+            UpstreamStream::Plain(plain) => Pin::new(plain).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpstreamStream::Tls(tls) => Pin::new(tls.as_mut()).poll_shutdown(cx),
+            UpstreamStream::Plain(plain) => Pin::new(plain).poll_shutdown(cx),
+        }
+    }
 }
 
 /// One credential-bearing session, resolved from a token's claims.
@@ -1035,92 +1223,112 @@ fn find_token(headers: &hyper::header::HeaderMap) -> Option<String> {
     })
 }
 
-/// Audit and count a refusal, then answer with `code` and no body.
+/// What every audit row and metric one request writes needs, however it ends.
 ///
-/// Every refusal is recorded. A proxy that silently drops requests is one an
-/// operator debugging "why does my agent get a 401" has nothing to read.
-#[allow(clippy::too_many_arguments)]
-fn refuse(
-    proxy: &Proxy,
-    code: StatusCode,
+/// Assembled once, as soon as the destination is known, and borrowed by every
+/// refusal after it. The point is that a refusal five checks down cannot record
+/// a different host or a different clock from the one the request was decided
+/// against, which is exactly the drift a long argument list invites.
+struct Attempt<'a> {
+    proxy: &'a Proxy,
+    /// When the request arrived, for the latency on every row it may write.
     started: std::time::Instant,
-    mint_id: Option<&MintId>,
-    method: &str,
-    host: &str,
-    path: &str,
-    decision: &str,
-) -> Response<OutBody> {
-    let elapsed = started.elapsed();
-    if let Some(mint_id) = mint_id {
-        proxy.state.audit(&proxy_row(
-            mint_id, method, host, path,
-            // Not `code`. `status` is the *upstream's* answer, and nothing
-            // that reaches here got one — the status the client sees is
-            // briefcred's own, and `decision` is what says why.
-            None, 0, 0, elapsed, decision,
-        ));
-    }
-    proxy
-        .state
-        .metrics()
-        .record_proxy_request(decision, None, elapsed);
-    status(code)
+    method: &'a str,
+    host: &'a str,
+    path: &'a str,
+    /// The client's HTTP/2 connection, when the request is one stream of one.
+    connection_id: Option<&'a str>,
 }
 
-/// Audit and count a throttled request, then answer `429`.
-///
-/// Audited rather than merely counted, unlike the token failures above: the
-/// session is known, so the row can name a `mint_id`, and "the quota refused
-/// this" is exactly the row somebody reading the log to work out why an agent
-/// stalled needs to find.
-#[allow(clippy::too_many_arguments)]
-fn refuse_quota(
-    proxy: &Proxy,
-    refusal: crate::quota::Refusal,
-    started: std::time::Instant,
-    mint_id: &MintId,
-    method: &str,
-    host: &str,
-    path: &str,
-) -> Response<OutBody> {
-    let elapsed = started.elapsed();
-    proxy.state.audit(&proxy_row(
-        mint_id,
-        method,
-        host,
-        path,
-        None,
-        0,
-        0,
-        elapsed,
-        DECISION_QUOTA,
-    ));
-    proxy
-        .state
-        .metrics()
-        .record_proxy_request(DECISION_QUOTA, None, elapsed);
-
-    let mut response = Response::new(
-        Full::new(Bytes::from_static(QUOTA_BODY.as_bytes()))
-            .map_err(|never| match never {})
-            .boxed(),
-    );
-    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-    response.headers_mut().insert(
-        hyper::header::CONTENT_TYPE,
-        HeaderValue::from_static(APPLICATION_JSON),
-    );
-    // Absent where no wait would help: a session that has spent its `total`
-    // needs a new session, and a `Retry-After` would send it round the loop
-    // that got it here.
-    if let Some(retry_after) = refusal.retry_after() {
-        if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().to_string()) {
-            response
-                .headers_mut()
-                .insert(hyper::header::RETRY_AFTER, value);
-        }
+impl Attempt<'_> {
+    /// One `ProxyRequest` row for this request, as it stands now.
+    fn row(
+        &self,
+        mint_id: &MintId,
+        status: Option<u16>,
+        req_bytes: u64,
+        resp_bytes: u64,
+        decision: &str,
+    ) -> AuditEntry {
+        proxy_row(
+            mint_id,
+            self.method,
+            self.host,
+            self.path,
+            status,
+            req_bytes,
+            resp_bytes,
+            self.started.elapsed(),
+            decision,
+            self.connection_id.map(str::to_string),
+        )
     }
-    response
+
+    /// Audit and count a refusal, then answer with `code` and no body.
+    ///
+    /// Every refusal is recorded. A proxy that silently drops requests is one
+    /// an operator debugging "why does my agent get a 401" has nothing to read.
+    /// `mint_id` is absent where nothing resolved a session, and the row is
+    /// then skipped rather than invented: a row names a grant.
+    fn refuse(
+        &self,
+        code: StatusCode,
+        mint_id: Option<&MintId>,
+        decision: &str,
+    ) -> Response<OutBody> {
+        if let Some(mint_id) = mint_id {
+            // Not `code`. `status` is the *upstream's* answer, and nothing that
+            // reaches here got one — the status the client sees is briefcred's
+            // own, and `decision` is what says why.
+            self.proxy
+                .state
+                .audit(&self.row(mint_id, None, 0, 0, decision));
+        }
+        self.proxy
+            .state
+            .metrics()
+            .record_proxy_request(decision, None, self.started.elapsed());
+        status(code)
+    }
+
+    /// Audit and count a throttled request, then answer `429`.
+    ///
+    /// Audited rather than merely counted, unlike the token failures above: the
+    /// session is known, so the row can name a `mint_id`, and "the quota
+    /// refused this" is exactly the row somebody reading the log to work out
+    /// why an agent stalled needs to find.
+    fn refuse_quota(&self, refusal: crate::quota::Refusal, mint_id: &MintId) -> Response<OutBody> {
+        self.proxy
+            .state
+            .audit(&self.row(mint_id, None, 0, 0, DECISION_QUOTA));
+        self.proxy.state.metrics().record_proxy_request(
+            DECISION_QUOTA,
+            None,
+            self.started.elapsed(),
+        );
+
+        let mut response = Response::new(
+            Full::new(Bytes::from_static(QUOTA_BODY.as_bytes()))
+                .map_err(|never| match never {})
+                .boxed(),
+        );
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        response.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            HeaderValue::from_static(APPLICATION_JSON),
+        );
+        // Absent where no wait would help: a session that has spent its
+        // `total` needs a new session, and a `Retry-After` would send it round
+        // the loop that got it here.
+        if let Some(retry_after) = refusal.retry_after() {
+            if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().to_string()) {
+                response
+                    .headers_mut()
+                    .insert(hyper::header::RETRY_AFTER, value);
+            }
+        }
+        response
+    }
 }
 
 /// One `ProxyRequest` audit row. Metadata only, by construction.
@@ -1135,6 +1343,7 @@ fn proxy_row(
     resp_bytes: u64,
     latency: std::time::Duration,
     decision: &str,
+    connection_id: Option<String>,
 ) -> AuditEntry {
     AuditEntry::ProxyRequest {
         ts: OffsetDateTime::now_utc(),
@@ -1147,6 +1356,7 @@ fn proxy_row(
         resp_bytes,
         latency_ms: latency.as_millis() as u64,
         decision: decision.to_string(),
+        connection_id,
     }
 }
 
@@ -1155,14 +1365,14 @@ fn proxy_row(
 /// Wrapping rather than collecting is the whole point: a four-megabyte response
 /// reaches the client a frame at a time, and the count is a side effect of the
 /// frames going past rather than of holding them.
-struct Counting<B> {
+pub struct Counting<B> {
     inner: B,
     bytes: Arc<AtomicU64>,
     on_done: Option<Box<dyn FnOnce(u64) + Send + Sync>>,
 }
 
 impl<B> Counting<B> {
-    fn new(
+    pub fn new(
         inner: B,
         bytes: Arc<AtomicU64>,
         on_done: Option<Box<dyn FnOnce(u64) + Send + Sync>>,
@@ -1273,6 +1483,25 @@ fn origin_form(uri: &hyper::Uri) -> hyper::Uri {
         .unwrap_or_else(|_| hyper::Uri::from_static("/"))
 }
 
+/// Rewrite an origin-form URI as the absolute form HTTP/2 needs.
+///
+/// HTTP/2 has no request line: the destination is carried in the `:scheme` and
+/// `:authority` pseudo-headers, which hyper fills in from the URI. The port is
+/// left off when it is the scheme's own, because `:authority` is what an
+/// upstream compares against its certificate and its virtual hosts, and
+/// `api.openai.com:443` is not the same string as `api.openai.com`.
+fn absolute_form(scheme: &str, host: &str, port: u16, uri: &hyper::Uri) -> hyper::Uri {
+    let authority = if port == default_port(scheme) {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
+    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    format!("{scheme}://{authority}{path}")
+        .parse()
+        .unwrap_or_else(|_| uri.clone())
+}
+
 /// A response with a status and nothing else.
 ///
 /// Deliberately bodiless. A proxy that explained itself in the response body
@@ -1341,6 +1570,28 @@ mod tests {
         assert_eq!(origin_form(&uri).to_string(), "/v1/thing?a=1");
         let already: hyper::Uri = "/v1/thing".parse().unwrap();
         assert_eq!(origin_form(&already).to_string(), "/v1/thing");
+    }
+
+    #[test]
+    fn an_origin_form_uri_gets_its_authority_back_for_http2() {
+        let uri: hyper::Uri = "/v1/models?limit=1".parse().unwrap();
+        assert_eq!(
+            absolute_form("https", "api.openai.com", 443, &uri).to_string(),
+            "https://api.openai.com/v1/models?limit=1"
+        );
+    }
+
+    #[test]
+    fn a_non_default_port_stays_in_the_authority_and_a_default_one_does_not() {
+        let uri: hyper::Uri = "/v1/models".parse().unwrap();
+        assert_eq!(
+            absolute_form("https", "localhost", 8443, &uri).to_string(),
+            "https://localhost:8443/v1/models"
+        );
+        assert_eq!(
+            absolute_form("http", "localhost", 80, &uri).to_string(),
+            "http://localhost/v1/models"
+        );
     }
 
     #[test]

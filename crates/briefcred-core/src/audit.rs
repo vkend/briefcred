@@ -155,6 +155,62 @@ pub enum AuditEntry {
         /// operator reading a rising count knows whether to widen a policy or
         /// to go and look at something.
         decision: String,
+        /// The HTTP/2 connection this request was one stream of.
+        ///
+        /// Absent on HTTP/1.1, where a connection carries one request at a
+        /// time and the row is already the whole story. Present on HTTP/2,
+        /// where a hundred rows may belong to one connection and matching
+        /// them up by host and timestamp would be guesswork. It matches the
+        /// `connection_id` of exactly one
+        /// [`AuditEntry::ProxyH2Connection`] row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_id: Option<String>,
+    },
+    /// One HTTP/2 connection from a wrapped subprocess closed.
+    ///
+    /// Written in addition to the [`AuditEntry::ProxyRequest`] row each of its
+    /// streams already wrote, not instead of them. Every stream was authorised,
+    /// charged, and decided on its own — HTTP/2 changes how requests are framed
+    /// and nothing about what briefcred does with one — so this row carries no
+    /// decision of its own. What it adds is the shape of the connection: how
+    /// many streams a client multiplexed onto it, how long it held it open, and
+    /// how much crossed it in each direction.
+    ///
+    /// Metadata only, on the same terms as every other proxy row. There is no
+    /// path here, because a connection has many; no status, for the same
+    /// reason; and nothing at all from a stream's headers, body, or trailers. A
+    /// gRPC call's `grpc-status` trailer is relayed to the client untouched and
+    /// is never read, so it could not appear here.
+    ///
+    /// `mint_id` is the mint of the first stream on the connection that
+    /// resolved a session. A connection whose every stream was refused before
+    /// one did — a run of bad tokens, say — gets no row, on the same terms as
+    /// the request rows: a row names a grant, and nothing here named one.
+    ProxyH2Connection {
+        /// When the row was written, which is when the connection closed.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// Identifier for this connection, unique within the daemon's lifetime.
+        ///
+        /// What the `connection_id` on every [`AuditEntry::ProxyRequest`] and
+        /// [`AuditEntry::ProxyStream`] row of this connection points back at.
+        connection_id: String,
+        /// The synthetic token's mint, tying the connection to its `Mint` row.
+        mint_id: MintId,
+        /// The upstream host the `CONNECT` named, without the port.
+        host: String,
+        /// When the connection's TLS handshake finished.
+        #[serde(with = "time::serde::rfc3339")]
+        started: OffsetDateTime,
+        /// When the connection closed.
+        #[serde(with = "time::serde::rfc3339")]
+        ended: OffsetDateTime,
+        /// Streams opened on it, counted whatever became of each.
+        streams: u64,
+        /// Bytes of request body forwarded upstream, across every stream.
+        bytes_up: u64,
+        /// Bytes of response body forwarded back, across every stream.
+        bytes_down: u64,
     },
     /// One long-lived stream through the HTTP proxy ended.
     ///
@@ -194,6 +250,12 @@ pub enum AuditEntry {
         bytes_up: u64,
         /// Bytes the upstream sent back to the client.
         bytes_down: u64,
+        /// The HTTP/2 connection this stream was one stream of, if any.
+        ///
+        /// Absent on HTTP/1.1, and on the WebSocket streams that can only be
+        /// HTTP/1.1. Present on an event stream a client opened over HTTP/2.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_id: Option<String>,
     },
     /// One connection crossed the Postgres proxy.
     ///
@@ -421,6 +483,7 @@ impl AuditEntry {
             | AuditEntry::Revoke { mint_id, .. }
             | AuditEntry::ProxyRequest { mint_id, .. }
             | AuditEntry::ProxyStream { mint_id, .. }
+            | AuditEntry::ProxyH2Connection { mint_id, .. }
             | AuditEntry::PgConnection { mint_id, .. } => std::slice::from_ref(mint_id),
             AuditEntry::ExecStart { mint_ids, .. }
             | AuditEntry::ExecEnd { mint_ids, .. }
@@ -569,6 +632,7 @@ mod tests {
             started: OffsetDateTime::UNIX_EPOCH,
             ended: OffsetDateTime::UNIX_EPOCH,
             events_or_frames: 100,
+            connection_id: None,
             bytes_up: 40,
             bytes_down: 9_000,
         };

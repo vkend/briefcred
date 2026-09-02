@@ -146,6 +146,8 @@ pub struct Metrics {
     proxy_latency: Mutex<Histogram>,
     proxy_streams: Mutex<BTreeMap<&'static str, u64>>,
     proxy_stream_duration: Mutex<Histogram>,
+    proxy_h2_connections: AtomicU64,
+    proxy_h2_streams: AtomicU64,
     pgproxy_connections: Mutex<BTreeMap<String, u64>>,
     pgproxy_bytes: Mutex<BTreeMap<&'static str, u64>>,
     quota_saturation: Mutex<BTreeMap<String, f64>>,
@@ -194,6 +196,8 @@ impl Metrics {
             proxy_latency: Mutex::new(Histogram::default()),
             proxy_streams: Mutex::new(PROXY_STREAM_KINDS.iter().map(|kind| (*kind, 0)).collect()),
             proxy_stream_duration: Mutex::new(Histogram::new(&STREAM_DURATION_BUCKETS)),
+            proxy_h2_connections: AtomicU64::new(0),
+            proxy_h2_streams: AtomicU64::new(0),
             pgproxy_connections: Mutex::new(BTreeMap::new()),
             pgproxy_bytes: Mutex::new(PGPROXY_DIRECTIONS.iter().map(|name| (*name, 0)).collect()),
             quota_saturation: Mutex::new(BTreeMap::new()),
@@ -337,6 +341,26 @@ impl Metrics {
             .observe(kind, elapsed.as_secs_f64());
     }
 
+    /// Count one HTTP/2 connection from a client that has closed.
+    ///
+    /// Counted at the close rather than at the handshake, the same way a
+    /// stream is and for the same reason: it is the moment the connection's
+    /// `ProxyH2Connection` row exists, so the counter and the log agree.
+    pub fn record_h2_connection(&self) {
+        self.proxy_h2_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one stream opened on a client's HTTP/2 connection.
+    ///
+    /// Every stream, whatever became of it. What it is *for* is the ratio
+    /// against `briefcred_proxy_h2_connections_total`: a client multiplexing
+    /// well shows many streams per connection, and one that has fallen back to
+    /// a connection per call shows about one — which is the difference between
+    /// gRPC working through the proxy and merely not failing.
+    pub fn record_h2_stream(&self) {
+        self.proxy_h2_streams.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record how long one mint took, successful or not.
     ///
     /// Failures are timed too: a backend that takes thirty seconds to refuse is
@@ -478,6 +502,24 @@ impl Metrics {
                 "How long one long-lived stream stayed open, by kind.",
                 &mut out,
             );
+
+        out.push_str(
+            "# HELP briefcred_proxy_h2_connections_total HTTP/2 connections from wrapped subprocesses that have closed.\n",
+        );
+        out.push_str("# TYPE briefcred_proxy_h2_connections_total counter\n");
+        out.push_str(&format!(
+            "briefcred_proxy_h2_connections_total {}\n",
+            self.proxy_h2_connections.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP briefcred_proxy_h2_streams_total Streams opened on those HTTP/2 connections.\n",
+        );
+        out.push_str("# TYPE briefcred_proxy_h2_streams_total counter\n");
+        out.push_str(&format!(
+            "briefcred_proxy_h2_streams_total {}\n",
+            self.proxy_h2_streams.load(Ordering::Relaxed)
+        ));
 
         out.push_str(
             "# HELP briefcred_pgproxy_connections_total Connections through the Postgres proxy, by outcome.\n",
@@ -878,6 +920,8 @@ mod tests {
             "briefcred_pgproxy_bytes_total",
             "briefcred_proxy_streams_total",
             "briefcred_proxy_stream_duration_seconds",
+            "briefcred_proxy_h2_connections_total",
+            "briefcred_proxy_h2_streams_total",
         ] {
             assert!(text.contains(&format!("# HELP {series} ")), "{series}");
             assert!(text.contains(&format!("# TYPE {series} ")), "{series}");
