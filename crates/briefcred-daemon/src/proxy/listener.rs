@@ -1267,7 +1267,7 @@ async fn resolve_session(
     sid: &str,
     credential: &str,
 ) -> Option<Box<ResolvedSession>> {
-    let (profile_name, masters, pubkey, mint_id, quota, http) = proxy
+    let (profile_name, masters, pubkey, mint_id, minted, quota, http) = proxy
         .state
         .sessions()
         .with_session(sid, |session| {
@@ -1280,6 +1280,13 @@ async fn resolve_session(
                     .values()
                     .find(|mint| mint.credential == credential)
                     .map(|mint| mint.mint_id.clone()),
+                // The credentials this session actually minted, which is not
+                // the same set as the ones its profile declares.
+                session
+                    .mints
+                    .values()
+                    .map(|mint| mint.credential.clone())
+                    .collect::<std::collections::BTreeSet<String>>(),
                 session.quota.clone(),
                 Arc::clone(&session.http),
             )
@@ -1293,8 +1300,16 @@ async fn resolve_session(
     let _ = proxy.state.sessions().touch(sid).await;
     let profile = proxy.state.profiles().get(&profile_name).await?;
 
+    // Only what this exec minted. A `--cred openai` run holds one grant, and a
+    // profile that also declares `stripe` must not have the Stripe key
+    // substituted into its headers on the strength of a token that never
+    // covered it: `--cred` would otherwise narrow what is *published* to the
+    // subprocess without narrowing what the proxy will swap in.
     let mut credentials = Vec::new();
     for spec in &profile.credentials {
+        if !minted.contains(&spec.name) {
+            continue;
+        }
         let Some(Ok(kind)) = HttpKind::parse(&spec.kind, &spec.config) else {
             continue;
         };

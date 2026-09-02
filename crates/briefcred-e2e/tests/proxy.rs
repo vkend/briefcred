@@ -129,6 +129,9 @@ env:
 struct Seen {
     authorization: Option<String>,
     dpop: Option<String>,
+    /// A header the tests put a `__name__` placeholder in, so what the upstream
+    /// received can be compared against what was sent.
+    custom: Option<String>,
     path: String,
 }
 
@@ -226,6 +229,7 @@ async fn start_upstream() -> Upstream {
                         recorded.lock().unwrap().push(Seen {
                             authorization: header("authorization"),
                             dpop: header("dpop"),
+                            custom: header("x-custom"),
                             path: path.clone(),
                         });
 
@@ -822,6 +826,133 @@ impl Fixture {
     fn stop_upstream(&self) {
         self.upstream.accepting.abort();
     }
+}
+
+/// The second credential's master, which no test may ever see substituted.
+const STRIPE_KEY: &str = "sk_live_the_real_stripe_key";
+
+/// A profile declaring two HTTP credentials, so one exec can mint fewer than
+/// all of them.
+fn two_credential_profile() -> String {
+    format!(
+        "\
+name: openai
+unlock:
+  policy: none
+credentials:
+  - name: openai
+    kind: http-bearer
+    ttl_secs: 300
+  - name: stripe
+    kind: http-bearer
+    ttl_secs: 300
+policy_mode: enforce
+policy: |
+  permit(principal, action == Action::\"GET\", resource)
+  when {{ resource.host == \"{UPSTREAM_HOST}\" && resource.path == \"/v1/models\" }};
+"
+    )
+}
+
+#[tokio::test]
+async fn a_placeholder_for_a_credential_this_exec_did_not_mint_is_not_substituted() {
+    // `--cred openai` narrows what the run was given. Without the same
+    // narrowing at the proxy, a `__stripe__` in a header would be filled in
+    // from a master the session holds but this grant never covered — which
+    // would make `--cred` a suggestion rather than a bound.
+    let upstream = start_upstream().await;
+
+    let daemon = Daemon::prepare("");
+    let roots = daemon.home().join("upstream-roots.pem");
+    std::fs::write(&roots, &upstream.ca_pem).unwrap();
+    std::fs::write(
+        daemon.home().join("daemon.toml"),
+        format!(
+            "metrics_enabled = false\nmetrics_port = 0\nproxy_port = 0\npg_proxy_port = 0\n\
+             master_source = \"file\"\nupstream_roots = {:?}\n[ca]\nkeystore = \"file\"\n",
+            roots.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let ca = briefcred_core::CertificateAuthority::generate("test-machine").unwrap();
+    let store = briefcred_core::keystore::FileKeyStore::new(daemon.home().join("ca"));
+    let paths =
+        briefcred_core::paths::Paths::resolve(briefcred_core::paths::Platform::MacOs, &|key| {
+            (key == briefcred_core::paths::HOME_ENV)
+                .then(|| std::ffi::OsString::from(daemon.home()))
+        })
+        .unwrap();
+    ca.save(&paths, &store).unwrap();
+    let briefcred_ca = ca.cert_pem().to_string();
+
+    daemon.write_profile("openai", &two_credential_profile());
+    daemon.write_master("openai", REAL_KEY);
+    daemon.write_master("stripe", STRIPE_KEY);
+
+    let mut daemon = daemon;
+    daemon.start().await.unwrap_or_else(|e| panic!("{e}"));
+
+    let Response::Status { proxy_addr, .. } = daemon.request(Request::Status).await.unwrap() else {
+        panic!("expected a status");
+    };
+    let proxy_addr = proxy_addr.expect("the proxy is enabled");
+
+    let Response::SessionOpened { session_id, .. } = daemon
+        .request(Request::OpenSession {
+            profile: "openai".to_string(),
+            client_headless: true,
+            session_pubkey: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the session did not open:\n{}", daemon.log());
+    };
+
+    // Only `openai`. `stripe` is declared, its master is in the session, and
+    // this run was not given it.
+    let Response::Minted { mints, .. } = daemon
+        .request(Request::Exec {
+            session_id,
+            credentials: Some(vec!["openai".to_string()]),
+            argv0: "curl".to_string(),
+            args: Vec::new(),
+            pid: std::process::id(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("nothing was minted:\n{}", daemon.log());
+    };
+    assert_eq!(mints.len(), 1, "only `openai` was asked for");
+    let token = mints[0].fields["TOKEN"].expose().to_string();
+
+    let client = ProxyClient {
+        proxy_addr,
+        briefcred_ca,
+        upstream_port: upstream.port,
+        ws_port: upstream.ws_port,
+        grpc_port: upstream.grpc.port,
+    };
+    let mut headers = bearer(&token);
+    headers.push(("x-custom", "Bearer __stripe__".to_string()));
+    let (status, _, _) = client.get("/v1/models", &headers).await.unwrap();
+    assert_eq!(status, 200, "the request itself is permitted");
+
+    let seen = upstream.seen.lock().unwrap().clone();
+    let last = seen.last().expect("the upstream saw the request");
+    assert_eq!(
+        last.custom.as_deref(),
+        Some("Bearer __stripe__"),
+        "a placeholder for a credential this grant never covered must be \
+         forwarded literally, not filled in"
+    );
+    assert_eq!(
+        last.authorization.as_deref(),
+        Some(format!("Bearer {REAL_KEY}").as_str()),
+        "the credential this exec did mint is still swapped in"
+    );
 }
 
 fn bearer(token: &str) -> Vec<(&'static str, String)> {

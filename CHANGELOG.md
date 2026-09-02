@@ -8,6 +8,12 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Fixed
 
+- **Placeholder substitution is bounded by what the run minted.** The proxy
+  filled in a `__name__` placeholder for every HTTP credential the profile
+  declared, so a `briefcred exec --cred openai` could still have a second
+  credential's key swapped into a header. It now substitutes only credentials
+  this exec actually minted.
+
 - **`proxy: always` works on a profile with no credentials.** The proxy refuses
   a request with no token, so a profile whose only value was its Cedar policy
   pointed its subprocess at a proxy that answered `407` to everything. `exec`

@@ -1015,7 +1015,8 @@ env:
 
 For a tool that already speaks the `__name__` convention, any header value
 containing `__<credential name>__` gets the real value substituted, for every
-credential the session holds:
+credential **this run minted** — a `--cred openai` run substitutes `__openai__`
+and forwards a `__stripe__` untouched, even on a profile that declares both:
 
 ```yaml
 env:
