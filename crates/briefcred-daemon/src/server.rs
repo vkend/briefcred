@@ -58,6 +58,7 @@ pub struct State {
     metrics: Arc<Metrics>,
     audit: AuditHandle,
     metrics_addr: Option<String>,
+    proxy_addr: Option<String>,
     shutdown: tokio::sync::watch::Sender<bool>,
     shutdown_reason: Mutex<&'static str>,
     profiles: Arc<ProfileStore>,
@@ -85,6 +86,8 @@ pub struct StateParts {
     pub metrics: Arc<Metrics>,
     /// Where the Prometheus endpoint is listening, if it is.
     pub metrics_addr: Option<String>,
+    /// Where the HTTP proxy is listening, if it is.
+    pub proxy_addr: Option<String>,
     /// The shutdown signal's sending half.
     pub shutdown: tokio::sync::watch::Sender<bool>,
     /// The loaded profiles.
@@ -119,6 +122,7 @@ impl State {
             metrics: parts.metrics,
             audit: parts.audit,
             metrics_addr: parts.metrics_addr,
+            proxy_addr: parts.proxy_addr,
             shutdown: parts.shutdown,
             shutdown_reason: Mutex::new("unknown"),
             profiles: parts.profiles,
@@ -316,6 +320,7 @@ async fn handle_status(_request: Request, state: Arc<State>) -> Response {
         started_at: state.started_at(),
         audit_path: state.audit_path().await,
         metrics_addr: state.metrics_addr.clone(),
+        proxy_addr: state.proxy_addr.clone(),
     }
 }
 
@@ -1046,6 +1051,7 @@ mod tests {
             audit,
             metrics,
             metrics_addr: None,
+            proxy_addr: None,
             shutdown,
             profiles,
             sessions: Arc::new(SessionStore::new(clock.clone(), Duration::from_secs(1800))),

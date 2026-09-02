@@ -42,8 +42,17 @@ pub async fn sweep(
     masters: &dyn briefcred_core::MasterSource,
     audit: &AuditHandle,
 ) {
+    let registry = briefcred_core::Registry::discover();
     for profile in profiles.list().await {
         for spec in &profile.credentials {
+            // The proxy's own kinds create nothing at a backend, so there is
+            // nothing to strand and nothing to sweep. Skipped silently rather
+            // than attempted and reported: a helper that does not exist is not
+            // a reconciler failure, and logging one every interval would train
+            // an operator to ignore the line.
+            if registry.is_proxy(&spec.kind) {
+                continue;
+            }
             let master = match masters.fetch(spec.source_key()).await {
                 Ok(master) => master,
                 // A profile whose master has not been set up yet is a normal

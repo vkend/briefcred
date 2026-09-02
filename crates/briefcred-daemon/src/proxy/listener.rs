@@ -183,9 +183,15 @@ async fn serve_connection(stream: TcpStream, proxy: Arc<Proxy>) {
 
 /// Answer a `CONNECT`, then take the tunnel over as a TLS server.
 fn begin_tunnel(request: Request<Incoming>, proxy: Arc<Proxy>) -> Response<OutBody> {
-    let Some(host) = authority_host(request.uri().authority().map(|a| a.as_str())) else {
+    let authority = request.uri().authority().map(|a| a.as_str().to_string());
+    let Some(host) = authority_host(authority.as_deref()) else {
         return status(StatusCode::BAD_REQUEST);
     };
+    // The port comes from the `CONNECT` line and nowhere else. Inside the
+    // tunnel the request line is origin-form, so a request that could name its
+    // own port would be one that could get a certificate for a host on 443 and
+    // a connection to something else entirely.
+    let port = authority_port(authority.as_deref()).unwrap_or(443);
 
     // The 200 has to be written before the TLS handshake can start, so the
     // work happens in a task that waits for the upgrade rather than here.
@@ -197,7 +203,7 @@ fn begin_tunnel(request: Request<Incoming>, proxy: Arc<Proxy>) -> Response<OutBo
                 return;
             }
         };
-        if let Err(err) = serve_tunnel(TokioIo::new(upgraded), host.clone(), proxy).await {
+        if let Err(err) = serve_tunnel(TokioIo::new(upgraded), host.clone(), port, proxy).await {
             eprintln!("briefcred-daemon: proxy tunnel to `{host}`: {err}");
         }
     });
@@ -206,7 +212,7 @@ fn begin_tunnel(request: Request<Incoming>, proxy: Arc<Proxy>) -> Response<OutBo
 }
 
 /// Terminate the client's TLS and serve HTTP/1.1 inside it.
-async fn serve_tunnel<I>(io: I, host: String, proxy: Arc<Proxy>) -> Result<()>
+async fn serve_tunnel<I>(io: I, host: String, port: u16, proxy: Arc<Proxy>) -> Result<()>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -221,7 +227,9 @@ where
         let proxy = Arc::clone(&proxy);
         let host = host.clone();
         async move {
-            Ok::<_, std::convert::Infallible>(forward(request, proxy, "https", Some(host)).await)
+            Ok::<_, std::convert::Infallible>(
+                forward(request, proxy, "https", Some((host, port))).await,
+            )
         }
     });
     let _ = hyper::server::conn::http1::Builder::new()
@@ -232,27 +240,37 @@ where
 
 /// The whole of one proxied request: authorize, decide, swap, forward, audit.
 ///
-/// `tunnel_host` is the host the `CONNECT` named, when there was one. Inside a
-/// tunnel the request line carries only a path, so the authority has to come
-/// from the tunnel rather than from a `Host` header the client controls: a
-/// request that could name its own host would be one that could get a
-/// certificate for one vendor and a credential for another.
+/// `tunnel` is the host and port the `CONNECT` named, when there was one.
+/// Inside a tunnel the request line carries only a path, so the destination has
+/// to come from the tunnel rather than from a `Host` header the client
+/// controls: a request that could name its own host would be one that could get
+/// a certificate for one vendor and a connection to somewhere else entirely.
 async fn forward(
     request: Request<Incoming>,
     proxy: Arc<Proxy>,
     scheme: &str,
-    tunnel_host: Option<String>,
+    tunnel: Option<(String, u16)>,
 ) -> Response<OutBody> {
     let started = std::time::Instant::now();
     let method = request.method().to_string();
 
-    let Some(host) =
-        tunnel_host.or_else(|| {
-            request.uri().host().map(str::to_string).or_else(|| {
-                authority_host(request.headers().get(hyper::header::HOST)?.to_str().ok())
-            })
-        })
-    else {
+    let Some((host, port)) = tunnel.or_else(|| {
+        let host_header = request
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|value| value.to_str().ok());
+        let host = request
+            .uri()
+            .host()
+            .map(str::to_string)
+            .or_else(|| authority_host(host_header))?;
+        let port = request
+            .uri()
+            .port_u16()
+            .or_else(|| authority_port(host_header))
+            .unwrap_or(default_port(scheme));
+        Some((host, port))
+    }) else {
         return refuse(
             &proxy,
             StatusCode::BAD_REQUEST,
@@ -263,7 +281,6 @@ async fn forward(
             "",
         );
     };
-    let port = request.uri().port_u16().unwrap_or(default_port(scheme));
     // The query string is dropped here and never picked up again: it routinely
     // carries an API key, so neither the policy nor the audit row may see one.
     let path = request.uri().path().to_string();
@@ -745,6 +762,16 @@ fn authority_host(authority: Option<&str>) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// The port an `authority` names, if it names one.
+fn authority_port(authority: Option<&str>) -> Option<u16> {
+    let authority = authority?.trim();
+    let after_host = match authority.find(']') {
+        Some(end) => &authority[end + 1..],
+        None => authority,
+    };
+    after_host.rsplit_once(':')?.1.parse().ok()
+}
+
 /// The default port for a scheme.
 fn default_port(scheme: &str) -> u16 {
     if scheme == "https" {
@@ -810,6 +837,15 @@ mod tests {
         assert_eq!(authority_host(Some("")), None);
         assert_eq!(authority_host(Some("   ")), None);
         assert_eq!(authority_host(Some(":443")), None);
+    }
+
+    #[test]
+    fn an_authority_gives_up_its_port_when_it_has_one() {
+        assert_eq!(authority_port(Some("api.openai.com:8443")), Some(8443));
+        assert_eq!(authority_port(Some("api.openai.com")), None);
+        assert_eq!(authority_port(Some("[::1]:8443")), Some(8443));
+        assert_eq!(authority_port(Some("[::1]")), None);
+        assert_eq!(authority_port(Some("api.openai.com:https")), None);
     }
 
     #[test]

@@ -618,6 +618,7 @@ fn print_status(status: &Response, sock: &Path) {
         started_at,
         audit_path,
         metrics_addr,
+        proxy_addr,
     } = status
     else {
         return;
@@ -638,6 +639,10 @@ fn print_status(status: &Response, sock: &Path) {
     match metrics_addr {
         Some(addr) => println!("  metrics    http://{addr}/metrics"),
         None => println!("  metrics    disabled"),
+    }
+    match proxy_addr {
+        Some(addr) => println!("  proxy      http://{addr}"),
+        None => println!("  proxy      disabled"),
     }
 }
 

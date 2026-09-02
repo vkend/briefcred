@@ -863,10 +863,15 @@ dependencies = [
 name = "briefcred-e2e"
 version = "0.1.0"
 dependencies = [
+ "briefcred-cli",
  "briefcred-core",
  "briefcred-proto",
+ "futures-util",
  "getrandom 0.3.4",
  "hex",
+ "http-body-util",
+ "hyper 1.11.1",
+ "hyper-util",
  "rmcp",
  "rustls 0.23.43",
  "rustls-pemfile",

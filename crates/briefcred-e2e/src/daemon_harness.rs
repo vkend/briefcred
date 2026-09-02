@@ -88,6 +88,12 @@ impl Daemon {
         }
     }
 
+    /// The temporary home this daemon owns, for a test that has to write into
+    /// it directly — a CA, say, which no request can install.
+    pub fn home(&self) -> &Path {
+        self.home.path()
+    }
+
     /// The daemon's socket inside that home.
     pub fn sock(&self) -> PathBuf {
         self.home.path().join("sock")

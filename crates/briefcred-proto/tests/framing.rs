@@ -19,6 +19,7 @@ fn sample_status() -> Response {
         started_at: OffsetDateTime::UNIX_EPOCH,
         audit_path: PathBuf::from("/tmp/t/audit"),
         metrics_addr: Some("127.0.0.1:9317".into()),
+        proxy_addr: Some("127.0.0.1:9318".into()),
     }
 }
 

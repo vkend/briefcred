@@ -114,6 +114,7 @@ pub async fn run() -> Result<()> {
     let issuer = bound_proxy
         .as_ref()
         .map(|(_, _, issuer, _)| Arc::clone(issuer));
+    let proxy_addr = bound_proxy.as_ref().map(|(_, addr, _, _)| addr.to_string());
 
     let paths = Arc::new(paths);
     let listener = server::bind(paths.sock())?;
@@ -122,6 +123,7 @@ pub async fn run() -> Result<()> {
         audit,
         metrics: Arc::clone(&metrics),
         metrics_addr,
+        proxy_addr,
         shutdown,
         profiles: Arc::clone(&profiles),
         sessions: Arc::clone(&sessions),
