@@ -318,9 +318,12 @@ the audit log.
   non-empty `detail` with the backend's SQLSTATE and message. An `outcome=failed`
   row with no detail is a bug, and there is a test for it in both directions.
 - **Session and unlock events are recorded.** `session_open` and
-  `session_close` carry the handle and profile, and `session_close` says which
-  of `request`, `idle`, or `shutdown` ended it, so every opened session can be
-  accounted for. `unlock_denied` records a refused prompt and its reason;
+  `session_close` carry the handle and profile, and `session_close` says what
+  ended it — `request`, `idle`, `shutdown`, `handoff`, `mcp_disconnect` or
+  `quota` — so every opened session can be accounted for. Every path that
+  writes a `session_open` writes a matching close, including the one where a
+  profile's quota refuses the first MCP call and the session opened a moment
+  earlier is closed again. `unlock_denied` records a refused prompt and its reason;
   `profile_load_error` records that the daemon carried on with stale profiles.
   None of these rows carries a master, a key's value, or a profile's contents.
 - **Arguments can be recorded verbatim, but only on request.** `[audit]

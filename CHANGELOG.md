@@ -8,6 +8,12 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Fixed
 
+- **An MCP quota refusal writes a `session_close` row.** The session opened for
+  the call was closed again with no matching close row, so the audit log read
+  as a session still holding masters. It is now recorded with the reason
+  `quota`, and the documented set of close reasons lists every one the daemon
+  writes.
+
 - **`briefcred_exec` has a wall-clock bound.** An MCP command that produced no
   output and never exited held a minted credential and a tool call open
   indefinitely. It is now killed at `mcp_exec_timeout_secs` (300 seconds by

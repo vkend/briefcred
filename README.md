@@ -653,8 +653,19 @@ buys is that an honest client on SSH gets an accurate refusal instead of a
 prompt nobody is standing in front of.
 
 A session is wiped when it is closed, when it has gone `session_idle_secs`
-without being used, and at shutdown. Every one of those writes a
-`session_close` audit row naming which of the three it was.
+without being used, at shutdown, when it is handed to a successor daemon, when
+the MCP connection holding it goes away, and when a profile's quota refuses the
+first call it was opened for. Every one of those writes a `session_close` audit
+row naming which it was:
+
+| `reason` | What happened |
+| --- | --- |
+| `request` | a client sent `CloseSession` |
+| `idle` | nothing touched it for `session_idle_secs` |
+| `shutdown` | the daemon stopped |
+| `handoff` | it moved to a successor daemon, with its mints |
+| `mcp_disconnect` | the MCP connection holding it went away |
+| `quota` | the quota refused the first call, so the session just opened was closed again |
 
 ## Filesystem layout
 

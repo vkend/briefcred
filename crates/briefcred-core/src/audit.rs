@@ -403,7 +403,16 @@ pub enum AuditEntry {
         session_id: String,
         /// The profile it belonged to.
         profile: String,
-        /// One of `request`, `idle`, or `shutdown`.
+        /// Why it ended. One of:
+        ///
+        /// | reason | what happened |
+        /// | --- | --- |
+        /// | `request` | a client sent `CloseSession` |
+        /// | `idle` | nothing touched it for `session_idle_secs` |
+        /// | `shutdown` | the daemon stopped |
+        /// | `handoff` | it was handed to a successor daemon, and its mints go with it |
+        /// | `mcp_disconnect` | the MCP connection holding it went away |
+        /// | `quota` | the profile's quota refused the first call, so the session it had just opened was closed again |
         reason: String,
     },
     /// An unlock was refused, so nothing was opened and no master was read.

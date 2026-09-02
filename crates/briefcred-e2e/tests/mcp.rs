@@ -394,6 +394,64 @@ async fn a_second_tool_call_over_the_quota_is_refused_and_counted() {
     daemon.shutdown().await;
 }
 
+/// A quota that refuses the very first call is the one case where the session
+/// is opened and closed inside one tool call. The `session_open` row is already
+/// written by then, so a missing close row would leave an audit log that reads
+/// as a session still holding masters.
+#[tokio::test]
+async fn a_first_call_refused_by_the_quota_closes_its_session_in_the_audit_log() {
+    let Some(cluster) = cluster_or_skip("a_first_call_refused_by_the_quota").await else {
+        return;
+    };
+
+    // `total: 0` is spent before anything happens, so the refusal lands on the
+    // first call — after the session is open and before anything is minted.
+    let mut daemon = Daemon::prepare(
+        "metrics_enabled = false
+master_source = \"file\"\n",
+    );
+    daemon.write_profile(
+        "analytics",
+        &quota_db_profile(&cluster, "quota:\n  rate: 1.0\n  burst: 1\n  total: 0\n"),
+    );
+    daemon.write_master("pg-master", &cluster.master_password());
+    daemon.start().await.expect("start");
+    let client = mcp_client(&daemon).await;
+
+    let refused = client
+        .call_tool(
+            CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                serde_json::json!({ "profile": "analytics", "sql": "SELECT 1 AS one" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect_err("a spent session quota refuses the first call");
+    assert!(format!("{refused:?}").contains("quota"), "{refused:?}");
+
+    client.cancel().await.ok();
+    daemon.shutdown().await;
+
+    let rows = daemon.audit_rows();
+    let opened: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| row["event"] == "session_open")
+        .collect();
+    assert_eq!(opened.len(), 1, "one session was opened: {rows:#?}");
+    let session_id = opened[0]["session_id"].as_str().unwrap();
+
+    let closed = rows
+        .iter()
+        .find(|row| row["event"] == "session_close" && row["session_id"] == session_id);
+    let closed = closed.unwrap_or_else(|| panic!("no session_close row in {rows:#?}"));
+    assert_eq!(
+        closed["reason"], "quota",
+        "the row must say why the session ended: {closed}"
+    );
+}
+
 /// Scrape the daemon's Prometheus endpoint.
 async fn scrape(daemon: &Daemon) -> String {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

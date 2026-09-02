@@ -651,6 +651,15 @@ impl McpServer {
         // is about to be told no.
         if let Err(err) = self.charge_quota(profile, &session_id).await {
             if let Ok(session) = self.inner.state.sessions().close(&session_id).await {
+                // The `SessionOpen` row above is already written, so a close
+                // row has to follow it: an audit log with an open and no close
+                // reads as a session that is still holding masters.
+                self.inner.state.audit(&AuditEntry::SessionClose {
+                    ts: OffsetDateTime::now_utc(),
+                    session_id: session.id.clone(),
+                    profile: session.profile.clone(),
+                    reason: "quota".to_string(),
+                });
                 crate::server::retire(&self.inner.state, session, "quota").await;
             }
             return Err(err);
