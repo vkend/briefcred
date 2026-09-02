@@ -184,13 +184,20 @@ the socket file, and writes a `daemon_stop` row.
 | `metrics_enabled` | `true` | Whether to serve `/metrics` at all |
 | `proxy_port` | `9318` | Loopback port for the HTTP proxy; `0` asks for a free one |
 | `proxy_enabled` | `true` | Whether to run the HTTP proxy at all |
+| `pg_proxy_port` | `9319` | Loopback port for the Postgres proxy; `0` asks for a free one |
+| `pg_proxy_enabled` | `true` | Whether to run the Postgres proxy at all |
+| `pgproxy.tls` | `false` | Answer a client's `SSLRequest` with a leaf from briefcred's CA |
+| `pgproxy.allow_md5` | `false` | Permit MD5 when an upstream database asks for it |
 | `upstream_roots` | none | **For tests.** A PEM bundle of extra CAs the proxy trusts upstream |
 | `session_idle_secs` | `1800` | Seconds a session may go untouched before it is wiped |
 | `master_source` | platform default | `"keychain"`, `"file"`, or `"env"` |
 | `ca.keystore` | platform default | `"keychain"` or `"file"`; where the CA key lives |
 
 An unknown key is an error rather than a silent no-op, so a typo cannot switch
-a control off.
+a control off. `pg_proxy_enabled` needs `proxy_enabled`: both proxies verify
+synthetic tokens with the same signing key, and a daemon configured with one
+and not the other refuses to start rather than failing every `postgres-proxy`
+mint at the point of use.
 
 ### Audit log
 
@@ -214,6 +221,8 @@ currently being written, and ignores any filename it did not write.
 | `briefcred_revoke_failures_total{kind}` | counter | Revoke attempts that failed, by minter kind |
 | `briefcred_proxy_requests_total{decision,status_class}` | counter | Proxied requests, by decision and status class |
 | `briefcred_proxy_latency_seconds{kind}` | histogram | Time for one proxied request, by policy decision |
+| `briefcred_pgproxy_connections_total{outcome}` | counter | Postgres connections, by outcome |
+| `briefcred_pgproxy_bytes_total{direction}` | counter | Bytes relayed by the Postgres proxy, by direction |
 
 The two histograms time failures as well as successes: a backend that takes
 thirty seconds to refuse is exactly what they exist to show. A rising
@@ -514,6 +523,7 @@ it, so they never touch real user directories.
 | `http-bearer` | A synthetic token; the real key stays in the daemon | The API key | The daemon's HTTP proxy |
 | `http-header` | The same, sent under a header the profile names | The header's value | The daemon's HTTP proxy |
 | `http-basic` | The same, sent as HTTP basic auth | `user:password` | The daemon's HTTP proxy |
+| `postgres-proxy` | A synthetic token; the master stays in the daemon | The upstream role's password | The daemon's Postgres proxy |
 
 The third column is not decoration. A minter that opens a network connection
 with a master credential gets a process of its own, so a bug in its parser
@@ -535,6 +545,92 @@ tests: `DROP OWNED BY` on its own is not a revoke when the master does not own
 schema `public`, which is the managed-PostgreSQL default. A revoke that cannot
 complete reports `RevokeOutcome::Failed` with the backend's SQLSTATE and
 message; a role that was already gone reports `AlreadyGone`.
+
+## The PostgreSQL connection proxy
+
+`postgres-dynamic` needs `CREATEROLE` on the master. Plenty of real databases
+do not offer it — a managed cluster on a locked-down plan, a database owned by
+another team — and there the master password is the only thing that will ever
+authenticate. `postgres-proxy` is for those: instead of minting a credential, the
+daemon **becomes** the database as far as the subprocess is concerned.
+
+```yaml
+credentials:
+  - name: warehouse
+    kind: postgres-proxy
+    ttl_secs: 3600
+    config:
+      host: db.internal
+      port: 5432
+      dbname: analytics
+      user: reporting
+env:
+  DATABASE_URL: ${minted.warehouse.DATABASE_URL}
+```
+
+The master filed under the credential's `source_key` is the **password of the
+`user` named in `config`**, and nothing else — not `user:password`, because the
+role is already in the config and having it in two places is a way for them to
+disagree.
+
+The mint publishes six fields, all of them pointing at loopback and none of them
+carrying the master:
+
+| Field | Value |
+| --- | --- |
+| `DATABASE_URL` | `postgresql://<session>:<token>@127.0.0.1:9319/<dbname>` |
+| `PGHOST` | `127.0.0.1` |
+| `PGPORT` | the `pg_proxy_port` |
+| `PGDATABASE` | the configured `dbname` |
+| `PGUSER` | the session id |
+| `PGPASSWORD` | the synthetic token |
+
+So this works, and `psql` never sees a password:
+
+```sh
+briefcred exec --profile=warehouse -- psql -c 'SELECT current_user'
+ current_user
+--------------
+ reporting
+```
+
+### What the daemon does with the connection
+
+It asks the client for a cleartext password, which is the synthetic token; it
+checks the signature, the expiry, and the revocation; it checks that the startup
+packet's `user` is the session the token names and that its `database` is the
+one the credential configures. Only then does it open its own connection to the
+real server, authenticate with the master over **SCRAM-SHA-256**, and relay the
+server's own greeting back. After that it copies bytes in both directions
+without parsing them.
+
+The cleartext password is deliberate and is safe for one reason: the listener is
+bound to `127.0.0.1` and nothing else, so it is the same channel the token
+already arrived over in the subprocess's environment. Set `pgproxy.tls = true`
+for a client that will not connect without TLS; it gets a leaf from briefcred's
+own CA, which `briefcred ca trust` has already installed.
+
+MD5 is refused upstream unless `pgproxy.allow_md5 = true`, which logs a
+deprecation warning once. `SCRAM-SHA-256-PLUS` is never downgraded to its
+unbound variant. A master password outside printable ASCII is refused rather
+than hashed without SASLprep and reported as a wrong password.
+
+### What it records, and what it cannot
+
+One `PgConnection` audit row per connection, written when the connection closes:
+the mint id, the upstream role, when it started and ended, and the bytes each
+way. There is no query in it, and there is no field a query could go in — after
+authentication the proxy does not parse the protocol at all.
+
+### The limit, stated plainly
+
+A `postgres-proxy` credential is **not** bounded by the profile's Cedar policy.
+The policy vocabulary is HTTP's, and a connection has no method, host, or path;
+the only thing that could be checked per statement is the statement, which this
+proxy deliberately never sees. What bounds it is the upstream role's own
+privileges, the credential's `ttl_secs`, and the session it is tied to. Where
+`postgres-dynamic` is possible it is still the better answer, because a minted
+role can be granted less than the master has.
 
 ## The AWS STS minter
 

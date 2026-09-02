@@ -44,9 +44,18 @@ Model C is a stepping stone, never a destination. Where a phase ships Model C,
 
 Phase 3 hands a minted Postgres role to the subprocess through environment
 variables, which is Model C for that credential: the process can read
-`PGPASSWORD`. Phase 10 moves the same credential to Model A by having the proxy
-complete the PostgreSQL authentication handshake itself. That is why Phase 10
+`PGPASSWORD`. Phase 10 moves PostgreSQL to Model A with the `postgres-proxy`
+kind, where the daemon completes the authentication handshake itself and the
+subprocess holds a synthetic token instead of any password. That is why Phase 10
 is sequenced immediately after the thin proxy rather than at the end.
+
+The two Postgres kinds are alternatives rather than a replacement.
+`postgres-dynamic` (Model B) is still the better answer where the master has
+`CREATEROLE`: the credential the subprocess holds is real, short-lived, and
+revocable at the backend independently of briefcred. `postgres-proxy` (Model A)
+is for the databases where that is impossible — a managed cluster with no
+`CREATEROLE`, a database owned by another team — and it buys a stronger
+handoff at the cost of every connection depending on a live daemon.
 
 Phase 4 is what makes Model A real for HTTP. The `http-*` kinds hand the
 subprocess a **synthetic token** and keep the API key in the daemon, so the
@@ -100,6 +109,10 @@ two things every crate has to agree on.
 | `ca` | The root CA, leaf issuance, and the runtime trust environment. |
 | `exec` | The two pure decisions behind `briefcred exec`: is the command allowed, and what environment does it get. |
 | `policy` | The fixed Cedar schema, the compiled form of a profile's `policy`, and the enforce/observe split. |
+
+`minters::http` and `minters::postgres_proxy` are the two modules that register
+a schema and no minter at all: both are `Hosting::Proxy`, meaning the "mint" is
+a signed token and the real work happens in one of the daemon's two proxies.
 
 ## Data flow: one `briefcred exec`
 
@@ -413,6 +426,114 @@ proxies through touches neither.
 The proxy **loads** a CA; it never generates one. `briefcred install` does that.
 A generated one would be a certificate nothing on the machine trusts, so the
 honest failure is to say the CA is missing and name the command that makes it.
+
+## The Postgres proxy
+
+The `postgres-proxy` kind exists for the same reason the `http-*` kinds do —
+there is no backend to mint at, and the master is the only thing that will
+authenticate — but a database connection is not a request, so the mechanism is
+different. There is no header to swap. The credential is exchanged once, at the
+start of a session that then runs for minutes, by a protocol with two parties in
+it. So the daemon does not rewrite anything: it performs **both**
+authentications itself and then splices the two sockets together.
+
+`briefcred-daemon::pgproxy` is where every part of it lives.
+
+| Module | Question it answers |
+| --- | --- |
+| `startup` | What did this client open with, and what may be passed on? |
+| `wire` | How is a message framed, and what does briefcred write itself? |
+| `scram` | How does the daemon prove the master to the real server? |
+| `forward` | Opening the upstream connection, and relaying bytes. |
+| `audit` | The one row a connection leaves behind. |
+| `listener` | The loop that puts all of it in order. |
+
+### One connection, in order
+
+```
+  subprocess         pgproxy                       database
+      |                 |                             |
+      |  SSLRequest     |                             |
+      |---------------->|                             |
+      |  N              |                             |
+      |<----------------|                             |
+      |  StartupMessage user=<sid> database=analytics |
+      |---------------->|                             |
+      |  AuthenticationCleartextPassword              |
+      |<----------------|                             |
+      |  bc.<token>     |                             |
+      |---------------->|                             |
+      |                 | 1. verify signature, expiry |
+      |                 | 2. revoked?                 |
+      |                 | 3. user == sid?             |
+      |                 | 4. database == config?      |
+      |                 |  StartupMessage user=master |
+      |                 |---------------------------->|
+      |                 |  SCRAM-SHA-256, both ways   |
+      |                 |<===========================>|
+      |                 |  AuthenticationOk           |
+      |                 |<----------------------------|
+      |  AuthenticationOk                             |
+      |<----------------|                             |
+      |  the upstream's own ParameterStatus,          |
+      |  BackendKeyData and ReadyForQuery, verbatim   |
+      |<----------------|<----------------------------|
+      |  bytes, both directions, counted not parsed   |
+      |<===============>|<===========================>|
+      |                 | 5. PgConnection audit row   |
+```
+
+The order is the design, and the fifth arrow is the part that matters: the
+upstream authentication completes **before** the client is told anything. A
+client is therefore never sent `AuthenticationOk` for a connection that does not
+exist, and a wrong token never causes a connection to the database at all.
+
+### Why the client sends a cleartext password
+
+Because what it sends is not a password. It is a signed token that names one
+session and expires with it, and the point of MD5 and SCRAM is to keep a
+*reusable* secret off the wire. SCRAM would also be impossible to arrange here:
+the proxy would need the token's salted verifier before the client connected,
+and the token is minted per `exec`.
+
+What makes it acceptable is the address. The listener is bound to `127.0.0.1`
+and nothing else, so the wire is a loopback socket on the user's own machine —
+the same channel the token already arrived over, in the subprocess's
+environment. `pgproxy.tls = true` puts TLS underneath it, with a leaf from
+briefcred's own CA, for a client that will not connect without one.
+
+### What never happens
+
+- **The master never crosses the wire.** SCRAM proves it without sending it, and
+  the one method that would send it — `AuthenticationCleartextPassword` from the
+  *upstream* — is refused outright. MD5 is refused too unless
+  `pgproxy.allow_md5` is set, and `SCRAM-SHA-256-PLUS` is never downgraded to
+  its unbound variant.
+- **The server's signature is always checked.** A server that cannot produce it
+  does not hold the master, and the connection is abandoned rather than relayed.
+- **The client's startup parameters are not passed through.** Only
+  `application_name` and `client_encoding`. `options` in particular can set
+  arbitrary session configuration, and the upstream connection is authenticated
+  with a master the client does not hold.
+- **No statement is ever seen.** After `ReadyForQuery` the proxy copies bytes
+  through a fixed 16 KiB buffer without parsing them, so the audit row's silence
+  about queries is structural rather than a policy that could be changed.
+
+### What it does not do
+
+The profile's Cedar policy is not applied. The policy vocabulary is HTTP's —
+method, host, path — and a connection has none of those. What bounds a
+`postgres-proxy` credential is the upstream role's own privileges, the
+credential's `ttl_secs`, and the session it is bound to. `THREAT_MODEL.md` says
+so plainly rather than leaving it to be discovered.
+
+### One issuer, two proxies
+
+Both proxies verify tokens with the *same* `ProxyIssuer`: one signing key per
+daemon, one revocation set, one place that decides a token is no longer good.
+Two issuers would mean a revoke that retired a grant in one and not the other.
+A `daemon.toml` that sets `pg_proxy_enabled` without `proxy_enabled` is
+therefore refused at startup rather than started half-working.
 
 ## The MCP upgrade
 

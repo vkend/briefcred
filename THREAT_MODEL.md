@@ -415,8 +415,9 @@ reconstruct what it sent.
   immediate. The outcome type says so rather than pretending otherwise.
 - A subprocess can copy the credential it was given anywhere before it exits.
   Revoking afterwards ends the credential's usefulness; it does not undo what
-  was done with it while it was live. This is the whole of what Model C means,
-  and it is why Phase 10 exists.
+  was done with it while it was live. This is the whole of what Model C means.
+  For PostgreSQL, `postgres-proxy` closes it: see **Phase 10** below. It remains
+  true of every `postgres-dynamic` credential, which is Model B by design.
 - A synthetic token used without a `DPoP` proof is a bearer credential for the
   session that holds it. Every runtime `briefcred exec` wraps is on that path,
   because an environment variable is the only channel it has. See **Phase 4**
@@ -425,6 +426,109 @@ reconstruct what it sent.
   for longer leaves a principal behind until the reconciler's next sweep, which
   is bounded by the profile's `ttl_secs` in how long that principal is useful.
 
+
+## Phase 10: the Postgres proxy, and Model A for PostgreSQL
+
+`postgres-dynamic` is Model B: the subprocess holds a real, short-lived role
+password and can read it out of `PGPASSWORD`. `postgres-proxy` is Model A for
+the same database — the subprocess holds a synthetic token, the master stays in
+the daemon, and the daemon performs the authentication itself.
+
+This is the second Model A path briefcred ships, and the token is the same
+signed statement the HTTP proxy issues, verified by the same key. Everything
+under **Phase 4** about what a token is bounded by, and about it being a bearer
+credential without a `DPoP` proof, applies here unchanged — with one addition
+and one subtraction.
+
+### The addition: the connection is checked, not just the token
+
+A token that verifies is not enough. The startup packet's `user` must be the
+session the token names, and its `database` must be the one the credential's
+`config` declares. So a token for `analytics` cannot open `payroll` on the same
+server, even though the master could. libpq's rule that an absent `database`
+means the user's name is deliberately not applied: a session identifier is not a
+database name, and resolving it as one would be a surprise in the direction of
+more access.
+
+The check happens **before** any upstream connection is opened, which is
+asserted end to end by a counting splice in front of the test cluster: a refused
+client causes zero connections to the database.
+
+### The subtraction: there is no Cedar policy here
+
+This is the important one. A `postgres-proxy` credential is **not** bounded by
+the profile's `policy`. The Cedar schema's vocabulary is HTTP's — method, host,
+path — and a connection has none of those. The only thing that could be
+authorised per operation is the statement, and the proxy deliberately never
+parses one.
+
+So what bounds a `postgres-proxy` credential is:
+
+- **the upstream role's own privileges.** Whatever `config.user` may do, the
+  subprocess may do, for the life of the session. This is the whole of the
+  authorisation story, and it means the role named in a `postgres-proxy` config
+  should be the least-privileged role that can do the job — not the superuser,
+  where there is any alternative.
+- **the credential's `ttl_secs`,** after which the token stops verifying.
+- **the session,** which a `briefcred exec` finishing or a session close ends.
+- **the daemon being alive.** Unlike a minted role, this credential is worthless
+  the moment the daemon stops. That is a availability cost and a security
+  benefit at the same time.
+
+Where `postgres-dynamic` is possible, it remains the better answer: a minted
+role can be granted strictly less than the master holds, and it is revocable at
+the backend independently of briefcred. `postgres-proxy` is for the databases
+where minting is not on offer.
+
+### Cleartext over loopback, and why that is the right trade
+
+The proxy asks the client for `AuthenticationCleartextPassword`. Two things make
+that acceptable, and both have to be true:
+
+1. **What crosses is not a password.** It is a token briefcred signed, scoped to
+   one session and one credential, that expires and can be revoked. The reason
+   MD5 and SCRAM exist is to keep a *reusable* secret off the wire.
+2. **The wire is loopback.** The listener binds `127.0.0.1` and refuses to bind
+   anything else. Anything positioned to read that socket can already read the
+   subprocess's environment, where the same token sits in `PGPASSWORD`. So the
+   cleartext exchange widens nothing.
+
+SCRAM towards the client would also be unimplementable: it needs the token's
+salted verifier before the client connects, and the token is minted per `exec`.
+`pgproxy.tls = true` puts TLS underneath for a client that will not connect
+without it, using a leaf from briefcred's CA.
+
+### What the daemon is trusted with upstream
+
+The master never crosses the wire. SCRAM-SHA-256 proves it without sending it,
+the server's own signature is verified before anything it says is believed, and
+three downgrades are refused outright:
+
+- **Cleartext upstream** is never answered. A server asking for it gets a
+  refusal, not the master.
+- **MD5** needs `pgproxy.allow_md5 = true` and logs a deprecation warning once.
+  It is a hash of the master with a server-chosen salt, which is weak but not
+  the master itself.
+- **`SCRAM-SHA-256-PLUS`** is never satisfied with the unbound variant. A server
+  that offers only the channel-bound mechanism is refused, because falling back
+  is exactly what channel binding exists to prevent.
+
+briefcred does not implement SASLprep. A master password containing anything
+outside printable ASCII is refused with a message saying so, rather than hashed
+without normalisation and reported as a wrong password.
+
+### What the audit row does and does not hold
+
+`pg_connection` records the mint id, the upstream role's **name**, the start and
+end times, and the bytes each way. It holds no statement, no result, and no
+connection string — and there is no field one could be put in, because after
+`ReadyForQuery` the proxy copies bytes through a fixed buffer without parsing
+them. The silence about queries is structural rather than a policy.
+
+A connection refused at authentication leaves no row at all: the row names a
+`mint_id`, and a client whose token did not verify has not named a grant
+briefcred made. Those refusals are counted on
+`briefcred_pgproxy_connections_total{outcome="deny"}` and logged.
 
 ## The three additions in Phase 7, and what each one costs
 

@@ -1,0 +1,92 @@
+# A managed PostgreSQL whose master password never reaches the agent.
+#
+# This is the profile the Postgres proxy exists for. The subprocess gets a
+# `DATABASE_URL` pointing at `127.0.0.1`, with the session id as the user and a
+# synthetic token as the password. It connects, runs queries, and gets results —
+# and at no point has it held anything that would authenticate against the real
+# server.
+#
+# ## When to use this instead of `postgres-dynamic`
+#
+# `postgres-dynamic` is better where it works. It mints a real role with only
+# the grants the profile names, so the credential the subprocess holds is both
+# short-lived *and* less privileged than the master; and it can be revoked at
+# the backend whether or not briefcred is running.
+#
+# It needs `CREATEROLE` on the master. Use `postgres-proxy` where that is not on
+# offer:
+#
+#   - a managed cluster on a plan that does not grant it,
+#   - a database owned by another team,
+#   - a cluster where role churn would set off somebody's alerting.
+#
+# ## What bounds this credential
+#
+# Read `THREAT_MODEL.md`, "Phase 10", before deploying this. The short version:
+# the profile's Cedar `policy` does **not** apply to a database connection —
+# there is no method, host or path to match on, and the proxy deliberately never
+# parses a statement. What bounds the credential is the privileges of the role
+# named in `config.user`, the `ttl_secs`, and the session.
+#
+# So the role below should be the least-privileged role that can do the job.
+# `reporting` here is meant to be a read-only role on the analytics database,
+# not the cluster superuser.
+
+name: warehouse
+
+# The database is read-only for this role, so a passcode is enough; a profile
+# pointing at something writable should ask for `biometric`.
+unlock:
+  policy: passcode
+  cache_secs: 900
+
+credentials:
+  - name: analytics
+    kind: postgres-proxy
+
+    # An hour. The token stops verifying at the end of it, and an agent working
+    # through a long analysis should not have to be re-unlocked mid-task. A
+    # connection already open when the token expires is not torn down — the
+    # token authenticates the *opening* of a connection.
+    ttl_secs: 3600
+
+    config:
+      host: warehouse.internal
+      port: 5432
+      dbname: analytics
+
+      # The real role the daemon authenticates as. The master filed under this
+      # credential's `source_key` — here, `analytics` — is this role's password
+      # and nothing else: the role is already named here, and putting it in the
+      # secret too would be a way for the two to disagree.
+      user: reporting
+
+exec:
+  # `psql` by basename, so `/opt/homebrew/opt/libpq/bin/psql` is permitted too.
+  # Name an absolute path instead to pin one specific binary.
+  allow_argv0:
+    - psql
+    - python3
+
+env:
+  # Anything that takes a connection string. Note that this is the *minted*
+  # field, not a value written here: the port is whatever `pg_proxy_port` the
+  # daemon actually bound, and the password is the synthetic token.
+  DATABASE_URL: ${minted.analytics.DATABASE_URL}
+
+  # And the libpq environment, for `psql` and everything else that reads it.
+  # `PGUSER` is the session id, not `reporting`: the proxy has to know which
+  # session is connecting before it has seen a password, and the startup
+  # packet's `user` is the only field that arrives that early.
+  PGHOST: ${minted.analytics.PGHOST}
+  PGPORT: ${minted.analytics.PGPORT}
+  PGDATABASE: ${minted.analytics.PGDATABASE}
+  PGUSER: ${minted.analytics.PGUSER}
+  PGPASSWORD: ${minted.analytics.PGPASSWORD}
+
+# Try it:
+#
+#   briefcred exec --profile=warehouse -- psql -c 'SELECT current_user'
+#
+# which prints `reporting`. The agent asked as a session id and a token, and
+# arrived as the role the profile authorised.

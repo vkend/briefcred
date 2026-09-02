@@ -8,6 +8,44 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **The Postgres connection-auth proxy** (`briefcred-daemon::pgproxy`), and with
+  it Phase 10 of the roadmap. A listener on `127.0.0.1:9319` speaks the
+  PostgreSQL v3 protocol to the wrapped subprocess, authenticates it with a
+  synthetic token, then opens its own connection to the real server and
+  authenticates *that* with the master over SCRAM-SHA-256. Only once the
+  upstream connection exists is the client told it is in; the server's own
+  `ParameterStatus`, `BackendKeyData` and `ReadyForQuery` are relayed verbatim,
+  and after that bytes are copied both ways through a fixed buffer and counted,
+  never parsed.
+- **The `postgres-proxy` credential kind**, `config: { host, port, dbname,
+  user }`. This is Model A for PostgreSQL: the subprocess holds no password at
+  all, and the master — the password of the `user` in the config — stays in the
+  daemon. The mint publishes six fields: `DATABASE_URL`
+  (`postgresql://<session>:<token>@127.0.0.1:9319/<dbname>`), `PGHOST`,
+  `PGPORT`, `PGDATABASE`, `PGUSER` (the session id) and `PGPASSWORD` (the
+  token). `postgres-dynamic` is unchanged and is still the better answer where
+  the master has `CREATEROLE`.
+- **An in-crate SCRAM-SHA-256 client** (`pgproxy::scram`), checked against the
+  RFC 7677 test vector. It verifies the server's signature before believing
+  anything the server says, refuses `SCRAM-SHA-256-PLUS` rather than downgrading
+  to the unbound mechanism, and refuses a master password outside printable
+  ASCII rather than hashing it without SASLprep. MD5 is refused unless
+  `pgproxy.allow_md5` is set; cleartext upstream is never answered at all.
+- **`PgConnection` audit rows**: timestamp, mint id, the upstream role's name,
+  start and end times, and the bytes each way. No statement, and no field one
+  could be recorded in.
+- **Two metrics series**: `briefcred_pgproxy_connections_total{outcome}` and
+  `briefcred_pgproxy_bytes_total{direction}`.
+- **`daemon.toml` gains `pg_proxy_port` (default `9319`), `pg_proxy_enabled`,
+  and a `[pgproxy]` table with `tls` and `allow_md5`, both off by default.**
+  `pg_proxy_enabled` requires `proxy_enabled`, because both proxies verify
+  tokens with the same signing key; a configuration with one and not the other
+  is refused at startup rather than failing every mint later.
+- **`briefcred daemon status` reports the Postgres proxy's address**, next to
+  the HTTP proxy's.
+- **`examples/profiles/warehouse.yaml`**: a managed database whose master
+  password never reaches the agent.
+
 - **The HTTP proxy** (`briefcred-daemon::proxy`), and with it Phase 4 of the
   roadmap. A `CONNECT` listener on `127.0.0.1:9318` terminates the wrapped
   subprocess's TLS with a leaf from briefcred's own CA, applies the profile's

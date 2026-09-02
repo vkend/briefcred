@@ -148,3 +148,47 @@ fn the_openai_example_puts_a_synthetic_token_in_the_variable_the_sdk_reads() {
     assert!(!allowed("POST", "/v1/fine_tuning/jobs"));
     assert!(!allowed("DELETE", "/v1/models"));
 }
+
+#[test]
+fn the_warehouse_example_hands_the_agent_a_token_where_a_password_would_be() {
+    let yaml = std::fs::read_to_string(examples_dir().join("warehouse.yaml")).unwrap();
+    let profile = Profile::from_yaml_str(&yaml).unwrap();
+
+    assert_eq!(profile.name, "warehouse");
+    let credential = profile
+        .credential("analytics")
+        .expect("the example declares one credential named `analytics`");
+    assert_eq!(
+        credential.kind,
+        briefcred_core::minters::postgres_proxy::KIND,
+        "the point of the example is that the master never leaves the daemon"
+    );
+
+    // Every published field is wired up, and every one of them is a template
+    // rather than a literal: a hard-coded port or password in an example is an
+    // invitation to hard-code one in a real profile.
+    for field in briefcred_core::minters::postgres_proxy::FIELDS {
+        assert_eq!(
+            profile.env.get(field).map(String::as_str),
+            Some(format!("${{minted.analytics.{field}}}").as_str()),
+            "{field}"
+        );
+    }
+
+    // A `postgres-proxy` credential is not an HTTP one, so the subprocess must
+    // not be pointed at the HTTP proxy for it.
+    assert!(
+        !profile.wants_proxy(),
+        "a database profile has no business setting HTTPS_PROXY"
+    );
+
+    // The role the daemon authenticates as must not be the superuser: it is the
+    // only thing bounding what the agent can do, since no policy applies.
+    let config: briefcred_core::minters::postgres_proxy::PgProxyConfig =
+        serde_yaml::from_value(credential.config.clone()).unwrap();
+    assert_ne!(
+        config.user, "postgres",
+        "an example must not model a superuser"
+    );
+    assert!(!config.dbname.is_empty());
+}
