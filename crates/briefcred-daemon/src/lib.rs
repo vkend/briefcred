@@ -298,6 +298,7 @@ pub async fn run_with(startup: Startup) -> Result<()> {
         revokes: Arc::clone(&revokes),
         raw_args: config.audit.raw_args,
         mcp_query_timeout: config.mcp_query_timeout(),
+        mcp_exec_timeout: config.mcp_exec_timeout(),
         proxy: issuer.clone(),
         keystore,
         handing_over: Arc::clone(&handing_over),

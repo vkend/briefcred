@@ -111,10 +111,13 @@ async fn a_command_that_never_stops_writing_is_cut_and_killed() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30), run_capped(command))
-        .await
-        .expect("an unbounded writer must not hang the daemon")
-        .expect("the command runs");
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_capped(command, std::time::Duration::from_secs(30)),
+    )
+    .await
+    .expect("an unbounded writer must not hang the daemon")
+    .expect("the command runs");
 
     assert!(output.truncated, "the cap must be reported");
     assert!(
@@ -141,7 +144,9 @@ async fn a_command_that_stops_on_its_own_keeps_its_exit_code_and_both_streams() 
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let output = run_capped(command).await.unwrap();
+    let output = run_capped(command, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
     assert_eq!(output.stdout, "out");
     assert_eq!(output.stderr, "err");
     assert_eq!(output.exit_code, Some(3));
@@ -164,10 +169,13 @@ async fn a_child_writing_heavily_to_both_streams_does_not_deadlock() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30), run_capped(command))
-        .await
-        .expect("reading one stream at a time would hang here")
-        .unwrap();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_capped(command, std::time::Duration::from_secs(30)),
+    )
+    .await
+    .expect("reading one stream at a time would hang here")
+    .unwrap();
     assert_eq!(output.stdout.len(), 400 * 1024);
     assert_eq!(output.stderr.len(), 400 * 1024);
     assert_eq!(output.exit_code, Some(0));
@@ -255,4 +263,45 @@ async fn a_connection_that_only_makes_tool_calls_is_not_evicted_as_idle() {
         state.sessions().evict_idle().await.is_empty(),
         "a session used only through MCP tool calls is not idle"
     );
+}
+
+/// A command that never finishes holds a minted credential, an MCP connection
+/// and a tool call open with nobody waiting on any of them. The output cap does
+/// not help: a child that says nothing never reaches it.
+#[tokio::test]
+async fn a_command_that_never_finishes_is_killed_at_the_timeout() {
+    let mut command = tokio::process::Command::new("sleep");
+    command
+        .arg("60")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let started = std::time::Instant::now();
+    let Err(err) = run_capped(command, std::time::Duration::from_secs(1)).await else {
+        panic!("a command past its bound must not return output");
+    };
+
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the timeout must cut the run, not wait it out: {:?}",
+        started.elapsed()
+    );
+}
+
+/// The bound is a bound and not a delay: a command that finishes inside it
+/// returns its own output and its own exit code.
+#[tokio::test]
+async fn a_command_that_finishes_inside_the_timeout_is_untouched() {
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "printf quick"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = run_capped(command, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(output.stdout, "quick");
+    assert_eq!(output.exit_code, Some(0));
 }

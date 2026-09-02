@@ -522,9 +522,17 @@ impl McpServer {
             pid: std::process::id(),
         });
 
-        let output = run_capped(command)
-            .await
-            .map_err(|e| invalid(format!("cannot run `{argv0}`: {e}")))?;
+        let timeout = self.inner.state.mcp_exec_timeout();
+        let output = run_capped(command, timeout).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                invalid(format!(
+                    "`{argv0}` was still running after {}s and was killed                      (`mcp_exec_timeout_secs` in daemon.toml)",
+                    timeout.as_secs()
+                ))
+            } else {
+                invalid(format!("cannot run `{argv0}`: {e}"))
+            }
+        })?;
 
         let duration_ms = started.elapsed().as_millis() as u64;
         self.inner.state.audit(&AuditEntry::ExecEnd {
@@ -950,8 +958,27 @@ struct CappedOutput {
 /// stopped reading its pipe, so it would block on the next write and never
 /// exit, and it is a process a model asked for. The output collected up to
 /// that point is returned with `truncated` set.
-async fn run_capped(mut command: tokio::process::Command) -> std::io::Result<CappedOutput> {
+///
+/// # And a child that never finishes
+///
+/// `timeout` is the wall clock the whole run gets. The output cap bounds a
+/// child that says too much; nothing bounded one that says nothing and never
+/// exits, and such a child holds a minted credential, an MCP connection and a
+/// tool call open indefinitely. On expiry the child is killed and the error is
+/// `TimedOut`, so the caller can name the bound rather than reporting a spawn
+/// failure for a command that spawned perfectly well.
+async fn run_capped(
+    mut command: tokio::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<CappedOutput> {
+    // The child is put in its own process group so the kill reaches what it
+    // started too. A build script that backgrounds a server would otherwise
+    // survive the timeout that killed its parent.
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn()?;
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
 
@@ -965,16 +992,29 @@ async fn run_capped(mut command: tokio::process::Command) -> std::io::Result<Cap
             finished = &mut out_task, if out.is_none() => {
                 let finished = finished.map_err(std::io::Error::other)??;
                 if finished.1 {
-                    let _ = child.start_kill();
+                    kill_group(&mut child);
                 }
                 out = Some(finished);
             }
             finished = &mut err_task, if err.is_none() => {
                 let finished = finished.map_err(std::io::Error::other)??;
                 if finished.1 {
-                    let _ = child.start_kill();
+                    kill_group(&mut child);
                 }
                 err = Some(finished);
+            }
+            _ = &mut deadline => {
+                kill_group(&mut child);
+                out_task.abort();
+                err_task.abort();
+                // Reaped rather than left: the child has been signalled, and
+                // not waiting for it would leave a zombie for the length of the
+                // daemon's life.
+                let _ = child.wait().await;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("the command did not finish within {}s", timeout.as_secs()),
+                ));
             }
         }
     }
@@ -990,6 +1030,25 @@ async fn run_capped(mut command: tokio::process::Command) -> std::io::Result<Cap
         exit_code: status.code(),
         truncated: stdout_over || stderr_over || stdout_cut || stderr_cut,
     })
+}
+
+/// Signal the child's whole process group, falling back to the child alone.
+///
+/// The group is what `process_group(0)` above created, so a command that
+/// started children of its own is stopped with it rather than leaving them
+/// attached to the daemon.
+fn kill_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    if let Some(pid) = child.id() {
+        // SAFETY: `kill` takes two integers, touches no memory, and a negative
+        // pid addresses the process group of that id — which is this child's,
+        // because it was spawned with `process_group(0)`.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
 }
 
 /// Read one stream to end-of-file, or to one byte past the cap.

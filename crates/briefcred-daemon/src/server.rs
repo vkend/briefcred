@@ -150,6 +150,7 @@ pub struct State {
     revokes: Arc<RevokeQueue>,
     raw_args: bool,
     mcp_query_timeout: Duration,
+    mcp_exec_timeout: Duration,
     proxy: Option<Arc<crate::proxy::issuer::ProxyIssuer>>,
     keystore: Arc<dyn briefcred_core::keystore::KeyStore>,
     signer: Mutex<Option<Arc<crate::proxy::token::TokenSigner>>>,
@@ -198,6 +199,8 @@ pub struct StateParts {
     pub raw_args: bool,
     /// How long a `briefcred_db_query` statement may run.
     pub mcp_query_timeout: Duration,
+    /// How long a `briefcred_exec` command may run.
+    pub mcp_exec_timeout: Duration,
     /// The HTTP proxy's token authority, when the proxy is enabled.
     pub proxy: Option<Arc<crate::proxy::issuer::ProxyIssuer>>,
     /// Where the token-signer key lives, for signing a handoff blob.
@@ -241,6 +244,7 @@ impl State {
             revokes: parts.revokes,
             raw_args: parts.raw_args,
             mcp_query_timeout: parts.mcp_query_timeout,
+            mcp_exec_timeout: parts.mcp_exec_timeout,
             proxy: parts.proxy,
             keystore: parts.keystore,
             signer: Mutex::new(None),
@@ -381,6 +385,11 @@ impl State {
     /// Where helper binaries are looked for.
     pub fn helper_dirs(&self) -> &[PathBuf] {
         &self.helper_dirs
+    }
+
+    /// How long a `briefcred_db_query` statement may run.
+    pub fn mcp_exec_timeout(&self) -> Duration {
+        self.mcp_exec_timeout
     }
 
     /// How long a `briefcred_db_query` statement may run.

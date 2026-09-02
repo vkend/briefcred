@@ -78,6 +78,14 @@ pub struct PgProxyConfig {
 /// point anyone is waiting for it.
 pub const DEFAULT_MCP_QUERY_TIMEOUT_SECS: u64 = 30;
 
+/// Default wall-clock bound on one `briefcred_exec` tool call.
+///
+/// Five minutes. Longer than the query timeout, because a command a model runs
+/// is a build, a migration or a script rather than one statement, and shorter
+/// than forever, because a child that never exits holds a minted credential and
+/// an MCP connection open with nobody waiting on either.
+pub const DEFAULT_MCP_EXEC_TIMEOUT_SECS: u64 = 300;
+
 /// The daemon's resolved configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -141,6 +149,13 @@ pub struct Config {
     /// query a model asked for, which is why it exists at all: the row cap
     /// bounds what comes back, and this bounds what it costs to find out.
     pub mcp_query_timeout_secs: u64,
+    /// Seconds a `briefcred_exec` command may run before the daemon kills it.
+    ///
+    /// The output cap bounds how much a command may say; this bounds how long
+    /// it may take to say it. A child that hits the bound is killed and the
+    /// tool call returns an error naming the timeout, so a model is told the
+    /// command was cut rather than left waiting on a call that never returns.
+    pub mcp_exec_timeout_secs: u64,
     /// What the audit log records beyond the defaults.
     pub audit: AuditConfig,
     /// How the Postgres proxy behaves once it is running.
@@ -180,6 +195,7 @@ impl Default for Config {
             handoff_drain_secs: crate::handoff::DEFAULT_DRAIN_SECS,
             reconcile_interval_secs: DEFAULT_RECONCILE_INTERVAL_SECS,
             mcp_query_timeout_secs: DEFAULT_MCP_QUERY_TIMEOUT_SECS,
+            mcp_exec_timeout_secs: DEFAULT_MCP_EXEC_TIMEOUT_SECS,
             audit: AuditConfig::default(),
             pgproxy: PgProxyConfig::default(),
             master_source: None,
@@ -212,6 +228,12 @@ impl Config {
         if config.mcp_query_timeout_secs == 0 {
             return Err(
                 "mcp_query_timeout_secs must be at least 1; 0 would let a query run forever"
+                    .to_string(),
+            );
+        }
+        if config.mcp_exec_timeout_secs == 0 {
+            return Err(
+                "mcp_exec_timeout_secs must be at least 1; 0 would let a command run forever"
                     .to_string(),
             );
         }
@@ -263,6 +285,11 @@ impl Config {
     /// The MCP statement timeout as a [`Duration`].
     pub fn mcp_query_timeout(&self) -> Duration {
         Duration::from_secs(self.mcp_query_timeout_secs)
+    }
+
+    /// The `briefcred_exec` wall-clock bound as a [`Duration`].
+    pub fn mcp_exec_timeout(&self) -> Duration {
+        Duration::from_secs(self.mcp_exec_timeout_secs)
     }
 
     /// The master source to open, resolving the platform default.

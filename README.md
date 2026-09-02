@@ -257,6 +257,8 @@ guarantee, and how the service manager fits around it.
 | `pgproxy.allow_md5` | `false` | Permit MD5 when an upstream database asks for it |
 | `upstream_roots` | none | **For tests.** A PEM bundle of extra CAs the proxy trusts upstream |
 | `session_idle_secs` | `1800` | Seconds a session may go untouched before it is wiped |
+| `mcp_query_timeout_secs` | `30` | `statement_timeout` for a `briefcred_db_query` |
+| `mcp_exec_timeout_secs` | `300` | Seconds a `briefcred_exec` command may run before it is killed |
 | `handoff_drain_secs` | `30` | Seconds a replaced daemon gives its in-flight requests and streams |
 | `master_source` | platform default | `"keychain"`, `"file"`, or `"env"` |
 | `ca.keystore` | platform default | `"keychain"` or `"file"`; where the CA key lives |
@@ -1249,7 +1251,11 @@ so a `SELECT` over a billion rows produces the rows asked for and stops;
 `mcp_query_timeout_secs` in `daemon.toml` (30 seconds by default) becomes the
 connection's `statement_timeout`, so a runaway query is cancelled at the
 database. A command that writes without stopping is killed at the output cap
-rather than buffered.
+rather than buffered, and one that writes nothing and never exits is killed at
+`mcp_exec_timeout_secs` (300 seconds by default). The kill goes to the child's
+whole process group, so a command that started something of its own does not
+leave it attached to the daemon, and the tool call returns an error naming the
+bound rather than never returning.
 
 A portal needs a transaction, and that transaction is **rolled back**, so
 `briefcred_db_query` cannot write. This is deliberate and not a side effect of

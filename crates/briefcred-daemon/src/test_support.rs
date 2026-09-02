@@ -110,6 +110,7 @@ pub async fn test_state_with(
         ),
         raw_args: false,
         mcp_query_timeout: Duration::from_secs(30),
+        mcp_exec_timeout: Duration::from_secs(300),
         proxy: None,
         keystore: Arc::new(briefcred_core::keystore::FileKeyStore::new(
             home.path().join("ca"),

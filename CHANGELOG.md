@@ -8,6 +8,12 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Fixed
 
+- **`briefcred_exec` has a wall-clock bound.** An MCP command that produced no
+  output and never exited held a minted credential and a tool call open
+  indefinitely. It is now killed at `mcp_exec_timeout_secs` (300 seconds by
+  default), process group and all, and the tool call returns an error naming
+  the timeout.
+
 - **The hook no longer auto-approves a compound command.** An `allow` rule with
   `rewrite: true` answered `allow` for `psql … | tee /etc/passwd`, wrapping the
   whole line in a `briefcred exec` on the strength of a policy check that had
