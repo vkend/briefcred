@@ -553,6 +553,10 @@ async fn authorize(
         .map_err(|err| err.to_string())?;
     let (profile_name, masters, mint_id, quota) = session;
 
+    // Opening a connection is the session being used. A run that only ever
+    // talks to the database would otherwise be evicted as idle while it works.
+    let _ = proxy.state.sessions().touch(&claims.sid).await;
+
     let profile = proxy
         .state
         .profiles()
@@ -798,6 +802,97 @@ impl AsyncWrite for ClientStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::TestClock;
+    use crate::test_support::test_state_with;
+
+    /// A profile with one `postgres-proxy` credential whose `source_key` is the
+    /// key the shared test `MasterSource` holds.
+    const PROFILE: &str = "\
+name: p
+unlock:
+  policy: none
+credentials:
+  - name: db
+    kind: postgres-proxy
+    ttl_secs: 300
+    config:
+      host: 127.0.0.1
+      port: 5432
+      dbname: analytics
+      user: reporting
+      sslmode: disable
+";
+
+    #[tokio::test]
+    async fn opening_a_connection_keeps_the_session_from_being_evicted_as_idle() {
+        let idle_for = std::time::Duration::from_secs(60);
+        let clock = TestClock::new();
+        let (_home, state, _prompts) = test_state_with(PROFILE, clock.clone(), idle_for).await;
+        let keys = tempfile::tempdir().unwrap();
+        let issuer = ProxyIssuer::open(
+            Box::new(briefcred_core::keystore::FileKeyStore::new(keys.path())),
+            "http://127.0.0.1:0",
+        );
+        let proxy = PgProxy::new(Arc::clone(&state), Arc::clone(&issuer), false, false);
+
+        let profile = state.profiles().get("p").await.expect("profile `p`");
+        let (sid, _) = state
+            .sessions()
+            .open(
+                &profile,
+                state.master_source().as_ref(),
+                state.helper_dirs().to_vec(),
+                None,
+            )
+            .await
+            .expect("the session opens");
+
+        // The connection has to name a mint the session remembers, exactly as a
+        // real one does after `exec`.
+        let mint_id = MintId::generate();
+        state
+            .sessions()
+            .record_mints(
+                &sid,
+                vec![crate::revoke::PendingRevoke {
+                    mint_id: mint_id.clone(),
+                    kind: briefcred_core::minters::postgres_proxy::KIND.to_string(),
+                    profile: "p".to_string(),
+                    credential: "db".to_string(),
+                    source_key: "db".to_string(),
+                    config: serde_json::Value::Null,
+                    revoke_token: String::new(),
+                    expires_at_unix_ms: 0,
+                    attempts: 0,
+                    not_before_unix_ms: 0,
+                }],
+            )
+            .await
+            .expect("the mint is recorded");
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let issued = issuer.issue(&sid, None, "db", 3_600, now).unwrap();
+        let startup = Startup {
+            user: sid.clone(),
+            database: Some("analytics".to_string()),
+            forwarded: std::collections::BTreeMap::new(),
+        };
+
+        // Two idle windows, with a connection authorised in the middle of each.
+        // Nothing else touches the session.
+        for _ in 0..2 {
+            clock.advance(std::time::Duration::from_secs(45));
+            authorize(&startup, &issued.token, &proxy)
+                .await
+                .unwrap_or_else(|reason| panic!("the connection must be authorised: {reason}"));
+        }
+        clock.advance(std::time::Duration::from_secs(45));
+
+        assert!(
+            state.sessions().evict_idle().await.is_empty(),
+            "a session that only opens database connections is not idle"
+        );
+    }
 
     #[tokio::test]
     async fn port_zero_binds_somewhere_on_loopback() {

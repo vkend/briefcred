@@ -215,3 +215,44 @@ fn an_unexpected_unlock_answer_is_named_rather_than_debug_printed() {
     });
     assert!(locked.message.contains("cancelled"));
 }
+
+/// A profile with no credentials at all.
+///
+/// The subject here is the session's idle timer, not what was minted into it,
+/// and an empty `credentials` keeps the test free of a helper binary and of the
+/// proxy issuer a `http-*` kind would need.
+const IDLE_PROFILE: &str = "name: p\nunlock:\n  policy: none\n";
+
+/// An MCP connection is not a request on the daemon's socket, so nothing else
+/// in the daemon marks its session as used. Without the touch in
+/// `ensure_minted`, a conversation made entirely of tool calls has its masters
+/// wiped out from under it mid-answer.
+#[tokio::test]
+async fn a_connection_that_only_makes_tool_calls_is_not_evicted_as_idle() {
+    let idle_for = std::time::Duration::from_secs(60);
+    let clock = crate::clock::TestClock::new();
+    let (_home, state, _prompts) =
+        crate::test_support::test_state_with(IDLE_PROFILE, clock.clone(), idle_for).await;
+    let profile = state.profiles().get("p").await.expect("profile `p`");
+
+    let server = McpServer::new(Arc::clone(&state), "test");
+    server
+        .ensure_minted(&profile)
+        .await
+        .unwrap_or_else(|e| panic!("the first call mints: {e}"));
+
+    // Two idle windows, with a tool call in the middle of each.
+    for _ in 0..2 {
+        clock.advance(std::time::Duration::from_secs(45));
+        server
+            .ensure_minted(&profile)
+            .await
+            .unwrap_or_else(|e| panic!("a later call reuses the session: {e}"));
+    }
+    clock.advance(std::time::Duration::from_secs(45));
+
+    assert!(
+        state.sessions().evict_idle().await.is_empty(),
+        "a session used only through MCP tool calls is not idle"
+    );
+}

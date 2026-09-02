@@ -575,6 +575,16 @@ impl McpServer {
         let mut held = self.inner.held.lock().await;
         if let Some(existing) = held.as_ref() {
             return if existing.profile == profile.name {
+                // A tool call is the session being used. An MCP connection that
+                // works entirely through tool calls never reaches the daemon's
+                // request socket, so without this its session looks idle and is
+                // evicted mid-conversation.
+                let _ = self
+                    .inner
+                    .state
+                    .sessions()
+                    .touch(&existing.session_id)
+                    .await;
                 // One token per tool call, not per connection. The mint
                 // happened once, but each call is another use of the
                 // credential it produced, and a quota that only counted the

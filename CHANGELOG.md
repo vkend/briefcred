@@ -6,6 +6,14 @@ All notable changes to briefcred are recorded here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- **Idle eviction now counts proxied and MCP use.** A session's idle timer
+  was only reset by a request on the daemon's own socket, so an agent doing all
+  its work through the HTTP proxy, the Postgres proxy, or an MCP tool call had
+  its masters wiped out from under a run that had never stopped. All three
+  paths now mark the session as used.
+
 ### Added
 
 - **TLS on the Postgres proxy's upstream connection.** The daemon now sends

@@ -27,6 +27,8 @@ pub mod reconcile;
 pub mod revoke;
 pub mod server;
 pub mod session;
+#[cfg(test)]
+pub mod test_support;
 pub mod unlock;
 
 use std::collections::BTreeMap;

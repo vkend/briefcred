@@ -1276,6 +1276,11 @@ async fn resolve_session(
         })
         .await
         .ok()?;
+    // A proxied request is the session being used. Without this, an agent that
+    // does all its work through the proxy — which is the whole point of a
+    // Model A credential — looks idle to the evictor and has its masters wiped
+    // out from under a run that never stopped.
+    let _ = proxy.state.sessions().touch(sid).await;
     let profile = proxy.state.profiles().get(&profile_name).await?;
 
     let mut credentials = Vec::new();
@@ -1623,6 +1628,88 @@ fn empty() -> OutBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::TestClock;
+    use crate::test_support::test_state_with;
+
+    /// A profile whose one credential's `source_key` is the key the shared
+    /// test `MasterSource` holds, so a session opens with a master in it.
+    const PROFILE: &str = "name: p\nunlock:\n  policy: none\ncredentials:\n  - name: db\n    \
+                           kind: http-bearer\n    ttl_secs: 300\n";
+
+    /// A proxy over a state whose sessions run on a clock the test advances.
+    async fn proxy_with_clock(
+        clock: Arc<TestClock>,
+        idle_for: std::time::Duration,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Arc<Proxy>) {
+        let (home, state, _prompts) = test_state_with(PROFILE, clock, idle_for).await;
+        let keys = tempfile::tempdir().unwrap();
+        let issuer = ProxyIssuer::open(
+            Box::new(briefcred_core::keystore::FileKeyStore::new(keys.path())),
+            "http://127.0.0.1:0",
+        );
+        let upstream = crate::proxy::tls::client_config(None).unwrap();
+        let proxy = Proxy::new(state, issuer, upstream);
+        (home, keys, proxy)
+    }
+
+    async fn open_session(proxy: &Proxy) -> String {
+        let profile = proxy.state.profiles().get("p").await.expect("profile `p`");
+        proxy
+            .state
+            .sessions()
+            .open(
+                &profile,
+                proxy.state.master_source().as_ref(),
+                proxy.state.helper_dirs().to_vec(),
+                None,
+            )
+            .await
+            .expect("the session opens")
+            .0
+    }
+
+    #[tokio::test]
+    async fn a_session_that_only_proxies_requests_is_not_evicted_as_idle() {
+        let idle_for = std::time::Duration::from_secs(60);
+        let clock = TestClock::new();
+        let (_home, _keys, proxy) = proxy_with_clock(clock.clone(), idle_for).await;
+        let sid = open_session(&proxy).await;
+
+        // Two windows' worth of time, with a proxied request in the middle of
+        // each. Nothing else touches the session: no `exec`, no `status`, no
+        // request on the daemon's socket at all — which is exactly the shape of
+        // an agent doing all its work through a Model A credential.
+        for _ in 0..2 {
+            clock.advance(std::time::Duration::from_secs(45));
+            let _ = resolve_session(&proxy, &sid, "db").await;
+        }
+        clock.advance(std::time::Duration::from_secs(45));
+
+        assert!(
+            proxy.state.sessions().evict_idle().await.is_empty(),
+            "a session used through the proxy is not idle, and its masters must \
+             not be wiped out from under a run that never stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_nothing_touches_at_all_is_still_evicted() {
+        // The control for the test above: without the proxy's own touch, the
+        // very same timeline evicts. Without this, that test would pass just as
+        // well against an eviction that never fires.
+        let clock = TestClock::new();
+        let (_home, _keys, proxy) =
+            proxy_with_clock(clock.clone(), std::time::Duration::from_secs(60)).await;
+        let _sid = open_session(&proxy).await;
+
+        clock.advance(std::time::Duration::from_secs(61));
+
+        assert_eq!(
+            proxy.state.sessions().evict_idle().await.len(),
+            1,
+            "an untouched session past its window is evicted"
+        );
+    }
 
     #[test]
     fn an_authority_gives_up_its_host_without_its_port() {
