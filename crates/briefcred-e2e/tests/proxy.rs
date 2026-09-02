@@ -61,6 +61,8 @@ struct Upstream {
     ca_pem: String,
     port: u16,
     seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    /// The accept loop, so a test can take the upstream away mid-run.
+    accepting: tokio::task::JoinHandle<()>,
 }
 
 /// Start an in-process HTTPS server on loopback.
@@ -99,7 +101,7 @@ async fn start_upstream() -> Upstream {
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     let recorded = Arc::clone(&seen);
-    tokio::spawn(async move {
+    let accepting = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
@@ -159,6 +161,7 @@ async fn start_upstream() -> Upstream {
         ca_pem: ca.cert_pem().to_string(),
         port,
         seen,
+        accepting,
     }
 }
 
@@ -384,6 +387,17 @@ async fn start(policy_mode: &str) -> Fixture {
     }
 }
 
+impl Fixture {
+    /// Take the upstream away, so the next forward cannot reach it.
+    ///
+    /// Aborting the accept loop drops the listener with it, so the port stops
+    /// answering rather than accepting and hanging — the proxy then fails to
+    /// connect, which is the case under test.
+    fn stop_upstream(&self) {
+        self.upstream.accepting.abort();
+    }
+}
+
 fn bearer(token: &str) -> Vec<(&'static str, String)> {
     vec![("authorization", format!("Bearer {token}"))]
 }
@@ -486,6 +500,50 @@ async fn a_tampered_token_is_refused() {
 }
 
 #[tokio::test]
+async fn a_token_whose_session_is_gone_is_refused_even_though_it_still_verifies() {
+    // The signature and the expiry are the token's own; the session it names is
+    // not. A token that outlives its session has to stop working, or closing a
+    // session would be a suggestion rather than a wipe.
+    let fixture = start("enforce").await;
+    let (status, _, _) = fixture
+        .client
+        .get("/v1/models", &bearer(&fixture.token))
+        .await
+        .unwrap();
+    assert_eq!(
+        status, 200,
+        "the same token works while the session is open"
+    );
+    fixture.upstream.seen.lock().unwrap().clear();
+
+    fixture
+        .daemon
+        .request(Request::CloseSession {
+            session_id: fixture.session_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let (status, _, _) = fixture
+        .client
+        .get("/v1/models", &bearer(&fixture.token))
+        .await
+        .unwrap();
+    // Closing a session both drops the lookup and queues the revoke of what it
+    // minted, so either refusal is correct and which one arrives first is a
+    // race. What must never happen is the request being forwarded.
+    assert!(
+        status == 401 || status == 403,
+        "a token for a closed session must be refused, got {status}:\n{}",
+        fixture.daemon.log()
+    );
+    assert!(
+        fixture.upstream.seen.lock().unwrap().is_empty(),
+        "no credential may be attached to a request for a session that is gone"
+    );
+}
+
+#[tokio::test]
 async fn a_revoked_token_stops_working_at_once() {
     let fixture = start("enforce").await;
     let (status, _, _) = fixture
@@ -570,6 +628,38 @@ async fn a_dpop_proof_for_another_request_is_refused() {
 
     let (status, _, _) = fixture.client.get("/v1/models", &headers).await.unwrap();
     assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn an_unreachable_upstream_is_not_recorded_as_a_policy_denial() {
+    // The policy allowed this request; the upstream simply was not there. A
+    // row saying `deny` would send whoever reads it to widen a policy that was
+    // never the problem, and a `status: 502` would put briefcred's own failure
+    // in the field that means "what the vendor answered".
+    let fixture = start("observe").await;
+    fixture.stop_upstream();
+
+    let (status, _, _) = fixture
+        .client
+        .get("/v1/models", &bearer(&fixture.token))
+        .await
+        .unwrap();
+    assert_eq!(status, 502);
+
+    assert!(
+        proxy_row_written(&fixture.daemon).await,
+        "a failed forward must still be audited:\n{}",
+        fixture.daemon.log()
+    );
+    let rows = fixture.daemon.audit_rows();
+    let row = rows.iter().find(|r| r["event"] == "proxy_request").unwrap();
+    assert_eq!(row["decision"], "upstream_error");
+    assert!(
+        row["status"].is_null(),
+        "nothing reached an upstream, so there is no upstream status: {row}"
+    );
+    assert_eq!(row["host"], UPSTREAM_HOST);
+    assert_eq!(row["path"], "/v1/models");
 }
 
 #[tokio::test]
