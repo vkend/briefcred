@@ -86,6 +86,19 @@ const TLS_HOSTNAME: &str = "localhost";
 /// probing the proxy which half of the credential to fix.
 const REFUSAL: &str = "briefcred: this connection is not authorised";
 
+/// What a client whose connection briefcred ends mid-session is told.
+///
+/// Under SQLSTATE `57P01`, which is what PostgreSQL itself sends when an
+/// administrator terminates a backend, so a driver already knows to treat the
+/// connection as gone rather than retrying on it.
+const TERMINATION: &str = "briefcred: this credential has been revoked or has expired";
+
+/// How often a live connection's grant is re-checked.
+///
+/// One second. It is the bound `THREAT_MODEL.md` states, so it is a constant
+/// rather than a literal: a connection outlives its grant by at most this long.
+pub const LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Everything one proxied connection needs, shared across all of them.
 pub struct PgProxy {
     state: Arc<State>,
@@ -345,7 +358,10 @@ async fn serve_session(
             // told the connection failed and nothing about why.
             let _ = wire::write_message(
                 &mut stream,
-                &wire::fatal_error("briefcred: the database could not be reached"),
+                &wire::fatal_error(
+                    wire::SQLSTATE_CONNECTION_FAILURE,
+                    "briefcred: the database could not be reached",
+                ),
             )
             .await;
             let _ = stream.shutdown().await;
@@ -369,21 +385,43 @@ async fn serve_session(
         register_backend(proxy, key, &upstream_address);
     }
 
-    let transferred = forward::relay(stream, upstream.stream).await;
+    let relayed = forward::relay(
+        stream,
+        upstream.stream,
+        until_stale(proxy, &grant),
+        wire::fatal_error(wire::SQLSTATE_ADMIN_SHUTDOWN, TERMINATION),
+    )
+    .await;
 
     if let Some(key) = upstream.backend_key {
         forget_backend(proxy, key);
     }
+    if let Some(reason) = relayed.terminated {
+        eprintln!(
+            "briefcred-daemon: postgres proxy closed a live connection for `{}`: {reason}{}",
+            grant.credential,
+            if relayed.farewell_sent {
+                ""
+            } else {
+                " (mid-message, so the client was not told)"
+            }
+        );
+    }
+    // Counted as served either way, and audited either way: the connection was
+    // authorised and did real work, and a row that vanished because briefcred
+    // ended it would lose exactly the connections an investigator most wants.
+    // The reason is on the log rather than in the row, because the row's field
+    // list is the one this phase committed to.
     proxy.count(OUTCOME_ALLOW);
-    proxy
-        .state
-        .metrics()
-        .record_pgproxy_bytes(transferred.client_bytes, transferred.server_bytes);
+    proxy.state.metrics().record_pgproxy_bytes(
+        relayed.transferred.client_bytes,
+        relayed.transferred.server_bytes,
+    );
     proxy.state.audit(&crate::pgproxy::audit::connection_row(
         &grant.mint_id,
         &grant.config.user,
         started,
-        transferred,
+        relayed.transferred,
     ));
     Ok(())
 }
@@ -437,6 +475,14 @@ struct Grant {
     config: PgProxyConfig,
     master: Zeroizing<String>,
     mint_id: MintId,
+    /// The session the token names, so the connection can be watched for it
+    /// being closed while the connection is still open.
+    sid: String,
+    /// The credential the token names, for the same reason: a revoke is on the
+    /// `(session, credential)` pair.
+    credential: String,
+    /// The token's own `exp`, in Unix seconds.
+    expires_at: i64,
 }
 
 /// Check the token and the connection it asks for against the grant it names.
@@ -531,7 +577,54 @@ async fn authorize(
         config,
         master,
         mint_id,
+        sid: claims.sid,
+        credential: claims.cred,
+        expires_at: claims.exp,
     })
+}
+
+/// Wait until the grant behind a live connection stops being one.
+///
+/// The check that runs when a connection is opened is not enough on its own. A
+/// connection lives for as long as its client keeps it, so without this a
+/// subprocess that connected at the start of a run would still hold
+/// master-privileged access after `briefcred exec` finished, after the grant was
+/// revoked, and past the token's own expiry — and the proxy would be a
+/// chokepoint that checks once and then waves everything through.
+///
+/// # Polling, and why not a subscription
+///
+/// This asks three questions on a timer rather than waiting on a signal from
+/// the session store and the revocation set. Two reasons. A subscription has a
+/// window — between reading the current state and registering for changes, a
+/// close can happen and be missed — and closing it would mean new locking in
+/// two structures the HTTP proxy also uses. And the cost here is a map lookup
+/// per second per live connection, which is nothing next to the connection
+/// itself. What it buys is a bound stated in seconds rather than an invariant
+/// spread across three modules.
+///
+/// The returned string is the reason, for the log and for the audit trail.
+async fn until_stale(proxy: &PgProxy, grant: &Grant) -> &'static str {
+    let mut ticker = tokio::time::interval(LIVENESS_INTERVAL);
+    // `interval` fires immediately, and the grant was checked a moment ago.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        // The token's own `exp`, not `exp + CLOCK_SKEW_SECS`. The allowance
+        // exists so a client whose clock is a minute fast can still present a
+        // token; it is not an extension of what the credential is good for, and
+        // a connection already open has no clock of its own to forgive.
+        if now >= grant.expires_at {
+            return "the credential expired";
+        }
+        if proxy.issuer.is_revoked(&grant.sid, &grant.credential, now) {
+            return "the credential was revoked";
+        }
+        if !proxy.state.sessions().contains(&grant.sid).await {
+            return "the session was closed";
+        }
+    }
 }
 
 /// Refuse the connection with a proper `ErrorResponse`, then close it.
@@ -541,7 +634,11 @@ async fn refuse(
     reason: String,
 ) -> std::result::Result<(), ConnectionError> {
     proxy.count(OUTCOME_DENY);
-    let _ = wire::write_message(stream, &wire::fatal_error(REFUSAL)).await;
+    let _ = wire::write_message(
+        stream,
+        &wire::fatal_error(wire::SQLSTATE_INVALID_AUTHORIZATION, REFUSAL),
+    )
+    .await;
     let _ = stream.shutdown().await;
     Err(ConnectionError::Refused(reason))
 }
@@ -657,7 +754,7 @@ mod tests {
         assert!(!REFUSAL.contains("session"), "{REFUSAL}");
         assert!(!REFUSAL.contains("database"), "{REFUSAL}");
         assert!(!REFUSAL.contains("token"), "{REFUSAL}");
-        let error = wire::fatal_error(REFUSAL);
+        let error = wire::fatal_error(wire::SQLSTATE_INVALID_AUTHORIZATION, REFUSAL);
         let body = String::from_utf8_lossy(&error.body).to_string();
         assert!(
             body.contains(wire::SQLSTATE_INVALID_AUTHORIZATION),

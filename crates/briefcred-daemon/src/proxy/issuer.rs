@@ -151,6 +151,17 @@ impl ProxyIssuer {
         Ok(claims)
     }
 
+    /// Whether the grant for `credential` in `sid` has been retired.
+    ///
+    /// Separate from [`ProxyIssuer::authorize`] for the one caller that has
+    /// already verified a token and needs to keep asking: the Postgres proxy
+    /// re-checks a *live connection* on a timer, and it holds the session and
+    /// credential from the claims rather than the token string, so that a
+    /// long-running connection is not a reason to keep a token resident.
+    pub fn is_revoked(&self, sid: &str, credential: &str, now: i64) -> bool {
+        self.revocations.is_revoked(sid, credential, now)
+    }
+
     /// How many grants are currently revoked. For tests and diagnostics.
     pub fn revoked_count(&self) -> usize {
         self.revocations.len()

@@ -69,13 +69,27 @@ pub const TAG_READY_FOR_QUERY: u8 = b'Z';
 /// depends on what the server last asked for.
 pub const TAG_PASSWORD: u8 = b'p';
 
-/// The SQLSTATE briefcred refuses a connection with.
+/// The SQLSTATE briefcred refuses an unauthorised connection with.
 ///
 /// `28000` is `invalid_authorization_specification`, which is what a client
-/// presenting a token briefcred will not honour has done. Every refusal uses
-/// it, whatever the underlying reason: telling a caller *which* check failed
-/// is telling an attacker which half of the credential to fix.
+/// presenting a token briefcred will not honour has done. Every *authentication*
+/// refusal uses it, whatever the underlying reason: telling a caller which check
+/// failed is telling an attacker which half of the credential to fix.
 pub const SQLSTATE_INVALID_AUTHORIZATION: &str = "28000";
+
+/// The SQLSTATE for a connection that was authorised and then failed anyway.
+///
+/// `08006` is `connection_failure`. It is the honest answer when the client's
+/// credentials were fine and the real database could not be reached: a `28000`
+/// there would send a user to check a token that was never the problem.
+pub const SQLSTATE_CONNECTION_FAILURE: &str = "08006";
+
+/// The SQLSTATE for a connection briefcred ends while it is in use.
+///
+/// `57P01` is `admin_shutdown`, which is what PostgreSQL itself sends when an
+/// administrator terminates a backend — and it is what a driver already knows
+/// how to interpret as "this connection is gone, reconnect if you still can".
+pub const SQLSTATE_ADMIN_SHUTDOWN: &str = "57P01";
 
 /// Why a message could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -241,17 +255,20 @@ pub fn authentication_cleartext_password() -> Message {
     }
 }
 
-/// A fatal `ErrorResponse` carrying `message` under SQLSTATE `28000`.
+/// A fatal `ErrorResponse` carrying `message` under `sqlstate`.
 ///
 /// `message` is briefcred's own text and never a peer's: an error body is the
 /// one thing a refused client always gets to read, so nothing that came off the
-/// wire goes back out in it.
-pub fn fatal_error(message: &str) -> Message {
+/// wire goes back out in it. The `sqlstate` is what a driver branches on, so it
+/// has to distinguish the three things that can end a connection — the
+/// credential was not good, the database could not be reached, or briefcred
+/// ended a connection that was already running.
+pub fn fatal_error(sqlstate: &str, message: &str) -> Message {
     let mut body = Vec::new();
     for (field, value) in [
         (b'S', "FATAL"),
         (b'V', "FATAL"),
-        (b'C', SQLSTATE_INVALID_AUTHORIZATION),
+        (b'C', sqlstate),
         (b'M', message),
     ] {
         body.push(field);
@@ -411,14 +428,29 @@ mod tests {
     }
 
     #[test]
-    fn an_error_response_carries_the_sqlstate_a_refusal_has_to_have() {
-        let message = fatal_error("no");
+    fn an_error_response_carries_the_sqlstate_it_was_given() {
+        let message = fatal_error(SQLSTATE_INVALID_AUTHORIZATION, "no");
         assert_eq!(message.tag, TAG_ERROR_RESPONSE);
         let body = String::from_utf8_lossy(&message.body).to_string();
         assert!(body.contains("FATAL"), "{body}");
         assert!(body.contains(SQLSTATE_INVALID_AUTHORIZATION), "{body}");
         assert!(body.contains("no"), "{body}");
         assert_eq!(*message.body.last().unwrap(), 0, "the field list ends");
+    }
+
+    #[test]
+    fn the_three_sqlstates_are_distinct_so_a_driver_can_branch_on_them() {
+        // A client that cannot tell "your token is no good" from "the database
+        // is down" from "briefcred ended this" cannot decide whether to retry.
+        for (sqlstate, expected) in [
+            (SQLSTATE_INVALID_AUTHORIZATION, "28000"),
+            (SQLSTATE_CONNECTION_FAILURE, "08006"),
+            (SQLSTATE_ADMIN_SHUTDOWN, "57P01"),
+        ] {
+            assert_eq!(sqlstate, expected);
+            let body = String::from_utf8_lossy(&fatal_error(sqlstate, "x").body).to_string();
+            assert!(body.contains(expected), "{body}");
+        }
     }
 
     #[test]
