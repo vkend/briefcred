@@ -189,12 +189,20 @@ mod tests {
 
     /// Wait for `check` to hold, polling rather than sleeping a fixed time so
     /// the test is neither flaky on a loaded machine nor slow on a fast one.
+    ///
+    /// Thirty seconds, not ten. These tests wait on a filesystem watcher, and
+    /// what they assert is *that* a change is noticed and what the store does
+    /// about it — never how quickly the operating system delivers the event.
+    /// Ten seconds is enough on an idle machine and demonstrably not enough
+    /// when the rest of the suite is running beside it, so a tighter budget
+    /// buys no coverage and costs a spurious failure. A run that is genuinely
+    /// broken never notices at all, and still fails here.
     async fn eventually<F, Fut>(what: &str, check: F)
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
             if check().await {
                 return;

@@ -98,9 +98,15 @@ fn an_empty_output_is_an_empty_string_rather_than_a_truncation() {
 /// does write without stopping.
 #[tokio::test]
 async fn a_command_that_never_stops_writing_is_cut_and_killed() {
-    let mut command = tokio::process::Command::new("/bin/sh");
+    // `cat /dev/zero` rather than a shell loop. Both are unbounded writers and
+    // both exercise the same path, but a `while :; do printf ...; done` needs
+    // tens of thousands of shell-builtin iterations to reach a megabyte, and it
+    // burns a core doing it — inside the same test binary as the filesystem
+    // watcher tests, which then time out waiting for an event. One `cat` reaches
+    // the cap at pipe speed and costs almost nothing.
+    let mut command = tokio::process::Command::new("/bin/cat");
     command
-        .args(["-c", "while :; do printf 'xxxxxxxxxxxxxxxx'; done"])
+        .arg("/dev/zero")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -115,6 +121,10 @@ async fn a_command_that_never_stops_writing_is_cut_and_killed() {
         output.stdout.len() <= MAX_OUTPUT_BYTES,
         "{} bytes came back",
         output.stdout.len()
+    );
+    assert!(
+        !output.stdout.is_empty(),
+        "the cap must not be reached by reading nothing"
     );
     // Killed rather than exited: `start_kill` sends SIGKILL, which has no exit
     // code. A `Some(_)` here would mean the child was allowed to finish, which
