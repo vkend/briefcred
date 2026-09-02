@@ -15,6 +15,7 @@ pub mod exec;
 #[cfg(feature = "debug-heapscan")]
 pub mod heapscan;
 pub mod helper;
+pub mod inproc;
 pub mod metrics;
 pub mod profiles;
 pub mod reconcile;
@@ -173,7 +174,7 @@ pub async fn run() -> Result<()> {
     tokio::spawn(revoke::drain_loop(
         Arc::clone(&revokes),
         Arc::new(QueueRevoker {
-            helpers: Arc::new(helper::HelperSet::new(helper_dirs.clone())),
+            helpers: Arc::new(helper::MinterSet::new(helper_dirs.clone())),
             masters: Arc::clone(&master_source),
         }),
         state.audit_handle(),
@@ -238,7 +239,7 @@ pub async fn run() -> Result<()> {
 /// works. See `revoke::PendingRevoke`.
 #[derive(Debug)]
 struct QueueRevoker {
-    helpers: Arc<helper::HelperSet>,
+    helpers: Arc<helper::MinterSet>,
     masters: Arc<dyn briefcred_core::MasterSource>,
 }
 

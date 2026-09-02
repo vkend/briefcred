@@ -25,7 +25,7 @@ use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
 use crate::clock::Clock;
-use crate::helper::HelperSet;
+use crate::helper::MinterSet;
 use crate::revoke::PendingRevoke;
 
 /// How often the eviction task looks for idle sessions.
@@ -64,7 +64,7 @@ pub struct Session {
     /// An `Arc` so a handler can hold it across the awaits of a mint without
     /// keeping the whole session map locked for the length of a round trip to
     /// a database.
-    pub helpers: Arc<HelperSet>,
+    pub helpers: Arc<MinterSet>,
 }
 
 impl std::fmt::Debug for Session {
@@ -176,7 +176,7 @@ impl SessionStore {
             last_used: now,
             masters,
             mints: BTreeMap::new(),
-            helpers: Arc::new(HelperSet::new(helper_dirs)),
+            helpers: Arc::new(MinterSet::new(helper_dirs)),
         };
         let id = session.id.clone();
         let expires_at = session.expires_at(now, self.idle_for);

@@ -6,6 +6,13 @@
 //! own memory is not. A helper that panics costs one backend; a helper with a
 //! memory-disclosure bug exposes one master.
 //!
+//! # The exception
+//!
+//! A minter registered as [`Hosting::Daemon`] talks to no backend at all, so
+//! there is nothing for a helper to isolate and the daemon runs it in-process.
+//! Both shapes answer the same [`MintChannel`] trait, so nothing above this
+//! module branches on which one a kind uses; see [`crate::inproc`].
+//!
 //! # Where a helper comes from
 //!
 //! Next to the daemon's own executable first, then `BRIEFCRED_HELPER_DIR`. The
@@ -30,6 +37,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use briefcred_core::registry::{Hosting, Registry};
 use briefcred_proto::helper::{
     encode_line, HelperError, HelperParams, HelperRequest, HelperResponse, HelperResult,
     ShutdownParams, CODE_BACKEND,
@@ -145,6 +153,21 @@ pub fn own_dir() -> Option<PathBuf> {
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
 }
 
+/// Something the daemon can ask to mint, revoke, or reconcile.
+///
+/// Implemented by [`Helper`], which is a process, and by
+/// [`crate::inproc::InDaemonMinter`], which is not. The protocol is the same
+/// either way, so `crate::exec` and `crate::reconcile` never ask which they
+/// have.
+#[async_trait::async_trait]
+pub trait MintChannel: Send + Sync + std::fmt::Debug {
+    /// Send one call and read its answer.
+    async fn call(&self, params: HelperParams) -> Result<HelperResult, HelperFailure>;
+
+    /// Release whatever the channel is holding. A no-op where there is nothing.
+    async fn stop(&self);
+}
+
 /// One running helper process and its pipes.
 ///
 /// Behind a `Mutex` because a call is a write followed by the matching read,
@@ -193,7 +216,7 @@ impl Helper {
     }
 
     /// Send one call and read its answer.
-    pub async fn call(&self, params: HelperParams) -> Result<HelperResult, HelperFailure> {
+    async fn exchange(&self, params: HelperParams) -> Result<HelperResult, HelperFailure> {
         let method = params.method().to_string();
         let mut io = self.io.lock().await;
         let id = io.next_id;
@@ -257,12 +280,19 @@ impl Helper {
             }),
         }
     }
+}
+
+#[async_trait::async_trait]
+impl MintChannel for Helper {
+    async fn call(&self, params: HelperParams) -> Result<HelperResult, HelperFailure> {
+        self.exchange(params).await
+    }
 
     /// Ask the helper to stop, then make sure it has.
-    pub async fn stop(&self) {
+    async fn stop(&self) {
         let _ = tokio::time::timeout(
             SHUTDOWN_GRACE,
-            self.call(HelperParams::Shutdown(ShutdownParams {})),
+            self.exchange(HelperParams::Shutdown(ShutdownParams {})),
         )
         .await;
         let mut io = self.io.lock().await;
@@ -312,50 +342,74 @@ async fn read_reply(stdout: &mut BufReader<ChildStdout>) -> std::io::Result<Stri
     Ok(reply)
 }
 
-/// Every helper a session has started, keyed by minter kind.
+/// Every channel a session has opened, keyed by minter kind.
 ///
-/// Owned by the session, so closing the session closes the helpers, and the
-/// masters they hold go away with them.
+/// Owned by the session, so closing the session closes the helper processes,
+/// and the masters they hold go away with them.
 #[derive(Debug, Default)]
-pub struct HelperSet {
+pub struct MinterSet {
     dirs: Vec<PathBuf>,
-    helpers: Mutex<BTreeMap<String, Arc<Helper>>>,
+    registry: Registry,
+    channels: Mutex<BTreeMap<String, Arc<dyn MintChannel>>>,
 }
 
-impl HelperSet {
-    /// A set that looks for binaries in `dirs`.
-    pub fn new(dirs: Vec<PathBuf>) -> HelperSet {
-        HelperSet {
+impl MinterSet {
+    /// A set that looks for helper binaries in `dirs`.
+    ///
+    /// The registry it consults is every minter this binary was linked with,
+    /// which is the same one profiles were validated against.
+    pub fn new(dirs: Vec<PathBuf>) -> MinterSet {
+        MinterSet {
             dirs,
-            helpers: Mutex::new(BTreeMap::new()),
+            registry: Registry::discover(),
+            channels: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// The helper for `kind`, starting it if this is the first call.
-    pub async fn get(&self, kind: &str) -> Result<Arc<Helper>, HelperFailure> {
-        let mut helpers = self.helpers.lock().await;
-        if let Some(helper) = helpers.get(kind) {
-            return Ok(Arc::clone(helper));
+    /// The channel for `kind`, opening it if this is the first call.
+    ///
+    /// `config` is the credential's own `config` block. A helper ignores it —
+    /// it arrives again with every call — and an in-daemon minter is built
+    /// from it, exactly as [`Registry::build`] builds one at profile load.
+    ///
+    /// A kind nothing registered is looked for as a helper binary rather than
+    /// refused here, so the failure a caller sees is "no such helper", which
+    /// names the binary and everywhere it was looked for.
+    pub async fn get(
+        &self,
+        kind: &str,
+        config: &serde_yaml::Value,
+    ) -> Result<Arc<dyn MintChannel>, HelperFailure> {
+        let mut channels = self.channels.lock().await;
+        if let Some(channel) = channels.get(kind) {
+            return Ok(Arc::clone(channel));
         }
-        let helper = Arc::new(Helper::start(kind, &self.dirs)?);
-        helpers.insert(kind.to_string(), Arc::clone(&helper));
-        Ok(helper)
+        let channel: Arc<dyn MintChannel> = match self.registry.hosting(kind) {
+            Some(Hosting::Daemon) => Arc::new(crate::inproc::InDaemonMinter::build(
+                kind,
+                config,
+                &self.registry,
+            )?),
+            Some(Hosting::Helper) | None => Arc::new(Helper::start(kind, &self.dirs)?),
+        };
+        channels.insert(kind.to_string(), Arc::clone(&channel));
+        Ok(channel)
     }
 
-    /// Forget the helper for `kind` without stopping it.
+    /// Forget the channel for `kind` without stopping it.
     ///
     /// Used after a pipe failure: the process has already been killed, and the
     /// next call must build a fresh one rather than reuse a dead handle.
     pub async fn discard(&self, kind: &str) {
-        self.helpers.lock().await.remove(kind);
+        self.channels.lock().await.remove(kind);
     }
 
-    /// The kinds currently running.
+    /// The kinds currently open.
     pub async fn kinds(&self) -> Vec<String> {
-        self.helpers.lock().await.keys().cloned().collect()
+        self.channels.lock().await.keys().cloned().collect()
     }
 
-    /// Stop and forget every helper.
+    /// Stop and forget every channel.
     ///
     /// The take and the clear are one locked step. Taking the map out and then
     /// locking again to clear it leaves a window in which another task can
@@ -364,9 +418,9 @@ impl HelperSet {
     /// and, worse, a `get` racing the clear could insert a fresh helper that
     /// the clear then dropped on the floor, orphaning it with a master in it.
     pub async fn stop_all(&self) {
-        let taken = std::mem::take(&mut *self.helpers.lock().await);
-        for (_, helper) in taken {
-            helper.stop().await;
+        let taken = std::mem::take(&mut *self.channels.lock().await);
+        for (_, channel) in taken {
+            channel.stop().await;
         }
     }
 }
@@ -574,14 +628,14 @@ done"#,
             r#"while read -r line; do printf '{"jsonrpc":"2.0","id":1,"result":{"stopping":true}}\n'; done"#,
         );
 
-        let set = HelperSet::new(dirs);
-        let first = set.get("one").await.unwrap();
-        let again = set.get("one").await.unwrap();
+        let set = MinterSet::new(dirs);
+        let first = set.get("one", &serde_yaml::Value::Null).await.unwrap();
+        let again = set.get("one", &serde_yaml::Value::Null).await.unwrap();
         assert!(
             Arc::ptr_eq(&first, &again),
             "a second call must reuse the running process"
         );
-        set.get("two").await.unwrap();
+        set.get("two", &serde_yaml::Value::Null).await.unwrap();
         assert_eq!(set.kinds().await, vec!["one", "two"]);
 
         set.stop_all().await;
@@ -596,12 +650,38 @@ done"#,
             "one",
             r#"while read -r line; do printf '{"jsonrpc":"2.0","id":1,"result":{"stopping":true}}\n'; done"#,
         );
-        let set = HelperSet::new(dirs);
-        let first = set.get("one").await.unwrap();
+        let set = MinterSet::new(dirs);
+        let first = set.get("one", &serde_yaml::Value::Null).await.unwrap();
         set.discard("one").await;
-        let second = set.get("one").await.unwrap();
+        let second = set.get("one", &serde_yaml::Value::Null).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         set.stop_all().await;
         first.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_kind_registered_to_run_in_the_daemon_needs_no_binary_at_all() {
+        // No helper directories: if this were routed to a process it could
+        // only fail, which is exactly what makes the assertion meaningful.
+        let set = MinterSet::new(Vec::new());
+        let config = serde_yaml::from_str("principals: [ubuntu]\n").unwrap();
+        let channel = set
+            .get(briefcred_core::minters::ssh_cert::KIND, &config)
+            .await
+            .unwrap();
+        assert!(
+            format!("{channel:?}").contains("InDaemonMinter"),
+            "{channel:?}"
+        );
+        set.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_kind_nobody_registered_is_looked_for_as_a_binary() {
+        let err = MinterSet::new(vec![PathBuf::from("/nowhere")])
+            .get("not-a-registered-kind", &serde_yaml::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HelperFailure::NotFound { .. }), "{err}");
     }
 }

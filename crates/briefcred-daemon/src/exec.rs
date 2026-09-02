@@ -32,7 +32,7 @@ use briefcred_proto::{MintSummary, SecretString};
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
-use crate::helper::HelperSet;
+use crate::helper::MinterSet;
 use crate::revoke::PendingRevoke;
 
 /// What one `Exec` produced.
@@ -123,7 +123,7 @@ pub async fn mint(
     profile: &Profile,
     specs: &[&CredentialSpec],
     masters: &BTreeMap<String, Zeroizing<String>>,
-    helpers: &HelperSet,
+    helpers: &MinterSet,
     trust: &BTreeMap<String, String>,
     session_id: &str,
     argv0: &str,
@@ -210,7 +210,7 @@ async fn mint_one(
     profile: &Profile,
     spec: &CredentialSpec,
     master: &Zeroizing<String>,
-    helpers: &HelperSet,
+    helpers: &MinterSet,
 ) -> Result<
     (
         MintSummary,
@@ -222,7 +222,10 @@ async fn mint_one(
     let config = to_json(&spec.config)?;
     let mint_id = MintId::generate();
 
-    let helper = helpers.get(&spec.kind).await.map_err(|e| e.to_string())?;
+    let helper = helpers
+        .get(&spec.kind, &spec.config)
+        .await
+        .map_err(|e| e.to_string())?;
     let result = helper
         .call(HelperParams::Mint(MintParams {
             mint_id: mint_id.as_str().to_string(),
@@ -303,11 +306,18 @@ async fn mint_one(
 
 /// Ask a helper to revoke one entry.
 pub async fn revoke_one(
-    helpers: &HelperSet,
+    helpers: &MinterSet,
     entry: &PendingRevoke,
     master: &Zeroizing<String>,
 ) -> RevokeOutcome {
-    let helper = match helpers.get(&entry.kind).await {
+    // The queue persists a credential's config as JSON; a minter reads YAML,
+    // and an in-daemon one is built from it. Every JSON document is a YAML
+    // document, so a config that does not survive this was never valid.
+    let config = match serde_yaml::to_value(&entry.config) {
+        Ok(config) => config,
+        Err(err) => return RevokeOutcome::failed(err.to_string()),
+    };
+    let helper = match helpers.get(&entry.kind, &config).await {
         Ok(helper) => helper,
         Err(err) => return RevokeOutcome::failed(err.to_string()),
     };

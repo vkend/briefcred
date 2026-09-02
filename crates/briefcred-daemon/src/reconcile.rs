@@ -24,7 +24,7 @@ use briefcred_proto::SecretString;
 use time::OffsetDateTime;
 
 use crate::audit::AuditHandle;
-use crate::helper::HelperSet;
+use crate::helper::MinterSet;
 use crate::profiles::ProfileStore;
 
 /// How often the sweep runs when `daemon.toml` says nothing.
@@ -38,7 +38,7 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 /// carries on: a database that is down must not stop the others being cleaned.
 pub async fn sweep(
     profiles: &ProfileStore,
-    helpers: &HelperSet,
+    helpers: &MinterSet,
     masters: &dyn briefcred_core::MasterSource,
     audit: &AuditHandle,
 ) {
@@ -68,7 +68,7 @@ pub async fn sweep(
                 }
             };
 
-            let helper = match helpers.get(&spec.kind).await {
+            let helper = match helpers.get(&spec.kind, &spec.config).await {
                 Ok(helper) => helper,
                 Err(err) => {
                     eprintln!("briefcred-daemon: reconcile: {err}");
@@ -132,7 +132,7 @@ pub async fn sweep(
 /// Sweep at startup, then on every tick, until shutdown.
 pub async fn reconcile_loop(
     profiles: Arc<ProfileStore>,
-    helpers: Arc<HelperSet>,
+    helpers: Arc<MinterSet>,
     masters: Arc<dyn briefcred_core::MasterSource>,
     audit: AuditHandle,
     interval: Duration,
@@ -162,8 +162,8 @@ pub async fn reconcile_loop(
 /// A sweep must be able to run when no session is open — that is the normal
 /// case for the startup sweep after a crash — so it cannot borrow a session's
 /// helper set.
-pub fn helpers_for(dirs: Vec<std::path::PathBuf>) -> Arc<HelperSet> {
-    Arc::new(HelperSet::new(dirs))
+pub fn helpers_for(dirs: Vec<std::path::PathBuf>) -> Arc<MinterSet> {
+    Arc::new(MinterSet::new(dirs))
 }
 
 #[cfg(test)]
@@ -191,7 +191,7 @@ mod tests {
         // return rather than panic or block.
         sweep(
             &profiles,
-            &HelperSet::new(Vec::new()),
+            &MinterSet::new(Vec::new()),
             &MemorySource::default(),
             &audit,
         )
