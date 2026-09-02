@@ -116,6 +116,19 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// What one completed handoff moved, and to where.
+#[derive(Debug, Clone)]
+struct HandedOff {
+    /// The process now serving.
+    pid: u32,
+    /// The identifiers of the sessions the blob carried.
+    moved: std::collections::BTreeSet<String>,
+}
+
+/// What a client is told when it asks for something a handoff has closed off.
+pub const HANDING_OFF: &str =
+    "the daemon is handing off to a new one; retry, and the new daemon will answer";
+
 /// Everything a handler needs, shared across every connection.
 #[derive(Debug)]
 pub struct State {
@@ -141,7 +154,7 @@ pub struct State {
     keystore: Arc<dyn briefcred_core::keystore::KeyStore>,
     signer: Mutex<Option<Arc<crate::proxy::token::TokenSigner>>>,
     in_flight: InFlight,
-    handed_off: Mutex<Option<u32>>,
+    handed_off: Mutex<Option<HandedOff>>,
     handing_over: Arc<std::sync::atomic::AtomicBool>,
     drain: Duration,
     listener_fds: Vec<(crate::handoff::Slot, std::os::fd::RawFd)>,
@@ -271,19 +284,74 @@ impl State {
         Ok(signer)
     }
 
+    /// Claim the right to hand over, or report that somebody already has.
+    ///
+    /// A compare-exchange rather than a read and a write: two `Handoff`
+    /// requests can be accepted on two connections at the same instant, and
+    /// two daemons each sending their descriptors to a different successor
+    /// would leave four processes disagreeing about who owns the sockets.
+    /// Exactly one caller gets `true`.
+    pub fn begin_handoff(&self) -> bool {
+        self.handing_over
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Release the claim, for a handoff that did not happen.
+    pub fn end_handoff(&self) {
+        self.handing_over
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a handoff is under way, so nothing new may be minted.
+    ///
+    /// Between the moment the blob is built and the moment this daemon stops
+    /// accepting, the IPC listener is still answering. A session opened in that
+    /// window is in no blob and will be adopted by nobody, so a credential
+    /// minted against it would be one that no daemon has any record of and that
+    /// nothing would ever revoke. Refusing is the honest answer: the client
+    /// retries against the daemon that is about to own the socket.
+    pub fn handing_over(&self) -> bool {
+        self.handing_over.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Record that this daemon's listeners and sessions are now another's.
     ///
     /// Two things change once this is set, and both are about not undoing what
     /// the new daemon is relying on: the socket file is left alone rather than
-    /// unlinked, and the sessions are wiped without being retired — their
-    /// mints belong to the daemon still serving them.
-    pub fn handed_off_to(&self, pid: u32) {
-        *self.handed_off.lock().expect("handoff mutex") = Some(pid);
+    /// unlinked, and the sessions that *moved* are wiped without being retired
+    /// — their mints belong to the daemon still serving them. `moved` names
+    /// exactly those, so anything this daemon is still holding that the blob
+    /// did not carry is retired normally.
+    pub fn handed_off_to(&self, pid: u32, moved: std::collections::BTreeSet<String>) {
+        *self.handed_off.lock().expect("handoff mutex") = Some(HandedOff { pid, moved });
     }
 
     /// The pid this daemon handed everything to, if it did.
     pub fn handed_off(&self) -> Option<u32> {
-        *self.handed_off.lock().expect("handoff mutex")
+        self.handed_off
+            .lock()
+            .expect("handoff mutex")
+            .as_ref()
+            .map(|handed| handed.pid)
+    }
+
+    /// Whether `session_id` was one of the sessions the handoff carried.
+    ///
+    /// False for a session this daemon never handed anywhere, including one
+    /// opened in the window between the blob being built and the listener
+    /// closing — which is the case this exists for.
+    pub fn was_handed_over(&self, session_id: &str) -> bool {
+        self.handed_off
+            .lock()
+            .expect("handoff mutex")
+            .as_ref()
+            .is_some_and(|handed| handed.moved.contains(session_id))
     }
 
     /// The HTTP proxy's token authority, when the proxy is enabled.
@@ -527,6 +595,13 @@ async fn handle_open_session(request: Request, state: Arc<State>) -> Response {
     else {
         return mismatched(&request);
     };
+    // Nothing this daemon opens now would reach the blob, and no daemon would
+    // ever have a record of what it minted. See `State::handing_over`.
+    if state.handing_over() {
+        return Response::Error {
+            message: HANDING_OFF.to_string(),
+        };
+    }
     // A key the daemon cannot parse is refused rather than dropped: a client
     // that meant to bind its tokens and silently did not would believe it had
     // a guarantee it does not have.
@@ -706,6 +781,15 @@ async fn handle_exec(request: Request, state: Arc<State>) -> Response {
     else {
         return mismatched(&request);
     };
+
+    // Refused for the same reason `open_session` is, and it matters more here:
+    // an `exec` accepted in the window creates a principal on a real backend
+    // that neither daemon would hold a revoke for.
+    if state.handing_over() {
+        return Response::Error {
+            message: HANDING_OFF.to_string(),
+        };
+    }
 
     if let Err(err) = state.sessions.touch(&session_id).await {
         return Response::Error {
@@ -943,19 +1027,28 @@ async fn handle_handoff(request: Request, state: Arc<State>) -> Response {
         Ok(signer) => signer,
         Err(err) => return handoff_failed(&state, format!("{err}")),
     };
-    // Held off the queue file for the length of the attempt, and released again
-    // below if the handoff does not happen. The daemon taking over opens the
-    // same file while it starts.
-    state
-        .handing_over
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Claimed once. The flag holds the revoke queue off its file, refuses new
+    // sessions and mints, and — because it is taken with a compare-exchange —
+    // is also what makes a second concurrent `Handoff` a refusal rather than a
+    // second successor. It is released again below if the handoff fails.
+    if !state.begin_handoff() {
+        return Response::Error {
+            message: "a handoff is already in progress on this daemon".to_string(),
+        };
+    }
+
+    let moved: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
     let build_state = Arc::clone(&state);
+    let build_moved = Arc::clone(&moved);
     let handed = crate::handoff::hand_over(
         std::path::Path::new(&socket),
         &signer,
         async |sealer: &crate::handoff::Sealer| {
+            let sessions = build_state.sessions().export(sealer).await?;
+            *build_moved.lock().expect("moved mutex") =
+                sessions.iter().map(|s| s.id.clone()).collect();
             Ok(crate::handoff::Outgoing {
-                sessions: build_state.sessions().export(sealer).await?,
+                sessions,
                 revocations: build_state
                     .proxy()
                     .map(|proxy| proxy.export_revocations())
@@ -980,7 +1073,8 @@ async fn handle_handoff(request: Request, state: Arc<State>) -> Response {
         Err(err) => return handoff_failed(&state, err.to_string()),
     };
 
-    let sessions = state.sessions().len().await;
+    let moved = moved.lock().expect("moved mutex").clone();
+    let sessions = moved.len();
     state.metrics().record_handoff("handed_over");
     state.audit(&AuditEntry::DaemonHandoff {
         ts: OffsetDateTime::now_utc(),
@@ -989,7 +1083,7 @@ async fn handle_handoff(request: Request, state: Arc<State>) -> Response {
         sessions,
         outcome: "handed_over".to_string(),
     });
-    state.handed_off_to(to_pid);
+    state.handed_off_to(to_pid, moved);
     eprintln!("briefcred-daemon: handed {sessions} session(s) to pid {to_pid}; draining");
     state.request_shutdown("handoff");
     Response::HandoffComplete { to_pid, sessions }
@@ -1000,9 +1094,7 @@ async fn handle_handoff(request: Request, state: Arc<State>) -> Response {
 /// The daemon keeps running: it still owns the sockets, and an upgrade that
 /// could not be completed must leave the machine working rather than empty.
 fn handoff_failed(state: &Arc<State>, message: String) -> Response {
-    state
-        .handing_over
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+    state.end_handoff();
     state.metrics().record_handoff("failed");
     state.audit(&AuditEntry::DaemonHandoff {
         ts: OffsetDateTime::now_utc(),
@@ -1400,6 +1492,92 @@ mod tests {
             listener_fds: Vec::new(),
         }));
         (home, state, prompts)
+    }
+
+    #[tokio::test]
+    async fn only_the_first_caller_claims_a_handoff() {
+        let (_home, state, _prompts) = test_state(GUARDED).await;
+
+        assert!(state.begin_handoff(), "the first caller claims it");
+        assert!(!state.begin_handoff(), "the second is refused");
+        assert!(state.handing_over());
+
+        // A handoff that failed releases the claim, so a retry can be made
+        // against a daemon that is still perfectly capable of handing over.
+        state.end_handoff();
+        assert!(!state.handing_over());
+        assert!(state.begin_handoff());
+    }
+
+    #[tokio::test]
+    async fn a_handoff_refuses_new_sessions_and_new_mints() {
+        let (_home, state, _prompts) = test_state("name: dev\nunlock:\n  policy: none\n").await;
+
+        let opened = handle_open_session(
+            Request::OpenSession {
+                profile: "dev".into(),
+                client_headless: true,
+                session_pubkey: None,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        let Response::SessionOpened { session_id, .. } = opened else {
+            panic!("the session should have opened: {opened:?}");
+        };
+
+        assert!(state.begin_handoff());
+
+        // Nothing opened now would reach the blob, so it is refused rather
+        // than handed masters no daemon will account for.
+        let refused = handle_open_session(
+            Request::OpenSession {
+                profile: "dev".into(),
+                client_headless: true,
+                session_pubkey: None,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Response::Error { message } if message.contains("handing off")),
+            "{refused:?}"
+        );
+
+        // And an `exec` against the session that *is* in the blob is refused
+        // too: the mint would happen on this daemon and be recorded on neither.
+        let refused = handle_exec(
+            Request::Exec {
+                session_id,
+                credentials: None,
+                argv0: "curl".into(),
+                args: Vec::new(),
+                pid: 1,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Response::Error { message } if message.contains("handing off")),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_sessions_the_blob_carried_count_as_handed_over() {
+        // The discrimination the shutdown path turns into "release" or
+        // "retire". A session the handoff did not carry was adopted by nobody,
+        // so its mints are orphaned exactly as on an ordinary shutdown.
+        let (_home, state, _prompts) = test_state(GUARDED).await;
+        assert!(!state.was_handed_over("moved"), "before any handoff");
+
+        state.handed_off_to(99, std::collections::BTreeSet::from(["moved".to_string()]));
+        assert_eq!(state.handed_off(), Some(99));
+        assert!(state.was_handed_over("moved"));
+        assert!(
+            !state.was_handed_over("opened-in-the-window"),
+            "a session the blob never carried was not handed anywhere"
+        );
     }
 
     const GUARDED: &str = "name: dev\ncredentials:\n  - name: db\n    kind: postgres-dynamic\n    config:\n      host: 127.0.0.1\n      dbname: app\n      user: m\n      sslmode: disable\n      role_template: {}\n";

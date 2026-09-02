@@ -589,6 +589,13 @@ impl McpServer {
             };
         }
 
+        // Refused during a handoff for the same reason `open_session` and
+        // `exec` are: a session opened now reaches no blob, so a credential
+        // minted against it would be one no daemon holds a revoke for.
+        if self.inner.state.handing_over() {
+            return Err(invalid(crate::server::HANDING_OFF.to_string()));
+        }
+
         // The unlock gate first, then the masters, then the mint: the same
         // order `open_session` uses, so a refused prompt leaves nothing behind.
         // `client_headless` is false because the peer is a `briefcred mcp` on

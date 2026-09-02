@@ -140,6 +140,7 @@ pub async fn run_with(startup: Startup) -> Result<()> {
                 "briefcred-daemon: waiting to take over on {}",
                 socket.display()
             );
+            takeover_delay().await;
             let signer = crate::proxy::token::TokenSigner::load_or_create(keystore.as_ref())?;
             let mut accepted = takeover.accept(&signer).await?;
             // A descriptor from a handoff wins over one from socket
@@ -500,25 +501,25 @@ pub async fn run_with(startup: Startup) -> Result<()> {
     // rows come first, because after `close_all` there is nothing left to
     // name — and a session that vanished without a row is a session an
     // investigator cannot account for.
-    let reason = if handed_off.is_some() {
-        "handoff"
-    } else {
-        "shutdown"
-    };
     for session in sessions.close_all().await {
+        // Per session, not per daemon. A session the blob carried was *moved*:
+        // the daemon that took it over holds its mints, and queueing their
+        // revokes here would kill credentials it is still serving. A session
+        // this daemon is holding that the blob did not carry was not moved —
+        // nobody adopted it, and its mints are orphaned exactly as they would
+        // be on an ordinary shutdown.
+        let moved = state.was_handed_over(&session.id);
+        let reason = if moved { "handoff" } else { "shutdown" };
         state.audit(&AuditEntry::SessionClose {
             ts: OffsetDateTime::now_utc(),
             session_id: session.id.clone(),
             profile: session.profile.clone(),
             reason: reason.to_string(),
         });
-        // After a handoff the mints are not orphaned: the daemon that took the
-        // session over is holding them, and queueing their revokes here would
-        // kill credentials it is still serving.
-        if handed_off.is_some() {
+        if moved {
             server::release(session).await;
         } else {
-            server::retire(&state, session, "shutdown").await;
+            server::retire(&state, session, reason).await;
         }
     }
 
@@ -532,6 +533,23 @@ pub async fn run_with(startup: Startup) -> Result<()> {
     // shutdown looks exactly like a crash to whoever reads the log.
     state.audit_flush().await;
     Ok(())
+}
+
+/// Widen the handoff window, for a test that needs to act inside it.
+///
+/// The socket is already bound, so the daemon being replaced connects and then
+/// waits here for the hello — which is exactly the interval in which it is
+/// still accepting IPC and its blob does not yet exist. Nothing outside a test
+/// sets the variable, and a daemon that ignores it behaves as it always did.
+async fn takeover_delay() {
+    let Some(millis) = std::env::var("BRIEFCRED_TEST_TAKEOVER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    eprintln!("briefcred-daemon: BRIEFCRED_TEST_TAKEOVER_DELAY_MS is set; waiting {millis} ms");
+    tokio::time::sleep(Duration::from_millis(millis)).await;
 }
 
 /// Turn an adopted descriptor into a listening TCP socket.
