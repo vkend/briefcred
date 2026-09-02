@@ -8,6 +8,51 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **Per-session quotas**, and with them Phase 5 of the roadmap. A profile may
+  set `quota: { rate, burst, total }` — a token bucket, in tokens per second,
+  where `rate` may be fractional and `total` is an optional hard cap for the
+  whole session. One token is spent per HTTP proxy request, per Postgres proxy
+  connection, and per `briefcred exec` or `briefcred get` that mints. The bucket
+  is built when the session opens and dies with it, so two concurrent runs of
+  one profile get a budget each rather than competing for one, and nothing
+  survives a daemon restart. `rate` must be positive and `burst` at least 1, and
+  both are checked when the profile is loaded.
+- **What a throttled client is told.** The HTTP proxy answers `429` with
+  `{"error":"briefcred quota exceeded"}` and a `Retry-After` header, and audits
+  the request as `decision: "quota"`. The Postgres proxy refuses the connection
+  with SQLSTATE `53300` (`too_many_connections`) *before* it opens an upstream
+  one, so the database never sees a login the client did not get.
+  `briefcred exec` fails with an error naming the profile. A spent `total` gets
+  no `Retry-After`, because no wait would help.
+- **The quota is charged before the policy is evaluated**, so a request the
+  policy denies still costs a token. The expensive thing to defend against is a
+  loop, and a loop that is being denied is still a loop — one that would
+  otherwise get an unmetered retry channel precisely because it is doing
+  something the profile forbids.
+- **Two metrics series**: `briefcred_quota_saturation{profile}`, a gauge from 0
+  for an untouched bucket to 1 for an empty one, updated on every charge and
+  pinned at exactly 1 by a refusal so `== 1` is an alert expression that works;
+  and `briefcred_quota_rejections_total{profile,surface}` with `surface` one of
+  `http`, `postgres`, `exec`. The gauge is deliberately unseeded: a series that
+  exists is a profile somebody metered.
+- **A Cedar request context.** `Http` requests now carry
+  `context: { hour, weekday, resp_bytes_so_far, requests_so_far }`, all `Long`.
+  `hour` and `weekday` are UTC and cannot be configured otherwise; both counters
+  report what the session did *before* the request being decided, so
+  `context.requests_so_far < 100` permits exactly a hundred. This is what lets a
+  policy express a time window or a per-session budget, which a vocabulary of
+  method, host and path cannot. A policy naming an attribute the context lacks
+  is still rejected when the profile loads.
+- **`docs/policy-cookbook.md`**: five worked policies — method × path, a time
+  window, a per-session cap, a byte budget, and combining a policy with a quota
+  — with a section on telling a policy limit from a quota. Every Cedar block in
+  it appears verbatim in a profile under `examples/profiles/`, and a test fails
+  if one drifts.
+- **Four example profiles carrying those recipes**: `anthropic.yaml`,
+  `github.yaml` and `stripe.yaml` are new, and `openai.yaml` was rewritten to
+  match. Every example is loaded, validated, and its policy compiled against the
+  Cedar schema by `crates/briefcred-core/tests/example_profiles.rs`.
+
 - **The Postgres connection-auth proxy** (`briefcred-daemon::pgproxy`), and with
   it Phase 10 of the roadmap. A listener on `127.0.0.1:9319` speaks the
   PostgreSQL v3 protocol to the wrapped subprocess, authenticates it with a

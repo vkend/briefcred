@@ -108,7 +108,7 @@ two things every crate has to agree on.
 | `keystore` | The `KeyStore` trait, the macOS keychain backend, and the file backend. |
 | `ca` | The root CA, leaf issuance, and the runtime trust environment. |
 | `exec` | The two pure decisions behind `briefcred exec`: is the command allowed, and what environment does it get. |
-| `policy` | The fixed Cedar schema, the compiled form of a profile's `policy`, and the enforce/observe split. |
+| `policy` | The fixed Cedar schema, the request context, the compiled form of a profile's `policy`, and the enforce/observe split. |
 
 `minters::http` and `minters::postgres_proxy` are the two modules that register
 a schema and no minter at all: both are `Hosting::Proxy`, meaning the "mint" is
@@ -358,6 +358,15 @@ only credential the vendor accepts. So the proxy is the mechanism, and the
 | `listener` | The loop that puts all of it in order. |
 | `revocation` | The `(session, credential)` pairs no longer honoured. |
 
+Alongside it, `briefcred-daemon::quota` answers the question the policy cannot:
+*how much*. One token bucket per open session, built from the profile's
+`quota:` when the session opens and dropped with it, charged by all three
+surfaces that spend a credential — the HTTP proxy per request, the Postgres
+proxy per connection, and `exec` per run that mints. Per session rather than
+per profile, so two concurrent runs get a budget each; and never persisted,
+because a quota bounds one session's blast radius and a session does not
+survive a restart.
+
 ### One request, in order
 
 ```
@@ -375,8 +384,9 @@ only credential the vendor accepts. So the proxy is the mechanism, and the
       |                 | 1. verify signature, expiry |
       |                 | 2. revoked?                 |
       |                 | 3. DPoP proof, if present   |
-      |                 | 4. Cedar: allow / deny      |
-      |                 | 5. swap in the real key     |
+      |                 | 4. quota: one token         |
+      |                 | 5. Cedar: allow / deny      |
+      |                 | 6. swap in the real key     |
       |                 |  TLS (system trust store)   |
       |                 |<===========================>|
       |                 |  GET /v1/models             |
@@ -384,7 +394,7 @@ only credential the vendor accepts. So the proxy is the mechanism, and the
       |                 |---------------------------->|
       |  streamed response body, counted as it passes |
       |<----------------|<----------------------------|
-      |                 | 6. ProxyRequest audit row   |
+      |                 | 7. ProxyRequest audit row   |
 ```
 
 The order is the design. The signature is checked before the payload is parsed,
@@ -393,6 +403,21 @@ so a refused request never has a credential attached to it. And the audit row
 is written when the response body *ends*, because that is when the byte counts
 are known — streaming a gigabyte and reporting zero would make them worse than
 useless.
+
+The quota is charged *before* the policy, which is the one step whose position
+looks wrong and is not. A request the policy denies still spends a token: the
+expensive thing to defend against is a loop, and a loop being denied is still a
+loop — one that would otherwise get an unmetered retry channel precisely
+because it is doing something forbidden. A throttled request is answered `429`
+with a `Retry-After` and audited as `decision: "quota"`, kept distinct from
+`deny` because widening a policy does not fix a quota and raising a quota does
+not fix a denial.
+
+Step 5 also carries a `context` the policy can match on: `hour` and `weekday`
+in UTC, and the session's own `requests_so_far` and `resp_bytes_so_far`, both
+counting what happened *before* this request. That is what lets a policy
+express a time window or a per-session budget, which a per-request vocabulary
+of method, host and path cannot.
 
 ### What never happens
 
@@ -541,6 +566,13 @@ method, host, path — and a connection has none of those. What bounds a
 `postgres-proxy` credential is the upstream role's own privileges, the
 credential's `ttl_secs`, and the session it is bound to. `THREAT_MODEL.md` says
 so plainly rather than leaving it to be discovered.
+
+The profile's `quota` *is* applied, one token per connection, charged before
+the upstream connect so that a refusal never leaves a real connection open
+behind it. A throttled client gets an `ErrorResponse` under SQLSTATE `53300`
+(`too_many_connections`) rather than the `28000` every other refusal uses,
+because the credential is not the problem and a driver that treated it as one
+would stop retrying when retrying is exactly right.
 
 ### One issuer, two proxies
 

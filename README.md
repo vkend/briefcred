@@ -223,6 +223,8 @@ currently being written, and ignores any filename it did not write.
 | `briefcred_proxy_latency_seconds{kind}` | histogram | Time for one proxied request, by policy decision |
 | `briefcred_pgproxy_connections_total{outcome}` | counter | Postgres connections, by outcome |
 | `briefcred_pgproxy_bytes_total{direction}` | counter | Bytes relayed by the Postgres proxy, by direction |
+| `briefcred_quota_saturation{profile}` | gauge | How full a profile's session quota is, 0 to 1, where 1 is empty |
+| `briefcred_quota_rejections_total{profile,surface}` | counter | Charges a quota refused, by profile and by `http`/`postgres`/`exec` |
 
 The two histograms time failures as well as successes: a backend that takes
 thirty seconds to refuse is exactly what they exist to show. A rising
@@ -230,7 +232,11 @@ thirty seconds to refuse is exactly what they exist to show. A rising
 keeps failing is a credential that is still live.
 
 Every request series is seeded at zero, so a counter that has never fired is
-distinguishable from a scrape that failed.
+distinguishable from a scrape that failed. `briefcred_quota_saturation` is the
+exception and is deliberately unseeded: a series that exists is a profile
+somebody put a `quota:` on, and one that does not is a profile running
+unmetered. A refused charge pins it at exactly 1, so `== 1` is an alert
+expression that works.
 
 ## Running a command
 
@@ -422,7 +428,39 @@ proxy: auto                # auto (default) | always
 
 `policy` is compiled and validated against briefcred's fixed Cedar schema when
 the profile is loaded, so a typo is an error next to the file rather than a
-request that is quietly denied later. `docs/policy.md` is the guide.
+request that is quietly denied later. `docs/policy.md` is the guide, and
+`docs/policy-cookbook.md` has five worked policies that each ship as a profile
+under `examples/profiles/`.
+
+One more key bounds *how much* a session may do, which no policy can express:
+
+```yaml
+quota:
+  rate: 2                  # tokens per second, sustained; may be fractional
+  burst: 20                # tokens the bucket holds, and how many at once
+  total: 400               # optional hard cap for the whole session
+```
+
+One token is spent per HTTP proxy request, per Postgres proxy connection, and
+per `briefcred exec` or `briefcred get` that mints. The bucket is created when
+the session opens and dies with it, so two concurrent runs of the same profile
+get a budget each rather than competing for one; nothing is persisted across a
+daemon restart.
+
+When the bucket is empty the HTTP proxy answers `429` with
+`{"error":"briefcred quota exceeded"}` and a `Retry-After` header, the Postgres
+proxy refuses the connection with SQLSTATE `53300` (`too_many_connections`)
+before it opens an upstream one, and `briefcred exec` fails with an error naming
+the profile. A spent `total` gets no `Retry-After`, because no wait would help:
+close the session and open a new one.
+
+Two things about the charge are worth knowing. It happens **before** the policy
+is evaluated, so a request the policy denies still costs a token — the expensive
+thing to defend against is a loop, and a loop that is being denied is still a
+loop. And a policy refusal and a quota refusal are deliberately
+distinguishable: `403` against `429`, `decision: "deny"` against
+`decision: "quota"` in the audit log. Widening the policy will not fix a quota
+rejection, and raising the quota will not fix a denial.
 
 Unknown keys are errors at every level, so a typo cannot silently switch a
 control off. `${minted.<credential>.<field>}` must name a credential the
@@ -649,6 +687,11 @@ privileges, the credential's `ttl_secs`, and the session it is tied to. Where
 `postgres-dynamic` is possible it is still the better answer, because a minted
 role can be granted less than the master has.
 
+What *does* apply is the profile's `quota`: one token per connection, charged
+before the upstream connect, so a client opening connections faster than the
+profile budgeted for is refused with SQLSTATE `53300` and the database never
+sees a login the client did not get.
+
 ## The AWS STS minter
 
 Assumes a role and returns the session as `AWS_ACCESS_KEY_ID`,
@@ -762,13 +805,16 @@ briefcred's proxy on this machine.
    `briefcred exec` set the CA-bundle variables (see **Trust environment**).
 3. The proxy reads the inner HTTP/1.1 request and finds the synthetic token.
    It checks the signature, the expiry, and whether the grant has been revoked.
-4. It asks the profile's Cedar policy whether this session may make this
-   request. Default deny; see `docs/policy.md`.
-5. It replaces the token with the real credential, rendered for the kind, and
+4. It takes one token off the session's quota bucket, if the profile set one.
+   Before the policy, so a denied request is still counted.
+5. It asks the profile's Cedar policy whether this session may make this
+   request, passing the session's own totals and the clock as `context`.
+   Default deny; see `docs/policy.md` and `docs/policy-cookbook.md`.
+6. It replaces the token with the real credential, rendered for the kind, and
    forwards the request over its own TLS connection to the real vendor —
    verified against the system trust store, with no way to weaken that.
-6. Bodies stream through in both directions. Nothing is buffered whole.
-7. One `ProxyRequest` audit row is written when the response ends: method,
+7. Bodies stream through in both directions. Nothing is buffered whole.
+8. One `ProxyRequest` audit row is written when the response ends: method,
    host, path, status, byte counts, latency, decision. No headers, no body,
    and no query string.
 
@@ -783,6 +829,7 @@ policy outcomes:
 | `allow` | permitted and forwarded | the upstream's |
 | `deny` | the policy refused it, or the token did not authorise | absent |
 | `would_deny` | the policy refused it and the profile is observing | the upstream's |
+| `quota` | the session's budget was spent; the policy was never asked | absent |
 | `swap_error` | the policy allowed it; the credential would not go in | absent |
 | `upstream_error` | the policy allowed it; the upstream was unreachable | absent |
 

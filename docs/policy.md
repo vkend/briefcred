@@ -11,13 +11,14 @@ you can reach by omission.
 
 ## The schema
 
-Three things go into the decision, and nothing else.
+Four things go into the decision, and nothing else.
 
 | Cedar | briefcred |
 | --- | --- |
 | `principal` | `Session::"<session id>"` — one `briefcred exec`, one identity |
 | `action` | `Action::"GET"`, `"POST"`, `"PUT"`, `"PATCH"`, `"DELETE"`, `"HEAD"`, `"OPTIONS"` |
 | `resource` | `Http::"<host><path>"`, with attributes `host`, `path`, `scheme` |
+| `context` | what the session has already done, and what time it is |
 
 The seven methods are grouped under `Action::"http"`, so `action in
 [Action::"http"]` permits any of them without listing them. A method that is
@@ -38,9 +39,42 @@ action http;
 action GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS in [http]
   appliesTo {
     principal: [Session],
-    resource: [Http]
+    resource: [Http],
+    context: {
+      hour: Long,
+      weekday: Long,
+      resp_bytes_so_far: Long,
+      requests_so_far: Long,
+    }
   };
 ```
+
+### The context
+
+`resource` says what is being asked for; `context` says whether the session is
+still in a position to be asking.
+
+| attribute | what it is |
+| --- | --- |
+| `context.hour` | hour of day, 0 to 23, **UTC** |
+| `context.weekday` | 0 for Monday through 6 for Sunday, **UTC** |
+| `context.requests_so_far` | proxied requests this session made *before* this one |
+| `context.resp_bytes_so_far` | response bytes this session was sent before this one |
+
+Both counters are "before", not "including". The first request of a session
+sees `requests_so_far == 0`, so `context.requests_so_far < 100` permits exactly
+a hundred requests. `resp_bytes_so_far` has to work that way: a response's size
+is not known until it has been sent, so a budget can only ever be checked
+against what the session has already had, and a single large response can
+therefore overshoot by its own size.
+
+The clock is UTC and cannot be changed. A policy meaning "business hours" that
+read whatever timezone the daemon happened to start in would be a policy that
+silently changed meaning when the laptop crossed a border. Shift the numbers
+yourself.
+
+`docs/policy-cookbook.md` has worked examples of all four, each one shipped as
+a profile under `examples/profiles/`.
 
 ### What is deliberately absent
 
@@ -167,8 +201,9 @@ request that is quietly denied later. Two things are caught:
 - Cedar that does not parse. `permit(principal` fails with the parser's own
   complaint.
 - Cedar that parses but does not fit the schema. `resource.query == "x"` fails
-  because the schema has no `query` attribute, and `principal == User::"bob"`
-  fails because the schema has no `User` entity type. Both would otherwise be
+  because the schema has no `query` attribute, `context.minute == 0` fails
+  because the context has no `minute`, and `principal == User::"bob"` fails
+  because the schema has no `User` entity type. All three would otherwise be
   clauses that can never match, which is far worse than an error.
 
 If a policy stops compiling underneath a running daemon — the file was edited
@@ -186,7 +221,7 @@ Every request through the proxy writes one audit row, whatever happened to it:
  "req_bytes":0,"resp_bytes":8241,"latency_ms":312,"decision":"allow"}
 ```
 
-`decision` is one of five labels, which also appear on
+`decision` is one of six labels, which also appear on
 `briefcred_proxy_requests_total{decision,status_class}`:
 
 | `decision` | what it tells you |
@@ -194,14 +229,21 @@ Every request through the proxy writes one audit row, whatever happened to it:
 | `allow` | the policy permitted it |
 | `deny` | the policy refused it, or the token did not authorise |
 | `would_deny` | the policy refused it and `policy_mode` is `observe` |
+| `quota` | the session's `quota` was spent; the policy was never asked |
 | `swap_error` | the policy allowed it; briefcred could not attach the credential |
 | `upstream_error` | the policy allowed it; the upstream was unreachable |
 
-The last two are deliberately **not** `deny`. They are the cases where your
-policy was right and something else went wrong, so a rising `deny` count means
+The last three are deliberately **not** `deny`. They are the cases where your
+policy was right and something else happened, so a rising `deny` count means
 a policy that is too narrow, a rising `would_deny` count means a profile
-somebody forgot to promote to `enforce`, and a rising `swap_error` or
+somebody forgot to promote to `enforce`, a rising `quota` count means an agent
+doing too much of something it is allowed to do, and a rising `swap_error` or
 `upstream_error` count means nobody needs to touch the policy at all.
+
+A policy limit and a quota are told apart on the wire too: a policy refusal is
+a bodiless `403`, and a quota refusal is a `429` carrying
+`{"error":"briefcred quota exceeded"}` and, where waiting would help, a
+`Retry-After`. See **Combining with a quota** in `docs/policy-cookbook.md`.
 
 `status` is the upstream's own code, and is absent on every row that never
 reached an upstream.
