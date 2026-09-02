@@ -34,6 +34,26 @@ pub fn binary_dir() -> PathBuf {
         .to_path_buf()
 }
 
+/// Every `briefcred-helper-*` binary the daemon shells out to.
+///
+/// Spelled out rather than globbed for a directory whose contents are the
+/// thing in doubt: a glob over a target directory with no helpers in it finds
+/// nothing and reports nothing missing, which is exactly the case this list
+/// exists to catch. A helper added to the workspace and not added here is
+/// caught by [`every_helper_binary_in_the_workspace_is_listed`].
+const HELPERS: [&str; 2] = [
+    "briefcred-helper-postgres-dynamic",
+    "briefcred-helper-aws-sts",
+];
+
+/// Which of [`HELPERS`] are absent from `binaries`.
+pub fn missing_helpers(binaries: &Path) -> Vec<&'static str> {
+    HELPERS
+        .into_iter()
+        .filter(|name| !binaries.join(name).is_file())
+        .collect()
+}
+
 /// A running daemon and the temporary home it owns.
 ///
 /// Dropping it kills the daemon and removes the home, so a failing test leaves
@@ -194,10 +214,7 @@ impl Daemon {
     /// `is_file` and turns half an hour into a sentence. `just test` builds the
     /// workspace first and never reaches this.
     fn check_helpers(&self) -> Result<(), String> {
-        let missing: Vec<&str> = ["briefcred-helper-postgres-dynamic"]
-            .into_iter()
-            .filter(|name| !self.binaries.join(name).is_file())
-            .collect();
+        let missing = missing_helpers(&self.binaries);
         if missing.is_empty() {
             return Ok(());
         }
@@ -362,4 +379,69 @@ where
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The workspace root, two levels above this crate's manifest.
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/<crate>")
+            .to_path_buf()
+    }
+
+    #[test]
+    fn a_directory_with_no_helpers_in_it_is_reported_as_missing_all_of_them() {
+        let empty = TempDir::new().expect("temp dir");
+        assert_eq!(missing_helpers(empty.path()), HELPERS.to_vec());
+    }
+
+    #[test]
+    fn a_helper_that_is_present_is_not_reported() {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join(HELPERS[0]), b"").expect("write");
+        assert_eq!(missing_helpers(dir.path()), vec![HELPERS[1]]);
+    }
+
+    /// The check is only worth having if it covers every helper.
+    ///
+    /// A new `briefcred-helper-*` crate that nobody adds to [`HELPERS`] would
+    /// reintroduce exactly the failure the check exists to prevent, silently,
+    /// for the one helper that is newest and least understood. Reading the
+    /// binary names out of the manifests is what makes forgetting impossible.
+    #[test]
+    fn every_helper_binary_in_the_workspace_is_listed() {
+        let mut found: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(workspace_root().join("crates")).expect("crates dir") {
+            let manifest = entry.expect("dir entry").path().join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&manifest) else {
+                continue;
+            };
+            let parsed: toml::Value =
+                toml::from_str(&text).expect("a crate manifest is valid TOML");
+            let Some(bins) = parsed.get("bin").and_then(|b| b.as_array()) else {
+                continue;
+            };
+            for bin in bins {
+                let name = bin
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .expect("a bin name");
+                if name.starts_with("briefcred-helper-") {
+                    found.push(name.to_string());
+                }
+            }
+        }
+        found.sort();
+        let mut listed: Vec<String> = HELPERS.iter().map(|h| h.to_string()).collect();
+        listed.sort();
+        assert_eq!(
+            found, listed,
+            "the workspace's helper binaries and daemon_harness::HELPERS disagree"
+        );
+    }
 }
