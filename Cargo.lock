@@ -244,6 +244,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "mach2",
  "notify",
  "objc2",
  "objc2-core-foundation",
@@ -251,6 +252,8 @@ dependencies = [
  "objc2-local-authentication",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror",
  "time",
@@ -945,6 +948,15 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "mach2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "md-5"

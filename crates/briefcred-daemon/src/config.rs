@@ -20,12 +20,27 @@ pub const DEFAULT_RETENTION_DAYS: u32 = 90;
 /// The Prometheus port used when the file says nothing.
 pub const DEFAULT_METRICS_PORT: u16 = 9317;
 
+/// How often the reconciler sweeps when the file says nothing.
+pub const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = crate::reconcile::DEFAULT_INTERVAL_SECS;
+
 /// How long a session may sit unused before the daemon wipes it.
 ///
 /// Thirty minutes: long enough to survive a lunch break mid-task, short enough
 /// that a laptop left open overnight is not still holding a database
 /// superuser password in the morning.
 pub const DEFAULT_SESSION_IDLE_SECS: u64 = 1800;
+
+/// The `[audit]` table of `daemon.toml`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuditConfig {
+    /// Record command arguments verbatim alongside their digests.
+    ///
+    /// Off by default, and the one setting that puts text a user typed into
+    /// the audit log. An operator who needs to see the actual SQL an agent ran
+    /// turns it on knowingly and accepts that the log is now sensitive.
+    pub raw_args: bool,
+}
 
 /// The daemon's resolved configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -42,6 +57,13 @@ pub struct Config {
     pub metrics_enabled: bool,
     /// Seconds a session may go untouched before it is evicted and wiped.
     pub session_idle_secs: u64,
+    /// Seconds between reconciliation sweeps.
+    ///
+    /// The sweep also runs once at startup, which is the tick that matters:
+    /// it is what cleans up after a `SIGKILL`.
+    pub reconcile_interval_secs: u64,
+    /// What the audit log records beyond the defaults.
+    pub audit: AuditConfig,
     /// Where master credentials are read from.
     ///
     /// Absent means the platform default: the login keychain on macOS, files
@@ -63,6 +85,8 @@ impl Default for Config {
             metrics_port: DEFAULT_METRICS_PORT,
             metrics_enabled: true,
             session_idle_secs: DEFAULT_SESSION_IDLE_SECS,
+            reconcile_interval_secs: DEFAULT_RECONCILE_INTERVAL_SECS,
+            audit: AuditConfig::default(),
             master_source: None,
             ca: CaConfig::default(),
         }
@@ -103,7 +127,21 @@ impl Config {
                     .to_string(),
             );
         }
+        // Zero would make the reconciler a busy loop against every backend a
+        // profile names, which is a denial of service on the user's own
+        // databases rather than a policy choice.
+        if config.reconcile_interval_secs == 0 {
+            return Err(
+                "reconcile_interval_secs must be at least 1; 0 would sweep continuously"
+                    .to_string(),
+            );
+        }
         Ok(config)
+    }
+
+    /// The reconcile interval as a [`Duration`].
+    pub fn reconcile_interval(&self) -> Duration {
+        Duration::from_secs(self.reconcile_interval_secs)
     }
 
     /// The idle window as a [`Duration`].
@@ -131,6 +169,28 @@ mod tests {
         assert_eq!(config.session_idle_secs, 1800);
         assert_eq!(config.session_idle(), Duration::from_secs(1800));
         assert_eq!(config.master_source, None);
+        assert_eq!(config.reconcile_interval_secs, 300);
+        assert_eq!(config.reconcile_interval(), Duration::from_secs(300));
+        assert!(!config.audit.raw_args, "raw args must be opted into");
+    }
+
+    #[test]
+    fn raw_args_are_opt_in_through_their_own_table() {
+        let config = Config::from_toml_str("[audit]\nraw_args = true\n").unwrap();
+        assert!(config.audit.raw_args);
+        assert!(Config::from_toml_str("[audit]\nraw_argz = true\n").is_err());
+    }
+
+    #[test]
+    fn a_zero_reconcile_interval_is_rejected_rather_than_becoming_a_busy_loop() {
+        let err = Config::from_toml_str("reconcile_interval_secs = 0").unwrap_err();
+        assert!(err.contains("reconcile_interval_secs"), "{err}");
+        assert_eq!(
+            Config::from_toml_str("reconcile_interval_secs = 30")
+                .unwrap()
+                .reconcile_interval(),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

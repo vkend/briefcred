@@ -1,11 +1,13 @@
 //! The IPC listener, the dispatch table, and graceful shutdown.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use briefcred_core::audit::AuditEntry;
+use briefcred_core::paths::Paths;
+use briefcred_core::types::MintId;
 use briefcred_core::MasterSource;
 use briefcred_proto::{
     read_frame, write_frame, CredentialSummary, ProfileSummary, Request, Response,
@@ -13,11 +15,12 @@ use briefcred_proto::{
 use time::OffsetDateTime;
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::audit::AuditLog;
+use crate::audit::AuditHandle;
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 use crate::profiles::ProfileStore;
-use crate::session::{SessionError, SessionStore};
+use crate::revoke::RevokeQueue;
+use crate::session::{Session, SessionError, SessionStore};
 use crate::unlock::{UnlockCache, UnlockGate};
 
 /// How long in-flight connections get to finish once shutdown begins.
@@ -53,7 +56,7 @@ macro_rules! handler {
 pub struct State {
     started_at: OffsetDateTime,
     metrics: Arc<Metrics>,
-    audit: Mutex<AuditLog>,
+    audit: AuditHandle,
     metrics_addr: Option<String>,
     shutdown: tokio::sync::watch::Sender<bool>,
     shutdown_reason: Mutex<&'static str>,
@@ -62,35 +65,91 @@ pub struct State {
     unlock: Arc<dyn UnlockGate>,
     unlock_cache: UnlockCache,
     master_source: Arc<dyn MasterSource>,
+    paths: Arc<Paths>,
+    helper_dirs: Vec<PathBuf>,
+    revokes: Arc<RevokeQueue>,
+    raw_args: bool,
+}
+
+/// Everything [`State::new`] needs, as a struct.
+///
+/// A struct rather than eleven positional parameters: the daemon's shared
+/// state has grown a field per phase, and a call site of eleven `Arc`s is one
+/// where two of them get swapped and nothing catches it.
+pub struct StateParts {
+    /// The audit writer's handle.
+    pub audit: AuditHandle,
+    /// The metrics registry.
+    pub metrics: Arc<Metrics>,
+    /// Where the Prometheus endpoint is listening, if it is.
+    pub metrics_addr: Option<String>,
+    /// The shutdown signal's sending half.
+    pub shutdown: tokio::sync::watch::Sender<bool>,
+    /// The loaded profiles.
+    pub profiles: Arc<ProfileStore>,
+    /// The open sessions.
+    pub sessions: Arc<SessionStore>,
+    /// The presence gate.
+    pub unlock: Arc<dyn UnlockGate>,
+    /// The per-profile unlock cache.
+    pub unlock_cache: UnlockCache,
+    /// Where masters come from.
+    pub master_source: Arc<dyn MasterSource>,
+    /// The on-disk layout, for the trust environment.
+    pub paths: Arc<Paths>,
+    /// Where helper binaries are looked for.
+    pub helper_dirs: Vec<PathBuf>,
+    /// The persistent revoke queue.
+    pub revokes: Arc<RevokeQueue>,
+    /// Whether `ExecStart` rows carry raw arguments as well as digests.
+    pub raw_args: bool,
 }
 
 impl State {
-    /// Assemble the shared state. Takes ownership of the audit log.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        audit: AuditLog,
-        metrics: Arc<Metrics>,
-        metrics_addr: Option<String>,
-        shutdown: tokio::sync::watch::Sender<bool>,
-        profiles: Arc<ProfileStore>,
-        sessions: Arc<SessionStore>,
-        unlock: Arc<dyn UnlockGate>,
-        unlock_cache: UnlockCache,
-        master_source: Arc<dyn MasterSource>,
-    ) -> State {
+    /// Assemble the shared state.
+    pub fn new(parts: StateParts) -> State {
         State {
             started_at: OffsetDateTime::now_utc(),
-            metrics,
-            audit: Mutex::new(audit),
-            metrics_addr,
-            shutdown,
+            metrics: parts.metrics,
+            audit: parts.audit,
+            metrics_addr: parts.metrics_addr,
+            shutdown: parts.shutdown,
             shutdown_reason: Mutex::new("unknown"),
-            profiles,
-            sessions,
-            unlock,
-            unlock_cache,
-            master_source,
+            profiles: parts.profiles,
+            sessions: parts.sessions,
+            unlock: parts.unlock,
+            unlock_cache: parts.unlock_cache,
+            master_source: parts.master_source,
+            paths: parts.paths,
+            helper_dirs: parts.helper_dirs,
+            revokes: parts.revokes,
+            raw_args: parts.raw_args,
         }
+    }
+
+    /// The open sessions.
+    pub fn sessions(&self) -> &Arc<SessionStore> {
+        &self.sessions
+    }
+
+    /// The persistent revoke queue.
+    pub fn revokes(&self) -> &Arc<RevokeQueue> {
+        &self.revokes
+    }
+
+    /// Where helper binaries are looked for.
+    pub fn helper_dirs(&self) -> &[PathBuf] {
+        &self.helper_dirs
+    }
+
+    /// Where masters come from.
+    pub fn master_source(&self) -> &Arc<dyn MasterSource> {
+        &self.master_source
+    }
+
+    /// A clone of the audit writer's handle, for a background task.
+    pub fn audit_handle(&self) -> AuditHandle {
+        self.audit.clone()
     }
 
     /// The metrics registry, for the endpoint and for request counting.
@@ -108,29 +167,30 @@ impl State {
         &self.unlock_cache
     }
 
-    /// Append an audit row, counting rather than propagating a failure.
+    /// Queue an audit row.
     ///
-    /// A daemon that dies because it could not write its log is worse than one
-    /// that keeps serving with `briefcred_audit_write_errors_total` climbing,
-    /// which is exactly what that counter is for.
+    /// Returns before the row reaches the disk. A daemon that stalls on its
+    /// own log is worse than one that keeps serving with
+    /// `briefcred_audit_write_errors_total` climbing, which is exactly what
+    /// that counter is for. Use [`State::audit_flush`] where the row has to be
+    /// durable before the next step.
     pub fn audit(&self, entry: &AuditEntry) {
-        let mut log = self.audit.lock().expect("audit mutex");
-        if let Err(err) = log.append(entry) {
-            eprintln!("briefcred-daemon: audit write failed: {err}");
-        }
+        self.audit.append(entry);
+    }
+
+    /// Wait until every row queued so far is on the disk.
+    pub async fn audit_flush(&self) {
+        self.audit.flush().await;
     }
 
     /// The audit file rows are currently going to.
-    pub fn audit_path(&self) -> std::path::PathBuf {
-        self.audit.lock().expect("audit mutex").current_path()
+    pub async fn audit_path(&self) -> std::path::PathBuf {
+        self.audit.path().await
     }
 
     /// Run the retention sweep, reporting failures without stopping.
     pub fn sweep(&self) {
-        let log = self.audit.lock().expect("audit mutex");
-        if let Err(err) = log.sweep() {
-            eprintln!("briefcred-daemon: audit retention sweep failed: {err}");
-        }
+        self.audit.sweep();
     }
 
     /// Ask the daemon to stop accepting and drain.
@@ -199,6 +259,12 @@ pub fn dispatch_table() -> HashMap<&'static str, Handler> {
     table.insert("show_profile", handler!(handle_show_profile));
     table.insert("open_session", handler!(handle_open_session));
     table.insert("close_session", handler!(handle_close_session));
+    table.insert("unlock", handler!(handle_unlock));
+    table.insert("exec", handler!(handle_exec));
+    table.insert("exec_done", handler!(handle_exec_done));
+    table.insert("hook_check", handler!(handle_hook_check));
+    #[cfg(feature = "debug-heapscan")]
+    table.insert("heap_scan", handler!(handle_heap_scan));
     table
 }
 
@@ -212,7 +278,7 @@ async fn handle_status(_request: Request, state: Arc<State>) -> Response {
         pid: std::process::id(),
         uptime_secs: state.uptime_secs(),
         started_at: state.started_at(),
-        audit_path: state.audit_path(),
+        audit_path: state.audit_path().await,
         metrics_addr: state.metrics_addr.clone(),
     }
 }
@@ -261,49 +327,17 @@ async fn handle_open_session(request: Request, state: Arc<State>) -> Response {
         };
     };
 
-    // Before the cache, not after. A cached unlock is a record that somebody
-    // was once at a screen, which says nothing about whether *this* caller has
-    // one — so consulting the cache first would let an SSH shell ride a
-    // desktop unlock for the rest of the window. Either side reporting
-    // headless is enough: the client can see an SSH login the daemon cannot,
-    // and the daemon can see a background launchd session the client cannot.
-    if profile.unlock.policy != briefcred_core::profile::UnlockPolicy::None
-        && (client_headless || crate::unlock::is_headless())
-    {
-        let err = crate::unlock::UnlockError::NoAquaSession;
-        state.audit(&AuditEntry::UnlockDenied {
-            ts: OffsetDateTime::now_utc(),
-            profile: name,
-            policy: policy_name(profile.unlock.policy).to_string(),
-            reason: err.reason().to_string(),
-        });
-        return Response::Locked {
-            reason: err.reason().to_string(),
-            message: err.to_string(),
-        };
-    }
-
-    let window = profile.unlock.cache_for();
-    if !state.unlock_cache.is_fresh(&name, window).await {
-        let reason = format!("briefcred: unlock the `{name}` profile");
-        if let Err(err) = state.unlock.unlock(profile.unlock.policy, &reason).await {
-            state.audit(&AuditEntry::UnlockDenied {
-                ts: OffsetDateTime::now_utc(),
-                profile: name,
-                policy: policy_name(profile.unlock.policy).to_string(),
-                reason: err.reason().to_string(),
-            });
-            return Response::Locked {
-                reason: err.reason().to_string(),
-                message: err.to_string(),
-            };
-        }
-        state.unlock_cache.record(&name).await;
+    if let Err(locked) = prove_presence(&state, &profile, client_headless).await {
+        return locked;
     }
 
     match state
         .sessions
-        .open(&profile, state.master_source.as_ref())
+        .open(
+            &profile,
+            state.master_source.as_ref(),
+            state.helper_dirs.clone(),
+        )
         .await
     {
         Ok((session_id, expires_at)) => {
@@ -329,7 +363,9 @@ async fn handle_close_session(request: Request, state: Arc<State>) -> Response {
         return mismatched(&request);
     };
     match state.sessions.close(&session_id).await {
-        Ok(profile) => {
+        Ok(session) => {
+            let profile = session.profile.clone();
+            retire(&state, session, "request").await;
             state.audit(&AuditEntry::SessionClose {
                 ts: OffsetDateTime::now_utc(),
                 session_id: session_id.clone(),
@@ -341,6 +377,302 @@ async fn handle_close_session(request: Request, state: Arc<State>) -> Response {
         Err(err) => Response::Error {
             message: err.to_string(),
         },
+    }
+}
+
+/// Wind up a session that has been taken out of the store.
+///
+/// Anything it minted that no `ExecDone` accounted for goes on the revoke
+/// queue, and its helper processes are stopped. Both matter: a wrapper that
+/// was killed leaves mints behind, and a helper that outlives its session is a
+/// process still holding a master.
+pub async fn retire(state: &Arc<State>, session: Session, reason: &str) {
+    let orphaned: Vec<_> = session.mints.values().cloned().collect();
+    if !orphaned.is_empty() {
+        eprintln!(
+            "briefcred-daemon: session {} closed ({reason}) with {} credential(s) still minted; queueing their revokes",
+            session.id,
+            orphaned.len()
+        );
+        if let Err(err) = state.revokes.enqueue(orphaned).await {
+            eprintln!("briefcred-daemon: cannot queue an orphaned revoke: {err}");
+        }
+    }
+    session.helpers.stop_all().await;
+}
+
+/// Prove presence without opening anything.
+async fn handle_unlock(request: Request, state: Arc<State>) -> Response {
+    let Request::Unlock {
+        profile: name,
+        client_headless,
+    } = request
+    else {
+        return mismatched(&request);
+    };
+    let Some(profile) = state.profiles.get(&name).await else {
+        return Response::Error {
+            message: SessionError::NoSuchProfile(name).to_string(),
+        };
+    };
+    match prove_presence(&state, &profile, client_headless).await {
+        Ok(()) => Response::Unlocked { profile: name },
+        Err(locked) => locked,
+    }
+}
+
+/// The unlock gate, the headless check, and the cache, in that order.
+///
+/// Factored out of [`handle_open_session`] so `Unlock` cannot drift away from
+/// it: two code paths that both decide "may this profile be used now" would be
+/// two chances to get the ordering wrong.
+async fn prove_presence(
+    state: &Arc<State>,
+    profile: &briefcred_core::Profile,
+    client_headless: bool,
+) -> std::result::Result<(), Response> {
+    use briefcred_core::profile::UnlockPolicy;
+
+    if profile.unlock.policy != UnlockPolicy::None
+        && (client_headless || crate::unlock::is_headless())
+    {
+        let err = crate::unlock::UnlockError::NoAquaSession;
+        state.audit(&AuditEntry::UnlockDenied {
+            ts: OffsetDateTime::now_utc(),
+            profile: profile.name.clone(),
+            policy: policy_name(profile.unlock.policy).to_string(),
+            reason: err.reason().to_string(),
+        });
+        return Err(Response::Locked {
+            reason: err.reason().to_string(),
+            message: err.to_string(),
+        });
+    }
+
+    let window = profile.unlock.cache_for();
+    if !state.unlock_cache.is_fresh(&profile.name, window).await {
+        let reason = format!("briefcred: unlock the `{}` profile", profile.name);
+        if let Err(err) = state.unlock.unlock(profile.unlock.policy, &reason).await {
+            state.audit(&AuditEntry::UnlockDenied {
+                ts: OffsetDateTime::now_utc(),
+                profile: profile.name.clone(),
+                policy: policy_name(profile.unlock.policy).to_string(),
+                reason: err.reason().to_string(),
+            });
+            return Err(Response::Locked {
+                reason: err.reason().to_string(),
+                message: err.to_string(),
+            });
+        }
+        state.unlock_cache.record(&profile.name).await;
+    }
+    Ok(())
+}
+
+/// Check the command, mint, and compose the environment.
+async fn handle_exec(request: Request, state: Arc<State>) -> Response {
+    let Request::Exec {
+        session_id,
+        credentials,
+        argv0,
+        args,
+        pid,
+    } = request
+    else {
+        return mismatched(&request);
+    };
+
+    if let Err(err) = state.sessions.touch(&session_id).await {
+        return Response::Error {
+            message: err.to_string(),
+        };
+    }
+    let Ok(profile_name) = state
+        .sessions
+        .with_session(&session_id, |s| s.profile.clone())
+        .await
+    else {
+        return Response::Error {
+            message: SessionError::NoSuchSession(session_id).to_string(),
+        };
+    };
+    let Some(profile) = state.profiles.get(&profile_name).await else {
+        return Response::Error {
+            message: SessionError::NoSuchProfile(profile_name).to_string(),
+        };
+    };
+
+    // Before anything is minted. A refused command must leave no principal.
+    if let Err(denied) = briefcred_core::exec::check_command(&profile, &argv0, &args) {
+        return Response::Denied {
+            message: denied.to_string(),
+        };
+    }
+    let specs = match crate::exec::select(&profile, credentials.as_deref()) {
+        Ok(specs) => specs,
+        Err(err) => {
+            return Response::Denied {
+                message: err.to_string(),
+            }
+        }
+    };
+
+    // Both taken out of the store before the mint, so the session map is not
+    // held locked across a round trip to a database.
+    let Ok((masters, helpers)) = state
+        .sessions
+        .with_session(&session_id, |s| {
+            (s.masters.clone(), std::sync::Arc::clone(&s.helpers))
+        })
+        .await
+    else {
+        return Response::Error {
+            message: SessionError::NoSuchSession(session_id).to_string(),
+        };
+    };
+    let trust = briefcred_core::ca::trust_env(&state.paths, &profile);
+
+    let minted = crate::exec::mint(
+        &profile,
+        &specs,
+        &masters,
+        helpers.as_ref(),
+        &trust,
+        &session_id,
+        &argv0,
+        &args,
+        pid,
+        state.raw_args,
+    )
+    .await;
+
+    let minted = match minted {
+        Ok(minted) => minted,
+        Err(err) => {
+            return Response::Error {
+                message: err.to_string(),
+            }
+        }
+    };
+
+    // Recorded against the session before the client is told, so a client that
+    // dies between the reply and its first instruction still leaves something
+    // the session close can revoke.
+    if let Err(err) = state
+        .sessions
+        .record_mints(&session_id, minted.pending.clone())
+        .await
+    {
+        return Response::Error {
+            message: err.to_string(),
+        };
+    }
+    for row in &minted.rows {
+        state.audit(row);
+    }
+
+    Response::Minted {
+        mints: minted.mints,
+        env: minted.env,
+        passthrough: minted.passthrough,
+    }
+}
+
+/// The child has exited: queue its revokes and close the exec's audit rows.
+async fn handle_exec_done(request: Request, state: Arc<State>) -> Response {
+    let Request::ExecDone {
+        session_id,
+        mint_ids,
+        exit_code,
+        duration_ms,
+    } = request
+    else {
+        return mismatched(&request);
+    };
+
+    let _ = state.sessions.touch(&session_id).await;
+    let parsed: Vec<MintId> = mint_ids.iter().filter_map(|id| id.parse().ok()).collect();
+    let entries = match state.sessions.take_mints(&session_id, &parsed).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            return Response::Error {
+                message: err.to_string(),
+            }
+        }
+    };
+    let profile = state
+        .sessions
+        .profile_of(&session_id)
+        .await
+        .unwrap_or_default();
+
+    state.audit(&AuditEntry::ExecEnd {
+        ts: OffsetDateTime::now_utc(),
+        session_id: session_id.clone(),
+        mint_ids: entries.iter().map(|e| e.mint_id.clone()).collect(),
+        profile,
+        exit_code,
+        duration_ms,
+    });
+
+    match state.revokes.enqueue(entries).await {
+        Ok(queued) => Response::ExecRecorded { queued },
+        Err(err) => Response::Error {
+            message: err.to_string(),
+        },
+    }
+}
+
+/// Would this command be allowed? Mints nothing either way.
+async fn handle_hook_check(request: Request, state: Arc<State>) -> Response {
+    let Request::HookCheck {
+        profile: name,
+        argv0,
+        args,
+    } = request
+    else {
+        return mismatched(&request);
+    };
+    let Some(profile) = state.profiles.get(&name).await else {
+        // An unknown profile is a denial with a reason rather than an error:
+        // the hook has to turn every answer into a decision, and "briefcred
+        // does not know that profile" is a perfectly good reason to say no.
+        return Response::HookDecision {
+            allowed: false,
+            reason: SessionError::NoSuchProfile(name).to_string(),
+        };
+    };
+    match briefcred_core::exec::check_command(&profile, &argv0, &args) {
+        Ok(()) => Response::HookDecision {
+            allowed: true,
+            reason: format!("profile `{}` permits `{argv0}`", profile.name),
+        },
+        Err(denied) => Response::HookDecision {
+            allowed: false,
+            reason: denied.to_string(),
+        },
+    }
+}
+
+/// Debug-only self-scan. See [`crate::heapscan`].
+#[cfg(feature = "debug-heapscan")]
+async fn handle_heap_scan(request: Request, _state: Arc<State>) -> Response {
+    let Request::HeapScan { needle_sha256 } = request else {
+        return mismatched(&request);
+    };
+    // On a blocking thread: the scan hashes tens of millions of windows and
+    // would otherwise park an async worker for the whole of it.
+    let found = tokio::task::spawn_blocking(move || crate::heapscan::scan_self(&needle_sha256))
+        .await
+        .unwrap_or(crate::heapscan::ScanResult {
+            present: false,
+            regions_scanned: 0,
+            bytes_scanned: 0,
+        });
+    Response::HeapScanned {
+        present: found.present,
+        regions_scanned: found.regions_scanned,
+        bytes_scanned: found.bytes_scanned,
     }
 }
 
@@ -574,7 +906,9 @@ mod tests {
         std::fs::create_dir_all(&profiles_dir).unwrap();
         std::fs::write(profiles_dir.join("p.yaml"), profile_yaml).unwrap();
 
-        let audit = AuditLog::open(&home.path().join("audit"), 90).unwrap();
+        let audit = crate::audit::spawn(
+            crate::audit::AuditLog::open(&home.path().join("audit"), 90).unwrap(),
+        );
         let metrics = Arc::new(Metrics::new(audit.write_errors_handle()));
         let profiles = Arc::new(ProfileStore::new(
             profiles_dir,
@@ -585,22 +919,35 @@ mod tests {
         let clock = Arc::new(SystemClock::new());
         let prompts = Arc::new(AtomicUsize::new(0));
         let (shutdown, _) = tokio::sync::watch::channel(false);
-        let state = Arc::new(State::new(
+        let paths =
+            briefcred_core::paths::Paths::resolve(briefcred_core::paths::Platform::MacOs, &|key| {
+                (key == briefcred_core::paths::HOME_ENV)
+                    .then(|| home.path().as_os_str().to_os_string())
+            })
+            .unwrap();
+        let state = Arc::new(State::new(StateParts {
             audit,
             metrics,
-            None,
+            metrics_addr: None,
             shutdown,
             profiles,
-            Arc::new(SessionStore::new(clock.clone(), Duration::from_secs(1800))),
-            Arc::new(CountingGate {
+            sessions: Arc::new(SessionStore::new(clock.clone(), Duration::from_secs(1800))),
+            unlock: Arc::new(CountingGate {
                 prompts: Arc::clone(&prompts),
             }),
-            crate::unlock::UnlockCache::new(clock),
-            Arc::new(MemorySource::new([(
+            unlock_cache: crate::unlock::UnlockCache::new(clock),
+            master_source: Arc::new(MemorySource::new([(
                 "db".to_string(),
                 "master".to_string(),
             )])),
-        ));
+            paths: Arc::new(paths),
+            helper_dirs: Vec::new(),
+            revokes: Arc::new(
+                crate::revoke::RevokeQueue::open(home.path().join(crate::revoke::QUEUE_FILE))
+                    .unwrap(),
+            ),
+            raw_args: false,
+        }));
         (home, state, prompts)
     }
 

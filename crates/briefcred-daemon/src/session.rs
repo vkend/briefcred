@@ -25,6 +25,8 @@ use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
 use crate::clock::Clock;
+use crate::helper::HelperSet;
+use crate::revoke::PendingRevoke;
 
 /// How often the eviction task looks for idle sessions.
 pub const EVICTION_INTERVAL: Duration = Duration::from_secs(30);
@@ -47,10 +49,22 @@ pub struct Session {
     pub last_used: Duration,
     /// The master credential for each of the profile's `source_key`s.
     pub masters: BTreeMap<String, Zeroizing<String>>,
-    /// Credentials minted against this session, for revoke at close.
+    /// Credentials minted against this session and not yet handed to the
+    /// revoke queue, keyed by the principal they created.
     ///
-    /// Empty until Phase 3b, which is what does the minting.
-    pub mints: Vec<MintId>,
+    /// A `briefcred exec` that finishes normally reports back and its entries
+    /// leave here for the queue. One that does not — the wrapper was killed,
+    /// the terminal was closed — leaves them behind, and closing or evicting
+    /// the session is what sweeps them up. That is the second of the three
+    /// nets under a minted credential, after the queue and before the
+    /// reconciler.
+    pub mints: BTreeMap<MintId, PendingRevoke>,
+    /// The helper processes this session started, one per minter kind.
+    ///
+    /// An `Arc` so a handler can hold it across the awaits of a mint without
+    /// keeping the whole session map locked for the length of a round trip to
+    /// a database.
+    pub helpers: Arc<HelperSet>,
 }
 
 impl std::fmt::Debug for Session {
@@ -61,7 +75,7 @@ impl std::fmt::Debug for Session {
             .field("opened_at", &self.opened_at)
             .field("last_used", &self.last_used)
             .field("masters", &self.masters.keys().collect::<Vec<_>>())
-            .field("mints", &self.mints)
+            .field("mints", &self.mints.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -139,6 +153,7 @@ impl SessionStore {
         &self,
         profile: &Profile,
         source: &dyn MasterSource,
+        helper_dirs: Vec<std::path::PathBuf>,
     ) -> Result<(String, time::OffsetDateTime), SessionError> {
         let mut masters = BTreeMap::new();
         for spec in &profile.credentials {
@@ -160,7 +175,8 @@ impl SessionStore {
             opened_at: now,
             last_used: now,
             masters,
-            mints: Vec::new(),
+            mints: BTreeMap::new(),
+            helpers: Arc::new(HelperSet::new(helper_dirs)),
         };
         let id = session.id.clone();
         let expires_at = session.expires_at(now, self.idle_for);
@@ -184,18 +200,75 @@ impl SessionStore {
 
     /// Close `id`, wiping its masters immediately.
     ///
-    /// Returns the profile the session belonged to, for the audit row.
-    pub async fn close(&self, id: &str) -> Result<String, SessionError> {
-        // Removing drops the `Session`, and dropping it zeroises every master
-        // it holds. There is deliberately no "closed" flag: a session that
-        // still exists is a master that still exists.
-        let session = self
-            .sessions
+    /// Returns the whole session rather than just its name: the caller has to
+    /// stop the helper processes it started and sweep any mints that no
+    /// `ExecDone` ever accounted for, and both of those need the session.
+    /// Dropping the returned value is what zeroises the masters, so a caller
+    /// that ignores it still gets the wipe.
+    pub async fn close(&self, id: &str) -> Result<Session, SessionError> {
+        // Removing drops the `Session` unless the caller keeps it, and
+        // dropping it zeroises every master it holds. There is deliberately no
+        // "closed" flag: a session that still exists is a master that still
+        // exists.
+        self.sessions
             .write()
             .await
             .remove(id)
+            .ok_or_else(|| SessionError::NoSuchSession(id.to_string()))
+    }
+
+    /// Record what one `Exec` minted, so a session close can still revoke it.
+    pub async fn record_mints(
+        &self,
+        id: &str,
+        mints: Vec<PendingRevoke>,
+    ) -> Result<(), SessionError> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(id)
             .ok_or_else(|| SessionError::NoSuchSession(id.to_string()))?;
-        Ok(session.profile)
+        for mint in mints {
+            session.mints.insert(mint.mint_id.clone(), mint);
+        }
+        Ok(())
+    }
+
+    /// Take the entries for `mint_ids` off a session, for the revoke queue.
+    ///
+    /// Silently ignores an identifier the session does not hold: a client that
+    /// reports a mint twice, or reports one from another session, must not be
+    /// able to make the daemon revoke something on its say-so.
+    pub async fn take_mints(
+        &self,
+        id: &str,
+        mint_ids: &[MintId],
+    ) -> Result<Vec<PendingRevoke>, SessionError> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(id)
+            .ok_or_else(|| SessionError::NoSuchSession(id.to_string()))?;
+        Ok(mint_ids
+            .iter()
+            .filter_map(|mint_id| session.mints.remove(mint_id))
+            .collect())
+    }
+
+    /// The helper set of an open session.
+    pub async fn helpers_of(&self, id: &str) -> Result<Arc<HelperSet>, SessionError> {
+        self.with_session(id, |s| Arc::clone(&s.helpers)).await
+    }
+
+    /// Run `f` against an open session's masters and profile name.
+    pub async fn with_session<T>(
+        &self,
+        id: &str,
+        f: impl FnOnce(&Session) -> T,
+    ) -> Result<T, SessionError> {
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .get(id)
+            .ok_or_else(|| SessionError::NoSuchSession(id.to_string()))?;
+        Ok(f(session))
     }
 
     /// Whether `id` is currently open.
@@ -226,7 +299,7 @@ impl SessionStore {
     ///
     /// Returns the `(id, profile)` of each evicted session so the caller can
     /// audit it. The masters are wiped by the time this returns.
-    pub async fn evict_idle(&self) -> Vec<(String, String)> {
+    pub async fn evict_idle(&self) -> Vec<Session> {
         let now = self.clock.now();
         let idle_for = self.idle_for;
         let mut sessions = self.sessions.write().await;
@@ -239,7 +312,7 @@ impl SessionStore {
 
         expired
             .into_iter()
-            .filter_map(|id| sessions.remove(&id).map(|s| (id, s.profile)))
+            .filter_map(|id| sessions.remove(&id))
             .collect()
     }
 
@@ -253,12 +326,13 @@ impl SessionStore {
             .collect()
     }
 
-    /// Close every session, wiping every master. Used at shutdown.
-    pub async fn close_all(&self) -> usize {
+    /// Take every session, wiping every master. Used at shutdown.
+    ///
+    /// Returns them so the caller can stop their helpers and queue whatever
+    /// they had minted; dropping the result is still a complete wipe.
+    pub async fn close_all(&self) -> Vec<Session> {
         let mut sessions = self.sessions.write().await;
-        let count = sessions.len();
-        sessions.clear();
-        count
+        std::mem::take(&mut *sessions).into_values().collect()
     }
 }
 
@@ -266,12 +340,13 @@ impl SessionStore {
 ///
 /// `on_evict` is called with each evicted `(id, profile)`, which is how the
 /// daemon audits an eviction without this module knowing about audit logs.
-pub async fn evict_loop<F>(
+pub async fn evict_loop<F, Fut>(
     store: Arc<SessionStore>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     on_evict: F,
 ) where
-    F: Fn(&str, &str) + Send + 'static,
+    F: Fn(Session) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
 {
     let mut ticker = tokio::time::interval(EVICTION_INTERVAL);
     // `interval` fires immediately, and nothing can be idle at startup.
@@ -280,8 +355,8 @@ pub async fn evict_loop<F>(
         tokio::select! {
             _ = crate::server::shutdown_requested(&mut shutdown) => return,
             _ = ticker.tick() => {
-                for (id, profile) in store.evict_idle().await {
-                    on_evict(&id, &profile);
+                for session in store.evict_idle().await {
+                    on_evict(session).await;
                 }
             }
         }
@@ -329,7 +404,7 @@ credentials:
 ",
         );
 
-        let (id, _) = store.open(&profile, &source()).await.unwrap();
+        let (id, _) = store.open(&profile, &source(), Vec::new()).await.unwrap();
         assert!(store.contains(&id).await);
         assert_eq!(store.profile_of(&id).await.as_deref(), Some("dev"));
     }
@@ -366,7 +441,7 @@ credentials:
         );
         let source = CountingSource::default();
         let store = store(TestClock::new(), Duration::from_secs(1800));
-        store.open(&profile, &source).await.unwrap();
+        store.open(&profile, &source, Vec::new()).await.unwrap();
         assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -383,7 +458,10 @@ credentials:
     kind: postgres-dynamic
 ",
         );
-        let err = store.open(&profile, &source()).await.unwrap_err();
+        let err = store
+            .open(&profile, &source(), Vec::new())
+            .await
+            .unwrap_err();
         assert!(matches!(err, SessionError::Master(_)), "{err}");
         assert!(err.to_string().contains("absent"), "{err}");
         assert!(store.is_empty().await, "no half-open session may survive");
@@ -394,7 +472,10 @@ credentials:
         let store = store(TestClock::new(), Duration::from_secs(1800));
         let mut ids = std::collections::BTreeSet::new();
         for _ in 0..64 {
-            let (id, _) = store.open(&one_credential(), &source()).await.unwrap();
+            let (id, _) = store
+                .open(&one_credential(), &source(), Vec::new())
+                .await
+                .unwrap();
             assert_eq!(id.len(), SESSION_ID_BYTES * 2, "{id}");
             assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{id}");
             assert!(ids.insert(id), "session ids must not repeat");
@@ -404,9 +485,12 @@ credentials:
     #[tokio::test]
     async fn closing_a_session_removes_it_at_once() {
         let store = store(TestClock::new(), Duration::from_secs(1800));
-        let (id, _) = store.open(&one_credential(), &source()).await.unwrap();
+        let (id, _) = store
+            .open(&one_credential(), &source(), Vec::new())
+            .await
+            .unwrap();
 
-        assert_eq!(store.close(&id).await.unwrap(), "dev");
+        assert_eq!(store.close(&id).await.unwrap().profile, "dev");
         assert!(!store.contains(&id).await);
         assert!(store.is_empty().await);
 
@@ -422,7 +506,10 @@ credentials:
     async fn a_session_is_evicted_once_it_has_been_idle_for_the_configured_time() {
         let clock = TestClock::new();
         let store = store(clock.clone(), Duration::from_secs(1800));
-        let (id, _) = store.open(&one_credential(), &source()).await.unwrap();
+        let (id, _) = store
+            .open(&one_credential(), &source(), Vec::new())
+            .await
+            .unwrap();
 
         clock.advance(Duration::from_secs(1799));
         assert!(store.evict_idle().await.is_empty(), "not idle long enough");
@@ -430,7 +517,9 @@ credentials:
 
         clock.advance(Duration::from_secs(1));
         let evicted = store.evict_idle().await;
-        assert_eq!(evicted, vec![(id.clone(), "dev".to_string())]);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].id, id);
+        assert_eq!(evicted[0].profile, "dev");
         assert!(!store.contains(&id).await);
         assert!(
             store.evict_idle().await.is_empty(),
@@ -442,7 +531,10 @@ credentials:
     async fn using_a_session_postpones_its_eviction() {
         let clock = TestClock::new();
         let store = store(clock.clone(), Duration::from_secs(1800));
-        let (id, _) = store.open(&one_credential(), &source()).await.unwrap();
+        let (id, _) = store
+            .open(&one_credential(), &source(), Vec::new())
+            .await
+            .unwrap();
 
         for _ in 0..5 {
             clock.advance(Duration::from_secs(1700));
@@ -459,14 +551,20 @@ credentials:
     async fn eviction_takes_only_the_idle_sessions() {
         let clock = TestClock::new();
         let store = store(clock.clone(), Duration::from_secs(1800));
-        let (stale, _) = store.open(&one_credential(), &source()).await.unwrap();
+        let (stale, _) = store
+            .open(&one_credential(), &source(), Vec::new())
+            .await
+            .unwrap();
         clock.advance(Duration::from_secs(1000));
-        let (fresh, _) = store.open(&one_credential(), &source()).await.unwrap();
+        let (fresh, _) = store
+            .open(&one_credential(), &source(), Vec::new())
+            .await
+            .unwrap();
         clock.advance(Duration::from_secs(900));
 
         let evicted = store.evict_idle().await;
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].0, stale);
+        assert_eq!(evicted[0].id, stale);
         assert!(store.contains(&fresh).await);
     }
 
@@ -474,7 +572,10 @@ credentials:
     async fn touching_an_evicted_session_says_it_is_gone() {
         let clock = TestClock::new();
         let store = store(clock.clone(), Duration::from_secs(60));
-        let (id, _) = store.open(&one_credential(), &source()).await.unwrap();
+        let (id, _) = store
+            .open(&one_credential(), &source(), Vec::new())
+            .await
+            .unwrap();
         clock.advance(Duration::from_secs(60));
         store.evict_idle().await;
 
@@ -487,7 +588,10 @@ credentials:
     async fn the_reported_expiry_moves_forward_as_the_session_is_used() {
         let clock = TestClock::new();
         let store = store(clock.clone(), Duration::from_secs(1800));
-        let (id, opened_expiry) = store.open(&one_credential(), &source()).await.unwrap();
+        let (id, opened_expiry) = store
+            .open(&one_credential(), &source(), Vec::new())
+            .await
+            .unwrap();
 
         clock.advance(Duration::from_secs(600));
         let touched_expiry = store.touch(&id).await.unwrap();
@@ -501,17 +605,23 @@ credentials:
     async fn closing_every_session_reports_how_many_it_wiped() {
         let store = store(TestClock::new(), Duration::from_secs(1800));
         for _ in 0..3 {
-            store.open(&one_credential(), &source()).await.unwrap();
+            store
+                .open(&one_credential(), &source(), Vec::new())
+                .await
+                .unwrap();
         }
-        assert_eq!(store.close_all().await, 3);
+        assert_eq!(store.close_all().await.len(), 3);
         assert!(store.is_empty().await);
-        assert_eq!(store.close_all().await, 0);
+        assert!(store.close_all().await.is_empty());
     }
 
     #[tokio::test]
     async fn a_session_never_debug_prints_the_masters_it_holds() {
         let store = store(TestClock::new(), Duration::from_secs(1800));
-        store.open(&one_credential(), &source()).await.unwrap();
+        store
+            .open(&one_credential(), &source(), Vec::new())
+            .await
+            .unwrap();
 
         let rendered = format!("{:?}", store.sessions.read().await);
         assert!(!rendered.contains("master-secret"), "{rendered}");
@@ -536,7 +646,7 @@ credentials:
 
         let store = store(TestClock::new(), Duration::from_secs(1800));
         let (id, _) = store
-            .open(&profile("name: dev\n"), &Explodes)
+            .open(&profile("name: dev\n"), &Explodes, Vec::new())
             .await
             .unwrap();
         assert!(store.contains(&id).await);
@@ -546,7 +656,7 @@ credentials:
     async fn the_eviction_loop_stops_when_shutdown_is_requested() {
         let store = Arc::new(store(TestClock::new(), Duration::from_secs(1800)));
         let (shutdown, _) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(evict_loop(store, shutdown.subscribe(), |_, _| {}));
+        let handle = tokio::spawn(evict_loop(store, shutdown.subscribe(), |_session| async {}));
 
         shutdown.send_replace(true);
         tokio::time::timeout(Duration::from_secs(5), handle)

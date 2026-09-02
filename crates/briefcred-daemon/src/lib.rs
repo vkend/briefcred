@@ -11,8 +11,14 @@ pub mod audit;
 pub mod clock;
 pub mod config;
 pub mod error;
+pub mod exec;
+#[cfg(feature = "debug-heapscan")]
+pub mod heapscan;
+pub mod helper;
 pub mod metrics;
 pub mod profiles;
+pub mod reconcile;
+pub mod revoke;
 pub mod server;
 pub mod session;
 pub mod unlock;
@@ -30,7 +36,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::metrics::Metrics;
 use crate::profiles::{ProfileStore, Reload};
-use crate::server::State;
+use crate::server::{State, StateParts};
 use crate::session::SessionStore;
 use crate::unlock::{SystemUnlockGate, UnlockCache};
 
@@ -43,7 +49,7 @@ pub async fn run() -> Result<()> {
     paths.ensure_layout()?;
 
     let config = Config::load(&paths.daemon_toml())?;
-    let audit = AuditLog::open(&paths.audit_dir(), config.retention_days)?;
+    let audit = crate::audit::spawn(AuditLog::open(&paths.audit_dir(), config.retention_days)?);
     let metrics = Arc::new(Metrics::new(audit.write_errors_handle()));
 
     let bound_metrics = if config.metrics_enabled {
@@ -75,19 +81,35 @@ pub async fn run() -> Result<()> {
     ));
     let sessions = Arc::new(SessionStore::new(clock.clone(), config.session_idle()));
 
+    // Next to this binary first, then `BRIEFCRED_HELPER_DIR`. See
+    // `helper::search_path` for why that order and not the other one.
+    let helper_dirs = helper::search_path(helper::own_dir().as_deref());
+    let revokes = Arc::new(revoke::RevokeQueue::open(
+        paths.state_dir().join(revoke::QUEUE_FILE),
+    )?);
+    let outstanding = revokes.len().await;
+    if outstanding > 0 {
+        eprintln!("briefcred-daemon: resuming {outstanding} revoke(s) left by an earlier run");
+    }
+
+    let paths = Arc::new(paths);
     let listener = server::bind(paths.sock())?;
     let (shutdown, _) = tokio::sync::watch::channel(false);
-    let state = Arc::new(State::new(
+    let state = Arc::new(State::new(StateParts {
         audit,
-        Arc::clone(&metrics),
+        metrics: Arc::clone(&metrics),
         metrics_addr,
         shutdown,
-        Arc::clone(&profiles),
-        Arc::clone(&sessions),
-        Arc::new(SystemUnlockGate::new()),
-        UnlockCache::new(clock),
-        master_source,
-    ));
+        profiles: Arc::clone(&profiles),
+        sessions: Arc::clone(&sessions),
+        unlock: Arc::new(SystemUnlockGate::new()),
+        unlock_cache: UnlockCache::new(clock),
+        master_source: Arc::clone(&master_source),
+        paths: Arc::clone(&paths),
+        helper_dirs: helper_dirs.clone(),
+        revokes: Arc::clone(&revokes),
+        raw_args: config.audit.raw_args,
+    }));
 
     // Sweep before the first row is written, so a log left behind by a much
     // older run is gone before today's file is even opened.
@@ -131,14 +153,39 @@ pub async fn run() -> Result<()> {
     tokio::spawn(session::evict_loop(
         Arc::clone(&sessions),
         state.shutdown_signal(),
-        move |session_id, profile| {
-            evict_state.audit(&AuditEntry::SessionClose {
-                ts: OffsetDateTime::now_utc(),
-                session_id: session_id.to_string(),
-                profile: profile.to_string(),
-                reason: "idle".to_string(),
-            });
+        move |session: session::Session| {
+            let state = Arc::clone(&evict_state);
+            async move {
+                state.audit(&AuditEntry::SessionClose {
+                    ts: OffsetDateTime::now_utc(),
+                    session_id: session.id.clone(),
+                    profile: session.profile.clone(),
+                    reason: "idle".to_string(),
+                });
+                server::retire(&state, session, "idle").await;
+            }
         },
+    ));
+
+    // The revoke queue and the reconciler each get their own helper set: both
+    // outlive every session, and the whole point of the reconciler is that it
+    // runs when no session exists.
+    tokio::spawn(revoke::drain_loop(
+        Arc::clone(&revokes),
+        Arc::new(QueueRevoker {
+            helpers: Arc::new(helper::HelperSet::new(helper_dirs.clone())),
+            masters: Arc::clone(&master_source),
+        }),
+        state.audit_handle(),
+        state.shutdown_signal(),
+    ));
+    tokio::spawn(reconcile::reconcile_loop(
+        Arc::clone(&profiles),
+        reconcile::helpers_for(helper_dirs),
+        Arc::clone(&master_source),
+        state.audit_handle(),
+        config.reconcile_interval(),
+        state.shutdown_signal(),
     ));
 
     eprintln!(
@@ -161,15 +208,15 @@ pub async fn run() -> Result<()> {
     // rows come first, because after `close_all` there is nothing left to
     // name — and a session that vanished without a row is a session an
     // investigator cannot account for.
-    for (session_id, profile) in sessions.open_sessions().await {
+    for session in sessions.close_all().await {
         state.audit(&AuditEntry::SessionClose {
             ts: OffsetDateTime::now_utc(),
-            session_id,
-            profile,
+            session_id: session.id.clone(),
+            profile: session.profile.clone(),
             reason: "shutdown".to_string(),
         });
+        server::retire(&state, session, "shutdown").await;
     }
-    sessions.close_all().await;
 
     state.audit(&AuditEntry::DaemonStop {
         ts: OffsetDateTime::now_utc(),
@@ -177,7 +224,32 @@ pub async fn run() -> Result<()> {
         uptime_secs: state.uptime_secs(),
         reason: state.shutdown_reason().to_string(),
     });
+    // The last row has to be on the disk before the process exits, or a clean
+    // shutdown looks exactly like a crash to whoever reads the log.
+    state.audit_flush().await;
     Ok(())
+}
+
+/// The revoke queue's back end: a helper call with a freshly fetched master.
+///
+/// The master is fetched per attempt rather than carried on the queue, so the
+/// queue file never holds one and a revoke that outlives its session still
+/// works. See `revoke::PendingRevoke`.
+#[derive(Debug)]
+struct QueueRevoker {
+    helpers: Arc<helper::HelperSet>,
+    masters: Arc<dyn briefcred_core::MasterSource>,
+}
+
+#[async_trait::async_trait]
+impl revoke::Revoker for QueueRevoker {
+    async fn revoke(&self, entry: &revoke::PendingRevoke) -> briefcred_core::RevokeOutcome {
+        let master = match self.masters.fetch(&entry.source_key).await {
+            Ok(master) => master,
+            Err(err) => return briefcred_core::RevokeOutcome::failed(err.to_string()),
+        };
+        crate::exec::revoke_one(&self.helpers, entry, &master).await
+    }
 }
 
 /// Log a reload, and audit it when it failed.

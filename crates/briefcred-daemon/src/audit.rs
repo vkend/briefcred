@@ -4,6 +4,21 @@
 //! rotation is a filename change rather than a rename dance and retention is a
 //! date comparison rather than a stat. Every write is followed by an `fsync`:
 //! an audit log that loses its last rows in a crash is not an audit log.
+//!
+//! # Why there is a writer task
+//!
+//! `fsync` blocks, and it blocks for as long as the disk wants. Holding a
+//! `std::sync::Mutex` across it — which is what this module used to do —
+//! parks an async worker thread inside a lock that every other request handler
+//! is queueing on, so one slow disk stalls the whole daemon.
+//!
+//! So the log lives in one owner: a [`writer`] loop on a dedicated blocking
+//! thread, fed by an unbounded channel. Handlers hold an [`AuditHandle`] and
+//! hand rows over without waiting. Ordering is preserved because a channel is
+//! a queue, the fsync-per-row guarantee is unchanged because the writer still
+//! syncs every row before taking the next, and a caller that genuinely needs
+//! the row to be on disk — a test, or the last row before the process exits —
+//! calls [`AuditHandle::flush`].
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -162,6 +177,118 @@ impl AuditLog {
             }
         }
         Ok(removed)
+    }
+}
+
+/// One instruction to the [`writer`] loop.
+enum Command {
+    /// Append this row, then fsync it.
+    Append(Box<AuditEntry>),
+    /// Run the retention sweep.
+    Sweep,
+    /// Answer with the file rows are currently going to.
+    Path(tokio::sync::oneshot::Sender<PathBuf>),
+    /// Answer once every command queued before this one has been carried out.
+    Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+/// A handle to the audit log's writer task.
+///
+/// Cloneable and cheap: every handler holds one. Appending never blocks and
+/// never fails, which is deliberate — a daemon that stops serving because it
+/// could not write a log line is worse than one that keeps serving with
+/// `briefcred_audit_write_errors_total` climbing.
+#[derive(Debug, Clone)]
+pub struct AuditHandle {
+    tx: tokio::sync::mpsc::UnboundedSender<Command>,
+    write_errors: Arc<AtomicU64>,
+}
+
+impl AuditHandle {
+    /// Queue one row. Returns immediately, before the row reaches the disk.
+    pub fn append(&self, entry: &AuditEntry) {
+        // A closed channel means the writer thread is gone, which only happens
+        // as the process exits. Counting it keeps the metric honest.
+        if self
+            .tx
+            .send(Command::Append(Box::new(entry.clone())))
+            .is_err()
+        {
+            self.write_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Queue a retention sweep.
+    pub fn sweep(&self) {
+        let _ = self.tx.send(Command::Sweep);
+    }
+
+    /// The file rows are currently going to.
+    pub async fn path(&self) -> PathBuf {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(Command::Path(tx)).is_err() {
+            return PathBuf::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Wait until everything queued so far has been written and synced.
+    pub async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(Command::Barrier(tx)).is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    /// How many appends have failed over this log's lifetime.
+    pub fn write_errors(&self) -> u64 {
+        self.write_errors.load(Ordering::Relaxed)
+    }
+
+    /// A handle to the same counter, for the metrics endpoint to read.
+    pub fn write_errors_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.write_errors)
+    }
+}
+
+/// Start the writer thread for `log` and return the handle to it.
+///
+/// The loop runs on [`tokio::task::spawn_blocking`] rather than as an ordinary
+/// task: it calls `fsync`, and an async worker thread is exactly the wrong
+/// place to do that.
+pub fn spawn(log: AuditLog) -> AuditHandle {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = AuditHandle {
+        tx,
+        write_errors: log.write_errors_handle(),
+    };
+    tokio::task::spawn_blocking(move || writer(log, rx));
+    handle
+}
+
+/// Own the log and carry out one command at a time until the last handle drops.
+fn writer(mut log: AuditLog, mut rx: tokio::sync::mpsc::UnboundedReceiver<Command>) {
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            Command::Append(entry) => {
+                if let Err(err) = log.append(&entry) {
+                    eprintln!("briefcred-daemon: audit write failed: {err}");
+                }
+            }
+            Command::Sweep => {
+                if let Err(err) = log.sweep() {
+                    eprintln!("briefcred-daemon: audit retention sweep failed: {err}");
+                }
+            }
+            Command::Path(reply) => {
+                let _ = reply.send(log.current_path());
+            }
+            // Nothing to do: reaching this command at all means every command
+            // queued before it has already been carried out.
+            Command::Barrier(reply) => {
+                let _ = reply.send(());
+            }
+        }
     }
 }
 

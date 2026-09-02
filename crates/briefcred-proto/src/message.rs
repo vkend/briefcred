@@ -85,6 +85,14 @@ pub enum Request {
         argv0: String,
         /// Its arguments, in order.
         args: Vec<String>,
+        /// The pid of the client process that will spawn and own the child.
+        ///
+        /// The daemon cannot obtain this itself: `SO_PEERCRED` is not portable
+        /// and macOS's `LOCAL_PEERCRED` reports only uid and gid. It is also
+        /// the pid an operator can act on — the child does not exist yet when
+        /// this request is answered, and killing the wrapper takes the child
+        /// with it.
+        pid: u32,
     },
     /// Report that the subprocess has exited, so its mints can be revoked.
     ///
@@ -268,6 +276,15 @@ pub enum Response {
         regions_scanned: usize,
         /// How many bytes those regions covered.
         bytes_scanned: u64,
+    },
+    /// The profile's `exec` policy refused the command, so nothing was minted.
+    ///
+    /// Distinct from [`Response::Error`] because it is a policy decision rather
+    /// than a fault, and the client turns it into its own exit code so a script
+    /// can tell "not allowed" from "something broke".
+    Denied {
+        /// What was refused and why, naming the offending value.
+        message: String,
     },
     /// The unlock gate refused, so nothing was opened.
     ///

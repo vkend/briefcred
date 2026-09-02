@@ -63,6 +63,7 @@ async fn every_request_and_response_round_trips() {
             credentials: Some(vec!["db".into()]),
             argv0: "psql".into(),
             args: vec!["-c".into(), "SELECT 1".into()],
+            pid: 4242,
         },
         Request::ExecDone {
             session_id: "s-1".into(),
@@ -116,6 +117,9 @@ async fn every_request_and_response_round_trips() {
             passthrough: vec!["PATH".into()],
         },
         Response::ExecRecorded { queued: 1 },
+        Response::Denied {
+            message: "`rm` is not permitted by profile `db-ro`".into(),
+        },
         Response::HookDecision {
             allowed: false,
             reason: "`rm` is not in `exec.allow_argv0`".into(),
@@ -255,6 +259,7 @@ fn the_name_list_covers_every_request_variant_exactly_once() {
             credentials: None,
             argv0: "psql".into(),
             args: vec![],
+            pid: 1,
         },
         Request::ExecDone {
             session_id: "x".into(),

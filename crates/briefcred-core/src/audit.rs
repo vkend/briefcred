@@ -60,7 +60,11 @@ pub enum AuditEntry {
         /// digests stay alongside so the two are always correlatable.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         args: Option<Vec<String>>,
-        /// Operating system process id.
+        /// The pid of the `briefcred` process that spawned and owns the child.
+        ///
+        /// Not the child's own: the row is written when the credentials are
+        /// minted, which is before the child exists. The wrapper is also the
+        /// process an operator can act on, because killing it takes the child.
         pid: u32,
     },
     /// A wrapped subprocess exited.
