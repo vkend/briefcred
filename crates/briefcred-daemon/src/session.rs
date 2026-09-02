@@ -253,11 +253,6 @@ impl SessionStore {
             .collect())
     }
 
-    /// The helper set of an open session.
-    pub async fn helpers_of(&self, id: &str) -> Result<Arc<HelperSet>, SessionError> {
-        self.with_session(id, |s| Arc::clone(&s.helpers)).await
-    }
-
     /// Run `f` against an open session's masters and profile name.
     pub async fn with_session<T>(
         &self,

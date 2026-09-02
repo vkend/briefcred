@@ -240,11 +240,6 @@ impl AuditHandle {
         }
     }
 
-    /// How many appends have failed over this log's lifetime.
-    pub fn write_errors(&self) -> u64 {
-        self.write_errors.load(Ordering::Relaxed)
-    }
-
     /// A handle to the same counter, for the metrics endpoint to read.
     pub fn write_errors_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.write_errors)

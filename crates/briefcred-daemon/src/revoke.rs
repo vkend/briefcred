@@ -97,6 +97,15 @@ pub struct PendingRevoke {
     /// How many attempts have been made so far.
     #[serde(default)]
     pub attempts: u32,
+    /// The earliest this entry may be attempted again, as a Unix timestamp in
+    /// milliseconds.
+    ///
+    /// Wall clock rather than monotonic, deliberately: the value has to survive
+    /// a daemon restart, and a monotonic instant means nothing to the next
+    /// process. The cost is that a clock jump can make one retry early or late,
+    /// which for a retry schedule is not worth defending against.
+    #[serde(default)]
+    pub not_before_unix_ms: i64,
 }
 
 impl PendingRevoke {
@@ -104,6 +113,22 @@ impl PendingRevoke {
     pub fn exhausted(&self) -> bool {
         self.attempts >= MAX_ATTEMPTS
     }
+
+    /// Whether `now` has reached this entry's next attempt time.
+    pub fn is_due(&self, now_unix_ms: i64) -> bool {
+        now_unix_ms >= self.not_before_unix_ms
+    }
+
+    /// Record an attempt and schedule the next one.
+    fn defer(&mut self, now_unix_ms: i64) {
+        self.not_before_unix_ms =
+            now_unix_ms + backoff(self.attempts + 1).as_millis().min(i64::MAX as u128) as i64;
+    }
+}
+
+/// The current wall-clock time in Unix milliseconds.
+fn now_unix_ms() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
 }
 
 /// What actually performs a revoke.
@@ -146,11 +171,6 @@ impl RevokeQueue {
         Ok(queue)
     }
 
-    /// The file this queue is mirrored in.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// How many revokes are outstanding.
     pub async fn len(&self) -> usize {
         self.pending.lock().await.len()
@@ -164,6 +184,19 @@ impl RevokeQueue {
     /// Everything outstanding, in queue order.
     pub async fn entries(&self) -> Vec<PendingRevoke> {
         self.pending.lock().await.clone()
+    }
+
+    /// How long until the earliest outstanding entry is due, if there is one.
+    pub async fn next_due_in(&self) -> Option<Duration> {
+        let now = now_unix_ms();
+        self.pending
+            .lock()
+            .await
+            .iter()
+            .map(|entry| {
+                Duration::from_millis(entry.not_before_unix_ms.saturating_sub(now).max(0) as u64)
+            })
+            .min()
     }
 
     /// Add `entries` and persist before returning.
@@ -183,12 +216,15 @@ impl RevokeQueue {
         Ok(added)
     }
 
-    /// Take the whole queue, leaving it empty and the file rewritten.
-    async fn take(&self) -> Result<Vec<PendingRevoke>> {
+    /// Take the entries that are due, leaving the rest in place.
+    async fn take_due(&self, now: i64) -> Result<Vec<PendingRevoke>> {
         let mut pending = self.pending.lock().await;
-        let taken = std::mem::take(&mut *pending);
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|entry| entry.is_due(now));
+        *pending = waiting;
         persist(&self.path, &pending)?;
-        Ok(taken)
+        Ok(due)
     }
 
     /// Put entries back at the front, keeping the file in step.
@@ -199,17 +235,23 @@ impl RevokeQueue {
         persist(&self.path, &pending)
     }
 
-    /// Run one pass: attempt every outstanding entry once.
+    /// Attempt every entry whose backoff has elapsed.
     ///
-    /// Returns the entries that still need another attempt, already put back
-    /// on the queue with their attempt counts incremented. Separated from the
-    /// loop so a test can drive passes deterministically instead of sleeping.
+    /// Returns the entries that still need another attempt, already put back on
+    /// the queue with their attempt counts incremented and their next attempt
+    /// scheduled. Separated from the loop so a test can drive passes
+    /// deterministically instead of sleeping.
+    ///
+    /// An entry that is not yet due is left alone rather than retried early:
+    /// without that, one entry failing fast would drag every other entry's
+    /// schedule down to its own.
     pub async fn run_pass(
         &self,
         revoker: &dyn Revoker,
         audit: &crate::audit::AuditHandle,
     ) -> Result<Vec<PendingRevoke>> {
-        let due = self.take().await?;
+        let now = now_unix_ms();
+        let due = self.take_due(now).await?;
         let mut retry = Vec::new();
         for mut entry in due {
             entry.attempts += 1;
@@ -234,6 +276,7 @@ impl RevokeQueue {
                             entry.mint_id, entry.attempts
                         );
                     } else {
+                        entry.defer(now);
                         retry.push(entry);
                     }
                 }
@@ -320,11 +363,10 @@ pub async fn drain_loop(
             }
         };
 
-        let wait = retry
-            .iter()
-            .map(|entry| backoff(entry.attempts + 1))
-            .min()
-            .unwrap_or(MAX_BACKOFF);
+        // Sleep until the earliest thing on the queue is due, so one stubborn
+        // entry does not hold up one that has only just arrived.
+        let wait = queue.next_due_in().await.unwrap_or(MAX_BACKOFF);
+        let _ = &retry;
 
         tokio::select! {
             _ = crate::server::shutdown_requested(&mut shutdown) => return,
@@ -349,6 +391,7 @@ mod tests {
             config: serde_json::json!({ "host": "127.0.0.1", "dbname": "app" }),
             revoke_token: "{\"grants\":[]}".into(),
             attempts: 0,
+            not_before_unix_ms: 0,
         }
     }
 
@@ -492,6 +535,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_entry_that_is_not_due_yet_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = RevokeQueue::open(dir.path().join(QUEUE_FILE)).unwrap();
+        queue.enqueue(vec![one()]).await.unwrap();
+
+        let revoker = AlwaysFails::default();
+        let audit = audit(dir.path());
+        // The first attempt is immediate and fails, which schedules the second
+        // a second out.
+        queue.run_pass(&revoker, &audit).await.unwrap();
+        assert_eq!(revoker.0.load(Ordering::SeqCst), 1);
+
+        // A pass now must not attempt it again: it is not due.
+        queue.run_pass(&revoker, &audit).await.unwrap();
+        assert_eq!(
+            revoker.0.load(Ordering::SeqCst),
+            1,
+            "an entry inside its backoff window must not be retried early"
+        );
+        assert_eq!(queue.len().await, 1, "and it must still be queued");
+        assert!(queue.next_due_in().await.unwrap() <= BASE_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn one_stubborn_entry_does_not_drag_a_fresh_one_down_to_its_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = RevokeQueue::open(dir.path().join(QUEUE_FILE)).unwrap();
+
+        // An entry that has already burned six attempts, so its next one is a
+        // long way off.
+        let mut stubborn = one();
+        stubborn.attempts = 6;
+        stubborn.not_before_unix_ms = now_unix_ms() + 30_000;
+        queue.enqueue(vec![stubborn]).await.unwrap();
+        // And one that has just arrived.
+        queue.enqueue(vec![two()]).await.unwrap();
+
+        let revoker = AlwaysWorks::default();
+        queue.run_pass(&revoker, &audit(dir.path())).await.unwrap();
+
+        assert_eq!(
+            revoker.0.load(Ordering::SeqCst),
+            1,
+            "only the entry that was due may be attempted"
+        );
+        let left = queue.entries().await;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].attempts, 6, "the waiting entry is untouched");
+    }
+
+    #[tokio::test]
     async fn the_queue_gives_up_after_the_documented_number_of_attempts() {
         let dir = tempfile::tempdir().unwrap();
         let queue = RevokeQueue::open(dir.path().join(QUEUE_FILE)).unwrap();
@@ -500,6 +594,11 @@ mod tests {
         let revoker = AlwaysFails::default();
         let audit = audit(dir.path());
         for _ in 0..MAX_ATTEMPTS {
+            // Attempts are driven directly rather than by waiting out the real
+            // backoff, which would make this test take two minutes.
+            for entry in queue.pending.lock().await.iter_mut() {
+                entry.not_before_unix_ms = 0;
+            }
             queue.run_pass(&revoker, &audit).await.unwrap();
         }
 
@@ -521,6 +620,11 @@ mod tests {
             .run_pass(&AlwaysFails::default(), &audit)
             .await
             .unwrap();
+        // The second attempt is driven directly rather than by waiting out the
+        // backoff the first one scheduled.
+        for entry in queue.pending.lock().await.iter_mut() {
+            entry.not_before_unix_ms = 0;
+        }
         queue
             .run_pass(&AlwaysFails::default(), &audit)
             .await

@@ -274,6 +274,10 @@ async fn mint_one(
             config,
             revoke_token: minted.revoke_token,
             attempts: 0,
+            // Due at once: the common case is a healthy backend, and making
+            // every exec's revoke wait would leave a window where the
+            // credential is still live for no reason.
+            not_before_unix_ms: 0,
         },
     ))
 }

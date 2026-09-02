@@ -63,11 +63,6 @@ impl Daemon {
         }
     }
 
-    /// The temporary `BRIEFCRED_HOME`.
-    pub fn home(&self) -> &Path {
-        self.home.path()
-    }
-
     /// The daemon's socket inside that home.
     pub fn sock(&self) -> PathBuf {
         self.home.path().join("sock")
@@ -92,11 +87,6 @@ impl Daemon {
         std::fs::write(&path, value).expect("write master");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("master mode");
-    }
-
-    /// The daemon's process id, while it is running.
-    pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(Child::id)
     }
 
     /// Start the daemon and wait until it is answering.

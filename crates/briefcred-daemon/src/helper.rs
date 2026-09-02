@@ -191,11 +191,6 @@ impl Helper {
         })
     }
 
-    /// The minter kind this helper serves.
-    pub fn kind(&self) -> &str {
-        &self.kind
-    }
-
     /// Send one call and read its answer.
     pub async fn call(&self, params: HelperParams) -> Result<HelperResult, HelperFailure> {
         let method = params.method().to_string();

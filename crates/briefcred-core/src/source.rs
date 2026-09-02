@@ -94,7 +94,7 @@ pub fn open(kind: SourceKind, paths: &crate::paths::Paths) -> Result<Box<dyn Mas
             #[cfg(not(target_os = "macos"))]
             {
                 Err(Error::Master(
-                    "the keychain master source needs macOS; set `[masters] source = \"file\"` in daemon.toml"
+                    "the keychain master source needs macOS; set `master_source = \"file\"` in daemon.toml"
                         .to_string(),
                 ))
             }
