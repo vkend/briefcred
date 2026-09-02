@@ -559,6 +559,20 @@ dangerous state, so it is worth being exact about what protects it.
 - **Durability: none, deliberately.** No plaintext master, no minted token and
   no signing key is written to a file at any point in a handoff. The blob is
   built in memory, sent, and dropped.
+- **Replay.** The blob echoes the recipient's ephemeral public key inside the
+  signature and carries the second it was issued; the receiver refuses a blob
+  addressed elsewhere, or one more than two minutes from its own clock, before
+  it opens a single master. The key agreement already made the ciphertext
+  useless to anyone else, so what this adds is that a captured blob cannot be
+  replayed at a *later* daemon as though it were current.
+- **The handoff window.** The outgoing daemon refuses `open_session`, `exec`
+  and MCP mints for the length of a handoff, because a session opened there
+  reaches no blob and is adopted by nobody — a credential minted against it
+  would be one that neither daemon holds a revoke for. Anything the outgoing
+  daemon is still holding that the blob did not carry is retired on the way out
+  rather than released, so its mints are queued exactly as on an ordinary
+  shutdown. Two concurrent handoffs are settled by a compare-exchange: two
+  successors would each be sent every descriptor and every master.
 - **Failing closed.** The incoming daemon answers `ready` only after it has
   verified, decrypted, rebuilt and started accepting. Anything short of that is
   a `refused`, and the outgoing daemon keeps running with its sockets and its

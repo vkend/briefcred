@@ -53,6 +53,22 @@ All notable changes to briefcred are recorded here. The format follows
   for something else. The unit's `ListenStream=` order and the daemon's
   adoption order are one fact written in two places, and both are snapshot- and
   unit-tested.
+- **New work is refused for the length of a handoff.** The daemon being
+  replaced goes on accepting IPC until the new one is serving, and a session
+  opened in that window would reach no blob and be adopted by nobody — so a
+  credential minted against it would be one neither daemon holds a revoke for.
+  `open_session`, `exec` and MCP tool calls that mint are answered "the daemon
+  is handing off to a new one; retry" instead, and the retry lands on the new
+  daemon. On the way out the old daemon retires anything it is still holding
+  that the blob did not carry, and releases without revoking only what actually
+  moved. Two concurrent `Handoff` requests are settled by a compare-exchange:
+  exactly one proceeds, the other is refused.
+- **A handoff blob names the daemon it was built for and when.** The
+  recipient's ephemeral public key is echoed inside the signature and checked
+  before a master is opened, and a blob more than two minutes from the
+  receiver's clock is refused. Neither keeps the masters secret — the key
+  agreement does that — but together they stop a blob captured off a socket
+  being presented to a later daemon as though it were current.
 - **`docs/upgrade.md`**: the whole sequence, what an upgrade does and does not
   guarantee, what happens when it fails, and how the launchd and systemd units
   fit around a process the service manager did not start.

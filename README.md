@@ -192,8 +192,10 @@ the sockets never closed; pid 4102 is draining what it had in flight
 
 A session handle a client already holds keeps working against the new process,
 the ports do not move, and an event stream or WebSocket that was open before
-the upgrade runs to its end. Every failure before the confirmation leaves the
-running daemon exactly as it was. On Linux, `briefcred install` also writes a
+the upgrade runs to its end. New sessions and new mints are refused for the
+length of the handoff — the retry lands on the new daemon — because anything
+opened in that window would be adopted by nobody. Every failure before the
+confirmation leaves the running daemon exactly as it was. On Linux, `briefcred install` also writes a
 `briefcred.socket` unit so systemd can hold the listeners across an ordinary
 restart. `docs/upgrade.md` has the whole sequence, what it does and does not
 guarantee, and how the service manager fits around it.

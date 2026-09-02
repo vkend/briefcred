@@ -40,15 +40,44 @@ upgrade has just replaced.
      its session key, and its master credentials — each master encrypted to the
      new daemon's ephemeral key.
 4. **The new daemon verifies, rebuilds and adopts.** It checks the signature
-   against the machine's token-signer key, decrypts the masters, rebuilds the
-   sessions, restores the proxy's revocation set, adopts the descriptors and
-   starts accepting. Then, and only then, it answers `ready`.
+   against the machine's token-signer key, checks that the blob names *this*
+   daemon's ephemeral key and was issued within the last two minutes, decrypts
+   the masters, rebuilds the sessions, restores the proxy's revocation set,
+   adopts the descriptors and starts accepting. Then, and only then, it answers
+   `ready`.
 5. **The old daemon stands down.** It stops accepting, drains the requests and
    streams it was already serving (bounded by `handoff_drain_secs`, thirty
    seconds by default), writes its audit rows, wipes its masters, and exits 0.
 
 Between steps 4 and 5 both processes hold the same listening sockets, so there
 is no instant in which nobody is accepting. That overlap is the design.
+
+## The window, and why new work is refused in it
+
+From step 2 to step 5 the old daemon is still accepting on the IPC socket. A
+session opened in there would reach no blob and be adopted by nobody, so a
+credential minted against it would be one that *neither* daemon holds a revoke
+for — the worst outcome an upgrade could produce.
+
+So for the length of the handoff the old daemon refuses `open_session`, `exec`
+and MCP tool calls that mint, with:
+
+```
+the daemon is handing off to a new one; retry, and the new daemon will answer
+```
+
+The retry lands on the new daemon, because by the time the client sees the
+refusal the sockets are already changing hands. If the handoff fails the
+refusal is lifted and the old daemon carries on as before.
+
+Belt and braces: on the way out, the old daemon retires — that is, queues
+revokes for — any session it is still holding that the blob did *not* carry, and
+releases without revoking only the ones that actually moved. A mint that somehow
+reached the window is caught by that rather than lost.
+
+Two `briefcred daemon upgrade` runs at once are not a race. The claim is taken
+with a compare-exchange, so exactly one proceeds and the other is told `a
+handoff is already in progress on this daemon`.
 
 ## What is guaranteed, and what is not
 
@@ -78,6 +107,13 @@ That is why the new daemon verifies the blob's signature before it adopts
 anything, and why it answers `refused` rather than `ready` when it cannot: a
 handoff that half happened would be two daemons each believing they own the
 socket, which is worse than an upgrade that did not happen.
+
+The blob also names the daemon it was built for — the recipient's ephemeral
+public key is echoed back inside the signature — and carries the second it was
+issued, which is refused if it is more than two minutes from the receiver's own
+clock. Neither is what keeps the masters secret; the key agreement already does
+that. What they buy is that a blob captured off a socket cannot be presented to
+a *later* daemon as though it were current.
 
 ## The service manager still owns the *installed* daemon
 
