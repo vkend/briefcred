@@ -29,6 +29,7 @@
 //! | `http` | request through the HTTP proxy |
 //! | `postgres` | connection through the Postgres proxy |
 //! | `exec` | `briefcred exec` or `briefcred get` that mints |
+//! | `mcp` | `briefcred_db_query` or `briefcred_exec` tool call |
 //!
 //! A Postgres *connection* rather than a statement, because the proxy relays
 //! bytes without parsing them and so has no statements to count — see
@@ -58,6 +59,14 @@ pub const SURFACE_POSTGRES: &str = "postgres";
 
 /// The `surface` label for an `exec` or `get` that mints.
 pub const SURFACE_EXEC: &str = "exec";
+
+/// The `surface` label for an MCP tool call that uses a credential.
+///
+/// `briefcred_db_query` and `briefcred_exec` both run *inside* the daemon
+/// rather than handing a subprocess a credential, so neither passes through
+/// the two proxies or the `exec` handler. Without a surface of their own they
+/// would be the one way to spend a metered profile without being metered.
+pub const SURFACE_MCP: &str = "mcp";
 
 /// Why a charge was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -494,10 +503,10 @@ mod tests {
     }
 
     #[test]
-    fn the_three_surfaces_are_the_ones_the_metric_documents() {
+    fn the_four_surfaces_are_the_ones_the_metric_documents() {
         assert_eq!(
-            [SURFACE_HTTP, SURFACE_POSTGRES, SURFACE_EXEC],
-            ["http", "postgres", "exec"]
+            [SURFACE_HTTP, SURFACE_POSTGRES, SURFACE_EXEC, SURFACE_MCP],
+            ["http", "postgres", "exec", "mcp"]
         );
     }
 }

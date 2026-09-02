@@ -575,7 +575,11 @@ impl McpServer {
         let mut held = self.inner.held.lock().await;
         if let Some(existing) = held.as_ref() {
             return if existing.profile == profile.name {
-                Ok(())
+                // One token per tool call, not per connection. The mint
+                // happened once, but each call is another use of the
+                // credential it produced, and a quota that only counted the
+                // first would bound nothing at all.
+                self.charge_quota(profile, &existing.session_id).await
             } else {
                 Err(invalid(format!(
                     "this MCP connection is already using profile `{}`; one connection mints \
@@ -614,6 +618,18 @@ impl McpServer {
             profile: profile.name.clone(),
             credentials: profile.credentials.len(),
         });
+
+        // Before the mint, and after the session exists because the bucket
+        // lives on it. A refusal here is a `total` already at zero — nothing
+        // else can empty a fresh bucket — and the session it just opened is
+        // closed again rather than left holding masters for a connection that
+        // is about to be told no.
+        if let Err(err) = self.charge_quota(profile, &session_id).await {
+            if let Ok(session) = self.inner.state.sessions().close(&session_id).await {
+                crate::server::retire(&self.inner.state, session, "quota").await;
+            }
+            return Err(err);
+        }
 
         let specs: Vec<_> = profile.credentials.iter().collect();
         let (masters, helpers) = self
@@ -675,6 +691,43 @@ impl McpServer {
             mints: minted.mints,
         });
         Ok(())
+    }
+
+    /// Take one token off the session's quota, or refuse the tool call.
+    ///
+    /// A tool call is charged like a `briefcred exec`, because that is what it
+    /// is: the daemon uses a credential on the caller's behalf. The message
+    /// names the profile and, where waiting would help, how long — a spent
+    /// `quota.total` gets no wait, because no wait would help.
+    async fn charge_quota(&self, profile: &Profile, session_id: &str) -> Result<(), McpError> {
+        let bucket = self
+            .inner
+            .state
+            .sessions()
+            .with_session(session_id, |session| session.quota.clone())
+            .await
+            .ok()
+            .flatten();
+        crate::quota::charge(
+            bucket.as_deref(),
+            &profile.name,
+            crate::quota::SURFACE_MCP,
+            self.inner.state.metrics(),
+        )
+        .map_err(|refusal| {
+            invalid(match refusal.retry_after() {
+                Some(retry_after) => format!(
+                    "profile `{}` is over its quota; try again in {}s",
+                    profile.name,
+                    retry_after.as_secs()
+                ),
+                None => format!(
+                    "profile `{}` has spent its session quota (`quota.total`); \
+                     start a new MCP connection",
+                    profile.name
+                ),
+            })
+        })
     }
 
     /// The principals this connection has minted, for an audit row.

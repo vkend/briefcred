@@ -173,10 +173,10 @@ impl Metrics {
 
     /// Count one charge a quota refused, by profile and by surface.
     ///
-    /// `surface` is `http`, `postgres`, or `exec`. Which one matters: the same
-    /// bucket is spent by all three, so a profile whose rejections are all
-    /// `exec` is one whose burst is too small for how often it is run, and one
-    /// whose rejections are all `http` is an agent in a loop.
+    /// `surface` is `http`, `postgres`, `exec`, or `mcp`. Which one matters:
+    /// the same bucket is spent by all four, so a profile whose rejections are
+    /// all `exec` is one whose burst is too small for how often it is run, and
+    /// one whose rejections are all `http` is an agent in a loop.
     pub fn record_quota_rejection(&self, profile: &str, surface: &str) {
         *self
             .quota_rejections
