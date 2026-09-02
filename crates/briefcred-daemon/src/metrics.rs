@@ -118,7 +118,15 @@ pub struct Metrics {
     revoke_failures: Mutex<BTreeMap<String, u64>>,
     proxy_requests: Mutex<BTreeMap<(String, String), u64>>,
     proxy_latency: Mutex<Histogram>,
+    pgproxy_connections: Mutex<BTreeMap<String, u64>>,
+    pgproxy_bytes: Mutex<BTreeMap<&'static str, u64>>,
 }
+
+/// The direction labels on `briefcred_pgproxy_bytes_total`.
+///
+/// Seeded at zero so a proxy nobody has connected through is distinguishable
+/// from a scrape that failed.
+const PGPROXY_DIRECTIONS: [&str; 2] = ["client_to_server", "server_to_client"];
 
 impl Metrics {
     /// Start the clock, with every request series pre-seeded at zero.
@@ -136,7 +144,37 @@ impl Metrics {
             revoke_failures: Mutex::new(BTreeMap::new()),
             proxy_requests: Mutex::new(BTreeMap::new()),
             proxy_latency: Mutex::new(Histogram::default()),
+            pgproxy_connections: Mutex::new(BTreeMap::new()),
+            pgproxy_bytes: Mutex::new(PGPROXY_DIRECTIONS.iter().map(|name| (*name, 0)).collect()),
         }
+    }
+
+    /// Record one connection through the Postgres proxy, by how it ended.
+    ///
+    /// `outcome` is one of four. `allow` was authenticated and relayed;
+    /// `deny` was refused because the client's token did not authorise the
+    /// connection it asked for; `upstream_error` was authorised and the real
+    /// server would not have it; `protocol_error` never got as far as either,
+    /// because what arrived was not a PostgreSQL connection briefcred serves.
+    ///
+    /// The same split as the HTTP proxy's `decision`, and for the same reason:
+    /// a rising `deny` means a profile or a stale token, a rising
+    /// `upstream_error` means somebody should go and look at the database, and
+    /// conflating them would make neither actionable.
+    pub fn record_pgproxy_connection(&self, outcome: &str) {
+        *self
+            .pgproxy_connections
+            .lock()
+            .expect("metrics mutex")
+            .entry(outcome.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// Record the bytes one relayed connection moved, in each direction.
+    pub fn record_pgproxy_bytes(&self, client_bytes: u64, server_bytes: u64) {
+        let mut bytes = self.pgproxy_bytes.lock().expect("metrics mutex");
+        *bytes.entry(PGPROXY_DIRECTIONS[0]).or_insert(0) += client_bytes;
+        *bytes.entry(PGPROXY_DIRECTIONS[1]).or_insert(0) += server_bytes;
     }
 
     /// Record one request that crossed the HTTP proxy.
@@ -286,6 +324,31 @@ impl Metrics {
             "Time taken by one proxied request, by policy decision.",
             &mut out,
         );
+
+        out.push_str(
+            "# HELP briefcred_pgproxy_connections_total Connections through the Postgres proxy, by outcome.\n",
+        );
+        out.push_str("# TYPE briefcred_pgproxy_connections_total counter\n");
+        for (outcome, count) in self
+            .pgproxy_connections
+            .lock()
+            .expect("metrics mutex")
+            .iter()
+        {
+            out.push_str(&format!(
+                "briefcred_pgproxy_connections_total{{outcome=\"{outcome}\"}} {count}\n"
+            ));
+        }
+
+        out.push_str(
+            "# HELP briefcred_pgproxy_bytes_total Bytes relayed by the Postgres proxy, by direction.\n",
+        );
+        out.push_str("# TYPE briefcred_pgproxy_bytes_total counter\n");
+        for (direction, count) in self.pgproxy_bytes.lock().expect("metrics mutex").iter() {
+            out.push_str(&format!(
+                "briefcred_pgproxy_bytes_total{{direction=\"{direction}\"}} {count}\n"
+            ));
+        }
         out
     }
 }
@@ -438,6 +501,41 @@ mod tests {
     }
 
     #[test]
+    fn a_postgres_connection_appears_with_its_outcome_and_its_byte_counts() {
+        let metrics = Metrics::new(Arc::new(AtomicU64::new(0)));
+        metrics.record_pgproxy_connection("allow");
+        metrics.record_pgproxy_connection("allow");
+        metrics.record_pgproxy_connection("deny");
+        metrics.record_pgproxy_bytes(40, 900);
+        metrics.record_pgproxy_bytes(2, 8);
+
+        let text = metrics.render();
+        for expected in [
+            "briefcred_pgproxy_connections_total{outcome=\"allow\"} 2",
+            "briefcred_pgproxy_connections_total{outcome=\"deny\"} 1",
+            "briefcred_pgproxy_bytes_total{direction=\"client_to_server\"} 42",
+            "briefcred_pgproxy_bytes_total{direction=\"server_to_client\"} 908",
+        ] {
+            assert!(text.contains(expected), "{expected} missing from:\n{text}");
+        }
+    }
+
+    #[test]
+    fn both_postgres_byte_directions_are_present_from_the_first_scrape() {
+        // A counter that only appears once it is non-zero cannot be told apart
+        // from a scrape that failed.
+        let text = Metrics::new(Arc::new(AtomicU64::new(0))).render();
+        for direction in PGPROXY_DIRECTIONS {
+            assert!(
+                text.contains(&format!(
+                    "briefcred_pgproxy_bytes_total{{direction=\"{direction}\"}} 0"
+                )),
+                "{direction} missing from:\n{text}"
+            );
+        }
+    }
+
+    #[test]
     fn every_status_maps_to_the_class_it_belongs_to() {
         assert_eq!(status_class(None), "none");
         assert_eq!(status_class(Some(100)), "1xx");
@@ -559,6 +657,8 @@ mod tests {
             "briefcred_mint_duration_seconds",
             "briefcred_revoke_duration_seconds",
             "briefcred_revoke_failures_total",
+            "briefcred_pgproxy_connections_total",
+            "briefcred_pgproxy_bytes_total",
         ] {
             assert!(text.contains(&format!("# HELP {series} ")), "{series}");
             assert!(text.contains(&format!("# TYPE {series} ")), "{series}");
