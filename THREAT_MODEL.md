@@ -438,6 +438,18 @@ rather than a hole:
 - The connection does not outlive its grant. Expiry, revocation, or the session
   closing ends both halves within about a second, on the same one-second poll
   the Postgres proxy uses.
+- The connection spends the session's byte budget while it runs. Bytes going
+  towards the client are added to the session's total once a second or every
+  64 KiB, so a Cedar `context.resp_bytes_so_far` cannot be stepped around by
+  asking for a socket instead of a response.
+
+One more thing is worth being precise about, because it is easy to read the
+counts as more than they are. `Sec-WebSocket-Extensions` is forwarded as the two
+ends negotiated it, and briefcred does not parse it. Under `permessage-deflate`
+the payloads are compressed: `bytes_up` and `bytes_down` are wire bytes, not
+application bytes, and `events_or_frames` counts frame headers, of which a
+fragmented message has several. The counts bound what crossed the wire. They are
+not a measure of what was said.
 
 An event stream is a narrower case of the same trade: its body is forwarded
 rather than examined, but it is a response, so the policy already decided the

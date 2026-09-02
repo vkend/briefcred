@@ -38,6 +38,15 @@ All notable changes to briefcred are recorded here. The format follows
 - **A stream does not outlive its grant.** The same one-second liveness poll the
   Postgres proxy runs on a live connection now runs for as long as a stream is
   open, and ends both halves on expiry, revocation, or the session closing.
+- **A WebSocket spends the session's byte budget while it is open.** Bytes going
+  towards the client are added to the session's running total once a second or
+  every 64 KiB, so a Cedar `context.resp_bytes_so_far` cannot be stepped around
+  by asking for a socket instead of a response.
+- **A new `bad_request` decision** on `proxy_request` rows and
+  `briefcred_proxy_requests_total`, for a request briefcred could not act on —
+  today, a WebSocket handshake with no `Sec-WebSocket-Key`. Kept out of `deny`
+  because nothing refused it: the policy was never asked, and a client's own bug
+  does not belong in the series an operator reads to find a narrow profile.
 - **Signed profile distribution**, and with it Phase 8 of the roadmap. A
   profile fetched from somewhere else names the hosts a subprocess may reach
   and the credentials briefcred will mint, so briefcred now keeps two kinds of

@@ -886,6 +886,7 @@ policy outcomes:
 | `deny` | the policy refused it, or the token did not authorise | absent |
 | `would_deny` | the policy refused it and the profile is observing | the upstream's |
 | `quota` | the session's budget was spent; the policy was never asked | absent |
+| `bad_request` | the request was malformed; nothing decided it | absent |
 | `swap_error` | the policy allowed it; the credential would not go in | absent |
 | `upstream_error` | the policy allowed it; the upstream was unreachable | absent |
 
@@ -980,6 +981,20 @@ Each stream gets a `proxy_stream` audit row when it ends, alongside the
 blocks that carried a `data:` field, or WebSocket frame headers in both
 directions. No event's data and no frame's payload is read to produce it, and a
 WebSocket payload is never unmasked.
+
+`Sec-WebSocket-Extensions` is passed through as the client and upstream
+negotiated it, and briefcred does not read what it says. If they agree on
+`permessage-deflate`, the payloads on the wire are compressed and briefcred goes
+on counting frame headers and wire bytes without noticing: `bytes_up` and
+`bytes_down` are bytes as they crossed the connection, not bytes as the
+application saw them, and `events_or_frames` is frame headers rather than
+messages, which a fragmented message makes more than one of.
+
+A WebSocket also spends the session's byte budget. The bytes running towards the
+client are added to the session's running total as the socket carries them, once
+a second or every 64 KiB, so a Cedar `context.resp_bytes_so_far` sees a
+long-lived socket spending its budget while it is still open rather than only
+once it closes.
 
 A stream does not outlive its grant. The same one-second liveness poll the
 Postgres proxy uses runs for as long as a stream is open, and expiry,

@@ -487,9 +487,17 @@ handshake goes upstream intact; briefcred forwarded the client's own
 and byte-forwarded. The frame parser reads opcode, mask bit, and length, steps
 over the payload, and never unmasks one.
 
+`Sec-WebSocket-Extensions` is forwarded as negotiated and never parsed, so under
+`permessage-deflate` the bytes counted are wire bytes and the frames counted are
+frame headers rather than messages.
+
 Each stream writes a `ProxyStream` row when it closes, in addition to the
 `ProxyRequest` row for the head that opened it. A stream that ran for an hour
-would otherwise be one row written at the start with nothing after it.
+would otherwise be one row written at the start with nothing after it. A
+WebSocket also feeds the session's `HttpCounters` as it runs — once a second or
+every 64 KiB, with the tail flushed from a `Drop` so a relay briefcred cut off
+is still charged for what it carried. Without that, `context.resp_bytes_so_far`
+would be a budget an agent could step around by asking for a socket.
 
 Neither outlives its grant. `until_stale` is the same one-second poll
 `pgproxy` runs on a live connection, mirrored rather than shared so that

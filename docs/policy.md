@@ -237,14 +237,17 @@ Every request through the proxy writes one audit row, whatever happened to it:
 | `deny` | the policy refused it, or the token did not authorise |
 | `would_deny` | the policy refused it and `policy_mode` is `observe` |
 | `quota` | the session's `quota` was spent; the policy was never asked |
+| `bad_request` | the request was malformed; nothing decided it |
 | `swap_error` | the policy allowed it; briefcred could not attach the credential |
 | `upstream_error` | the policy allowed it; the upstream was unreachable |
 
-The last three are deliberately **not** `deny`. They are the cases where your
+The last four are deliberately **not** `deny`. They are the cases where your
 policy was right and something else happened, so a rising `deny` count means
 a policy that is too narrow, a rising `would_deny` count means a profile
 somebody forgot to promote to `enforce`, a rising `quota` count means an agent
-doing too much of something it is allowed to do, and a rising `swap_error` or
+doing too much of something it is allowed to do, a rising `bad_request` count
+means a client sending something briefcred cannot act on — today, a WebSocket
+handshake with no `Sec-WebSocket-Key` — and a rising `swap_error` or
 `upstream_error` count means nobody needs to touch the policy at all.
 
 A policy limit and a quota are told apart on the wire too: a policy refusal is
