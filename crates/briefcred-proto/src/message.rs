@@ -297,6 +297,15 @@ pub enum Response {
         /// whether the port was taken.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pg_proxy_addr: Option<String>,
+        /// Whether this daemon is in the middle of handing off to a new one.
+        ///
+        /// True from the moment the daemon is asked to hand over until it
+        /// stops serving. Requests that would create something the successor
+        /// will not inherit — a session, a mint — are refused in that window,
+        /// so a client that is told "handing off" can ask what state the
+        /// daemon is in rather than inferring it from the refusal.
+        #[serde(default)]
+        handing_over: bool,
     },
     /// Acknowledgement of [`Request::Shutdown`], sent before the daemon stops.
     ShuttingDown,

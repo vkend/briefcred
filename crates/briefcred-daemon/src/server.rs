@@ -547,6 +547,7 @@ async fn handle_status(_request: Request, state: Arc<State>) -> Response {
         metrics_addr: state.metrics_addr.clone(),
         proxy_addr: state.proxy_addr.clone(),
         pg_proxy_addr: state.pg_proxy_addr.clone(),
+        handing_over: state.handing_over(),
     }
 }
 

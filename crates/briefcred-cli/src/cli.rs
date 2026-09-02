@@ -786,12 +786,17 @@ fn print_status(status: &Response, sock: &Path) {
         metrics_addr,
         proxy_addr,
         pg_proxy_addr,
+        handing_over,
     } = status
     else {
         return;
     };
 
-    println!("briefcred daemon is running");
+    if *handing_over {
+        println!("briefcred daemon is handing off to a new one");
+    } else {
+        println!("briefcred daemon is running");
+    }
     println!("  version    {version}");
     println!("  pid        {pid}");
     println!("  uptime     {}", human_uptime(*uptime_secs));

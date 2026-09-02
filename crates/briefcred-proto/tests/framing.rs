@@ -21,6 +21,7 @@ fn sample_status() -> Response {
         metrics_addr: Some("127.0.0.1:9317".into()),
         proxy_addr: Some("127.0.0.1:9318".into()),
         pg_proxy_addr: Some("127.0.0.1:9319".into()),
+        handing_over: false,
     }
 }
 

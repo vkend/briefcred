@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use briefcred_e2e::daemon_harness::{binary_dir, Daemon};
+use briefcred_e2e::daemon_harness::{binary_dir, wait_until, Daemon};
 use briefcred_proto::{Request, Response};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -666,9 +666,34 @@ async fn a_session_asked_for_during_the_handoff_window_is_refused() {
         .spawn()
         .expect("start briefcred daemon upgrade");
 
+    // Wait for the window rather than sleeping into it.
+    //
+    // A fixed sleep raced the takeover spawn from both sides: too short and
+    // the outgoing daemon had not been asked to hand over yet, so it answered
+    // normally and opened a session that should never have existed; too long
+    // on a loaded machine and the window had already closed. The daemon says
+    // which state it is in, so ask it. `Status` is the right thing to poll
+    // because it is refused by nothing and creates nothing — polling with
+    // `OpenSession` would open real sessions on every attempt before the
+    // window and change what the successor inherits.
+    let opened = wait_until(Duration::from_secs(30), || async {
+        matches!(
+            fixture.daemon.request(Request::Status).await,
+            Ok(Response::Status {
+                handing_over: true,
+                ..
+            })
+        )
+    })
+    .await;
+    assert!(
+        opened,
+        "the handoff window never opened:\n{}",
+        fixture.daemon.log()
+    );
+
     // Inside the window: the old daemon has been asked to hand over and the
     // new one has not yet been given anything.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
     let refusals = [
         fixture
             .daemon
