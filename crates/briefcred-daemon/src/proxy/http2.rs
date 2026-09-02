@@ -240,26 +240,30 @@ impl Upstreams {
         Ok(dialled)
     }
 
-    /// Send one request on a multiplexed upstream connection.
-    pub async fn send(
-        sender: &mut H2Sender,
-        request: Request<UpstreamBody>,
-    ) -> Result<Response<Incoming>> {
-        sender
-            .ready()
-            .await
-            .map_err(|e| Error::Proxy(format!("the upstream connection stalled: {e}")))?;
-        sender
-            .send_request(request)
-            .await
-            .map_err(|e| Error::Proxy(format!("upstream refused the request: {e}")))
-    }
-
     /// How many upstream connections are cached, for the tests.
     #[cfg(test)]
     async fn len(&self) -> usize {
         self.connections.lock().await.len()
     }
+}
+
+/// Send one request on a multiplexed upstream connection.
+///
+/// `ready` first, because a connection at its stream limit is not an error: it
+/// is a connection to wait a moment for, and sending without asking would fail
+/// the request instead.
+pub async fn send_on(
+    sender: &mut H2Sender,
+    request: Request<UpstreamBody>,
+) -> Result<Response<Incoming>> {
+    sender
+        .ready()
+        .await
+        .map_err(|e| Error::Proxy(format!("the upstream connection stalled: {e}")))?;
+    sender
+        .send_request(request)
+        .await
+        .map_err(|e| Error::Proxy(format!("upstream refused the request: {e}")))
 }
 
 /// The headers HTTP/2 has no place for, which a client on HTTP/1.1 may send.

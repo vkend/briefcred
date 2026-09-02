@@ -965,7 +965,7 @@ async fn send_upstream(
     host: &str,
     port: u16,
     key: http2::UpstreamKey,
-    request: Request<http2::UpstreamBody>,
+    mut request: Request<http2::UpstreamBody>,
     upgrades: bool,
 ) -> Result<Response<Incoming>> {
     // A WebSocket handshake, or a plain `http://` upstream where there is no
@@ -982,7 +982,6 @@ async fn send_upstream(
             .map_err(|e| Error::Proxy(format!("upstream refused the request: {e}")));
     }
 
-    let mut request = request;
     let dialled = proxy
         .upstreams
         .connect(key, || dial(proxy, scheme, host, port))
@@ -997,7 +996,7 @@ async fn send_upstream(
             // which hyper takes from the URI. Origin-form is an HTTP/1.1
             // spelling and leaves it with nothing to put there.
             *request.uri_mut() = absolute_form(scheme, host, port, request.uri());
-            http2::Upstreams::send(&mut sender, request).await
+            http2::send_on(&mut sender, request).await
         }
         http2::Dialled::Http1(mut sender) => sender
             .send_request(request)
@@ -1030,7 +1029,7 @@ async fn dial(proxy: &Proxy, scheme: &str, host: &str, port: u16) -> Result<http
 }
 
 /// A connected upstream, and what its ALPN said it speaks.
-struct Upstream {
+struct Connected {
     stream: TokioIo<UpstreamStream>,
     http2: bool,
 }
@@ -1053,13 +1052,13 @@ async fn connect_upstream(
     host: &str,
     port: u16,
     upgrades: bool,
-) -> Result<Upstream> {
+) -> Result<Connected> {
     let stream = TcpStream::connect((host, port))
         .await
         .map_err(|e| Error::Proxy(format!("cannot connect to `{host}:{port}`: {e}")))?;
 
     if scheme != "https" {
-        return Ok(Upstream {
+        return Ok(Connected {
             stream: TokioIo::new(UpstreamStream::Plain(stream)),
             http2: false,
         });
@@ -1076,7 +1075,7 @@ async fn connect_upstream(
         .await
         .map_err(|e| Error::Proxy(format!("`{host}` did not verify: {e}")))?;
     let http2 = tls.get_ref().1.alpn_protocol() == Some(crate::proxy::tls::ALPN_H2);
-    Ok(Upstream {
+    Ok(Connected {
         stream: TokioIo::new(UpstreamStream::Tls(Box::new(tls))),
         http2,
     })

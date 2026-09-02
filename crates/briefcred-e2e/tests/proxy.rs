@@ -2189,8 +2189,16 @@ async fn a_grpc_method_the_policy_does_not_permit_never_reaches_the_upstream() {
 /// How many unary calls each side of the latency comparison makes.
 const LATENCY_CALLS: usize = 200;
 
+/// What the proxy adds to a gRPC call, measured against the same call direct.
+///
+/// The budget is a ratio with an absolute allowance on top, and on loopback it
+/// is the allowance that binds: a direct call here is around a hundred
+/// microseconds, and the proxied path terminates one TLS session and originates
+/// a second on top of the token check, the quota charge, the Cedar decision and
+/// an audit row. So this asserts a bound on the *added* time rather than a
+/// ratio, which is the honest thing to assert against a denominator this small.
 #[tokio::test]
-async fn the_proxy_costs_less_than_a_tenth_of_the_direct_latency() {
+async fn the_proxy_stays_within_its_latency_budget_over_two_hundred_calls() {
     let fixture = start_with(&grpc_profile()).await;
     let direct = grpc::direct(fixture.upstream.grpc.port, &fixture.upstream.ca_pem).await;
     let proxied =

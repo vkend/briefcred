@@ -622,6 +622,76 @@ mod tests {
     }
 
     #[test]
+    fn an_http2_connection_row_carries_a_shape_and_no_content() {
+        let entry = AuditEntry::ProxyH2Connection {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            connection_id: "h2-9f31c0a2b4de".into(),
+            mint_id: MintId::generate(),
+            host: "api.openai.com".into(),
+            started: OffsetDateTime::UNIX_EPOCH,
+            ended: OffsetDateTime::UNIX_EPOCH,
+            streams: 140,
+            bytes_up: 81_204,
+            bytes_down: 2_140_338,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["event"], "proxy_h2_connection");
+        assert_eq!(json["connection_id"], "h2-9f31c0a2b4de");
+        assert_eq!(json["streams"], 140);
+        assert_eq!(entry.mint_ids().len(), 1);
+
+        // The field list is the whole promise, as it is for every proxy row.
+        // There is no path and no status because a connection has many of each,
+        // and nothing from a stream's headers, body, or trailers because there
+        // is nowhere here to put one.
+        let mut fields: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            [
+                "bytes_down",
+                "bytes_up",
+                "connection_id",
+                "ended",
+                "event",
+                "host",
+                "mint_id",
+                "started",
+                "streams",
+                "ts",
+            ]
+        );
+
+        let back: AuditEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn a_request_row_names_its_connection_only_when_it_had_one() {
+        let row = |connection_id: Option<String>| AuditEntry::ProxyRequest {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            mint_id: MintId::generate(),
+            method: "POST".into(),
+            host: "api.openai.com".into(),
+            path: "/v1/responses".into(),
+            status: Some(200),
+            req_bytes: 12,
+            resp_bytes: 34,
+            latency_ms: 5,
+            decision: "allow".into(),
+            connection_id,
+        };
+        // HTTP/1.1: the key is absent altogether, so a row is what it always
+        // was and an older reader parses it unchanged.
+        let http1 = serde_json::to_value(row(None)).unwrap();
+        assert!(http1.get("connection_id").is_none(), "{http1}");
+
+        let http2 = serde_json::to_value(row(Some("h2-9f31c0a2b4de".into()))).unwrap();
+        assert_eq!(http2["connection_id"], "h2-9f31c0a2b4de");
+    }
+
+    #[test]
     fn a_stream_row_carries_framing_counts_and_no_content() {
         let entry = AuditEntry::ProxyStream {
             ts: OffsetDateTime::UNIX_EPOCH,
