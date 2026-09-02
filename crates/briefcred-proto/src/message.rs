@@ -161,6 +161,21 @@ pub enum Request {
     /// widens no boundary. What it does widen is *capability*: see
     /// `THREAT_MODEL.md`.
     Mcp,
+    /// Hand this daemon's listeners and sessions to a newly started one.
+    ///
+    /// `briefcred daemon upgrade` starts the replacement with
+    /// `--takeover <socket>` and then sends this. The daemon connects to that
+    /// socket, passes its listening descriptors and a signed copy of its open
+    /// sessions, and — only once the new daemon has confirmed it is serving —
+    /// stops accepting, drains what is still in flight, and exits.
+    ///
+    /// Nothing on this request is a secret: it names a path. The masters cross
+    /// the handoff socket encrypted to the new daemon's ephemeral key, and
+    /// never touch this one.
+    Handoff {
+        /// The `--takeover` socket the new daemon is waiting on.
+        socket: String,
+    },
     /// Ask whether a command *would* be permitted, minting nothing.
     ///
     /// The hook's question. It runs before the agent's tool call, so it must
@@ -205,6 +220,7 @@ impl Request {
             Request::Exec { .. } => "exec",
             Request::Mcp => "mcp",
             Request::ExecDone { .. } => "exec_done",
+            Request::Handoff { .. } => "handoff",
             Request::HookCheck { .. } => "hook_check",
             #[cfg(feature = "debug-heapscan")]
             Request::HeapScan { .. } => "heap_scan",
@@ -225,6 +241,7 @@ impl Request {
         "mcp",
         "exec_done",
         "hook_check",
+        "handoff",
         #[cfg(feature = "debug-heapscan")]
         "heap_scan",
     ];
@@ -353,6 +370,18 @@ pub enum Response {
     McpReady {
         /// The daemon binary's crate version.
         version: String,
+    },
+    /// Answer to [`Request::Handoff`]: the new daemon has taken over.
+    ///
+    /// Sent while the old daemon is still draining, because the client asked
+    /// "did the upgrade work" and the answer is already known: the sockets and
+    /// the sessions are the new daemon's, and everything after this is the old
+    /// one finishing what it had already started.
+    HandoffComplete {
+        /// The process id now serving.
+        to_pid: u32,
+        /// How many sessions moved across.
+        sessions: usize,
     },
     /// Answer to [`Request::HookCheck`].
     HookDecision {

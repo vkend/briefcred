@@ -166,6 +166,21 @@ impl ProxyIssuer {
     pub fn revoked_count(&self) -> usize {
         self.revocations.len()
     }
+
+    /// Every retired grant, for a handoff. See [`RevocationSet::export`].
+    pub fn export_revocations(&self) -> Vec<(String, String, i64)> {
+        self.revocations.export()
+    }
+
+    /// The signing key, loading it if this is the first thing to ask.
+    ///
+    /// Public because the handoff signs its state blob with the same key, and
+    /// a daemon must not end up with two `TokenSigner`s racing to create one:
+    /// the loser's key is written over, and every token the winner signed stops
+    /// verifying.
+    pub fn token_signer(&self) -> briefcred_core::Result<Arc<TokenSigner>> {
+        self.signer()
+    }
 }
 
 #[cfg(test)]

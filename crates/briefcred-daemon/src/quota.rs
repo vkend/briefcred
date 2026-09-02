@@ -170,6 +170,40 @@ impl TokenBucket {
         }
     }
 
+    /// A bucket for `quota` resumed at `state`, for a handed-over session.
+    ///
+    /// The position is restored rather than the bucket restarted: an upgrade
+    /// that handed every running agent a full burst would make `briefcred
+    /// daemon upgrade` the way around a quota.
+    pub fn resume(quota: &Quota, clock: Arc<dyn Clock>, tokens: f64, spent: u64) -> TokenBucket {
+        let burst = f64::from(quota.burst);
+        let refilled_at = clock.now();
+        TokenBucket {
+            rate: quota.rate,
+            burst,
+            total: quota.total,
+            clock,
+            state: Mutex::new(State {
+                // Clamped to the *new* profile's burst: an operator who
+                // tightened the quota between the two daemons must not have
+                // the old daemon's larger balance survive the upgrade.
+                tokens: tokens.clamp(0.0, burst),
+                refilled_at,
+                spent,
+            }),
+        }
+    }
+
+    /// The bucket's position, brought up to date, for a handoff.
+    pub fn snapshot(&self) -> (f64, u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.refill(&mut state);
+        (state.tokens, state.spent)
+    }
+
     /// Take one token, or say why not, and report how full the bucket is left.
     pub fn charge(&self) -> Charge {
         let mut state = self

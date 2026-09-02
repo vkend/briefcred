@@ -52,6 +52,70 @@ macro_rules! handler {
     }};
 }
 
+/// How many connections are still being served, and a way to wait for zero.
+///
+/// The IPC listener drains by counting its own connection tasks, which works
+/// because every one of them is awaited by [`serve`]. The proxies cannot do
+/// that: a `CONNECT` tunnel outlives the connection future that produced it, so
+/// the task holding a live event stream is not the task the accept loop
+/// spawned. A counter every such task holds a guard on is the one thing that
+/// covers all of them, and it is what makes "drain before exiting" mean the
+/// streams and not merely the sockets.
+#[derive(Debug, Clone, Default)]
+pub struct InFlight {
+    open: Arc<std::sync::atomic::AtomicUsize>,
+    idle: Arc<tokio::sync::Notify>,
+}
+
+impl InFlight {
+    /// Count one piece of work until the returned guard is dropped.
+    pub fn guard(&self) -> InFlightGuard {
+        self.open.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InFlightGuard {
+            open: Arc::clone(&self.open),
+            idle: Arc::clone(&self.idle),
+        }
+    }
+
+    /// How much is still in flight.
+    pub fn open(&self) -> usize {
+        self.open.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until nothing is in flight, or until `within` has passed.
+    ///
+    /// Reports what was still open when it gave up, so the caller can say so
+    /// rather than exiting quietly on top of a stream somebody was reading.
+    pub async fn drained(&self, within: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + within;
+        while self.open() > 0 {
+            let notified = self.idle.notified();
+            if self.open() == 0 {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break;
+            }
+        }
+        self.open()
+    }
+}
+
+/// One counted piece of work. Dropping it is what reports it finished.
+#[derive(Debug)]
+pub struct InFlightGuard {
+    open: Arc<std::sync::atomic::AtomicUsize>,
+    idle: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.open.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            self.idle.notify_waiters();
+        }
+    }
+}
+
 /// Everything a handler needs, shared across every connection.
 #[derive(Debug)]
 pub struct State {
@@ -74,6 +138,12 @@ pub struct State {
     raw_args: bool,
     mcp_query_timeout: Duration,
     proxy: Option<Arc<crate::proxy::issuer::ProxyIssuer>>,
+    keystore: Arc<dyn briefcred_core::keystore::KeyStore>,
+    signer: Mutex<Option<Arc<crate::proxy::token::TokenSigner>>>,
+    in_flight: InFlight,
+    handed_off: Mutex<Option<u32>>,
+    drain: Duration,
+    listener_fds: Vec<(crate::handoff::Slot, std::os::fd::RawFd)>,
 }
 
 /// Everything [`State::new`] needs, as a struct.
@@ -116,6 +186,17 @@ pub struct StateParts {
     pub mcp_query_timeout: Duration,
     /// The HTTP proxy's token authority, when the proxy is enabled.
     pub proxy: Option<Arc<crate::proxy::issuer::ProxyIssuer>>,
+    /// Where the token-signer key lives, for signing a handoff blob.
+    pub keystore: Arc<dyn briefcred_core::keystore::KeyStore>,
+    /// How long in-flight proxy work gets to finish after a handoff.
+    pub drain: Duration,
+    /// The listening descriptors, so a handoff can pass them on.
+    ///
+    /// Raw descriptors rather than the listeners themselves: the accept loops
+    /// own those, and a handoff only ever needs to name them to `sendmsg`. They
+    /// stay valid for as long as this daemon is serving, which is exactly as
+    /// long as a handoff can happen.
+    pub listener_fds: Vec<(crate::handoff::Slot, std::os::fd::RawFd)>,
 }
 
 impl State {
@@ -141,7 +222,60 @@ impl State {
             raw_args: parts.raw_args,
             mcp_query_timeout: parts.mcp_query_timeout,
             proxy: parts.proxy,
+            keystore: parts.keystore,
+            signer: Mutex::new(None),
+            in_flight: InFlight::default(),
+            handed_off: Mutex::new(None),
+            drain: parts.drain,
+            listener_fds: parts.listener_fds,
         }
+    }
+
+    /// The counter every proxy connection and tunnel holds a guard on.
+    pub fn in_flight(&self) -> &InFlight {
+        &self.in_flight
+    }
+
+    /// How long in-flight work gets to finish after a handoff.
+    pub fn drain(&self) -> Duration {
+        self.drain
+    }
+
+    /// The machine's token-signer key.
+    ///
+    /// Delegated to the proxy's issuer whenever there is one, so a daemon never
+    /// holds two `TokenSigner`s: both would call `load_or_create`, and on a
+    /// machine with no key yet the second would overwrite the first and every
+    /// token the first signed would stop verifying. A daemon with the proxy
+    /// switched off has no other reader, so it caches one of its own.
+    pub fn token_signer(&self) -> briefcred_core::Result<Arc<crate::proxy::token::TokenSigner>> {
+        if let Some(proxy) = &self.proxy {
+            return proxy.token_signer();
+        }
+        let mut cached = self.signer.lock().expect("signer mutex");
+        if let Some(signer) = cached.as_ref() {
+            return Ok(Arc::clone(signer));
+        }
+        let signer = Arc::new(crate::proxy::token::TokenSigner::load_or_create(
+            self.keystore.as_ref(),
+        )?);
+        *cached = Some(Arc::clone(&signer));
+        Ok(signer)
+    }
+
+    /// Record that this daemon's listeners and sessions are now another's.
+    ///
+    /// Two things change once this is set, and both are about not undoing what
+    /// the new daemon is relying on: the socket file is left alone rather than
+    /// unlinked, and the sessions are wiped without being retired — their
+    /// mints belong to the daemon still serving them.
+    pub fn handed_off_to(&self, pid: u32) {
+        *self.handed_off.lock().expect("handoff mutex") = Some(pid);
+    }
+
+    /// The pid this daemon handed everything to, if it did.
+    pub fn handed_off(&self) -> Option<u32> {
+        *self.handed_off.lock().expect("handoff mutex")
     }
 
     /// The HTTP proxy's token authority, when the proxy is enabled.
@@ -317,6 +451,7 @@ pub fn dispatch_table() -> HashMap<&'static str, Handler> {
     table.insert("exec", handler!(handle_exec));
     table.insert("exec_done", handler!(handle_exec_done));
     table.insert("hook_check", handler!(handle_hook_check));
+    table.insert("handoff", handler!(handle_handoff));
     #[cfg(feature = "debug-heapscan")]
     table.insert("heap_scan", handler!(handle_heap_scan));
     table
@@ -469,6 +604,17 @@ pub async fn retire(state: &Arc<State>, session: Session, reason: &str) {
             eprintln!("briefcred-daemon: cannot queue an orphaned revoke: {err}");
         }
     }
+    session.helpers.stop_all().await;
+}
+
+/// Let a handed-over session go without revoking anything it minted.
+///
+/// The mirror of [`retire`], for the one case where the mints are not orphaned:
+/// another daemon is now holding this very session and will revoke them when
+/// its own client says so. Queueing them here would kill credentials the
+/// process that took over is still serving. The helpers are still stopped and
+/// the masters are still wiped when `session` is dropped.
+pub async fn release(session: Session) {
     session.helpers.stop_all().await;
 }
 
@@ -768,6 +914,90 @@ async fn handle_exec_done(request: Request, state: Arc<State>) -> Response {
 }
 
 /// Would this command be allowed? Mints nothing either way.
+/// Hand every listener and session to a daemon waiting on `socket`.
+///
+/// The order is the whole design. Nothing about this daemon changes until the
+/// new one has said it is serving, so a handoff that fails at any step leaves a
+/// daemon that is still listening, still holding its sessions, and still the
+/// only owner of the sockets. Only after the confirmation does this one mark
+/// itself handed off and ask for shutdown.
+async fn handle_handoff(request: Request, state: Arc<State>) -> Response {
+    let Request::Handoff { socket } = request else {
+        return mismatched(&request);
+    };
+    if let Some(pid) = state.handed_off() {
+        return Response::Error {
+            message: format!("this daemon has already handed over to pid {pid}"),
+        };
+    }
+
+    let signer = match state.token_signer() {
+        Ok(signer) => signer,
+        Err(err) => return handoff_failed(&state, format!("{err}")),
+    };
+    let build_state = Arc::clone(&state);
+    let handed = crate::handoff::hand_over(
+        std::path::Path::new(&socket),
+        &signer,
+        async |sealer: &crate::handoff::Sealer| {
+            Ok(crate::handoff::Outgoing {
+                sessions: build_state.sessions().export(sealer).await?,
+                revocations: build_state
+                    .proxy()
+                    .map(|proxy| proxy.export_revocations())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(
+                        |(session_id, credential, expires_at)| crate::handoff::RevocationBlob {
+                            session_id,
+                            credential,
+                            expires_at,
+                        },
+                    )
+                    .collect(),
+                listeners: build_state.listener_fds.clone(),
+            })
+        },
+    )
+    .await;
+
+    let to_pid = match handed {
+        Ok(pid) => pid,
+        Err(err) => return handoff_failed(&state, err.to_string()),
+    };
+
+    let sessions = state.sessions().len().await;
+    state.metrics().record_handoff("handed_over");
+    state.audit(&AuditEntry::DaemonHandoff {
+        ts: OffsetDateTime::now_utc(),
+        from_pid: std::process::id(),
+        to_pid: Some(to_pid),
+        sessions,
+        outcome: "handed_over".to_string(),
+    });
+    state.handed_off_to(to_pid);
+    eprintln!("briefcred-daemon: handed {sessions} session(s) to pid {to_pid}; draining");
+    state.request_shutdown("handoff");
+    Response::HandoffComplete { to_pid, sessions }
+}
+
+/// Record a handoff that did not happen, and say so without stopping.
+///
+/// The daemon keeps running: it still owns the sockets, and an upgrade that
+/// could not be completed must leave the machine working rather than empty.
+fn handoff_failed(state: &Arc<State>, message: String) -> Response {
+    state.metrics().record_handoff("failed");
+    state.audit(&AuditEntry::DaemonHandoff {
+        ts: OffsetDateTime::now_utc(),
+        from_pid: std::process::id(),
+        to_pid: None,
+        sessions: 0,
+        outcome: "failed".to_string(),
+    });
+    eprintln!("briefcred-daemon: the handoff failed, so this daemon keeps running: {message}");
+    Response::Error { message }
+}
+
 async fn handle_hook_check(request: Request, state: Arc<State>) -> Response {
     let Request::HookCheck {
         profile: name,
@@ -1145,6 +1375,11 @@ mod tests {
             raw_args: false,
             mcp_query_timeout: Duration::from_secs(30),
             proxy: None,
+            keystore: Arc::new(briefcred_core::keystore::FileKeyStore::new(
+                home.path().join("ca"),
+            )),
+            drain: Duration::from_secs(crate::handoff::DEFAULT_DRAIN_SECS),
+            listener_fds: Vec::new(),
         }));
         (home, state, prompts)
     }

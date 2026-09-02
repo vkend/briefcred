@@ -37,6 +37,26 @@ impl SystemClock {
             origin: Instant::now(),
         }
     }
+
+    /// A clock whose zero is `backdate` in the past.
+    ///
+    /// For a daemon that has just adopted another one's sessions. Every age the
+    /// handoff carries is measured against the old daemon's origin, and a new
+    /// clock starting at zero would make the oldest session look as though it
+    /// had opened at this instant — which would reset every idle timer and
+    /// leave a forgotten terminal's master resident for another full window.
+    /// Backdating the origin by the oldest age carries the timers across
+    /// instead, so eviction picks up exactly where it left off.
+    pub fn started_ago(backdate: Duration) -> SystemClock {
+        SystemClock {
+            // A machine whose uptime is shorter than the backdate cannot
+            // represent the instant, so fall back to zero rather than panic:
+            // the worst case is the one this exists to avoid, not a crash.
+            origin: Instant::now()
+                .checked_sub(backdate)
+                .unwrap_or_else(Instant::now),
+        }
+    }
 }
 
 impl Clock for SystemClock {

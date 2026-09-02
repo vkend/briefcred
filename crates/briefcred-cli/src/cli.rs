@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use briefcred_core::ca::machine_hostname;
 use briefcred_core::paths::Paths;
-use briefcred_proto::Response;
+use briefcred_proto::{Request, Response};
 use clap::{Parser, Subcommand};
 
 use crate::error::{Error, Result};
@@ -170,6 +170,21 @@ pub enum DaemonAction {
     Stop,
     /// Ask the service manager to restart the daemon.
     Restart,
+    /// Replace the running daemon in place, without closing a socket.
+    ///
+    /// Starts a second daemon, hands it the listening sockets and every open
+    /// session, and waits for it to confirm it is serving before the old one
+    /// stands down. A request in flight is answered by the daemon that
+    /// accepted it; a request that arrives during the swap is answered by the
+    /// new one. Nothing is refused and no stream is cut.
+    Upgrade {
+        /// The `briefcred-daemon` to upgrade to.
+        ///
+        /// Defaults to the one next to this `briefcred`, which is what a
+        /// package upgrade has just replaced.
+        #[arg(long, value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
+    },
 }
 
 /// Execute one parsed command, returning the process exit code.
@@ -563,6 +578,74 @@ async fn run_daemon(paths: &Paths, action: DaemonAction) -> Result<()> {
                 "listening",
             );
             Ok(())
+        }
+        DaemonAction::Upgrade { binary } => run_upgrade(paths, binary).await,
+    }
+}
+
+/// Hand the running daemon's sockets and sessions to a new binary.
+///
+/// The order is what makes this an upgrade rather than a restart with extra
+/// steps. The new daemon is started first and does nothing but wait; the old
+/// one is then asked to hand over, and only answers once the new one has
+/// confirmed it is serving. Every failure before that point leaves the old
+/// daemon listening, which is why nothing here stops it.
+async fn run_upgrade(paths: &Paths, binary: Option<std::path::PathBuf>) -> Result<()> {
+    let binary = match binary {
+        Some(path) => path,
+        None => lifecycle::daemon_binary(&current_exe()?)?,
+    };
+    if !binary.is_file() {
+        return Err(Error::DaemonBinaryMissing(binary));
+    }
+
+    // Asked before anything is started: an upgrade of a daemon that is not
+    // running is a `daemon start`, and spawning a takeover that nobody will
+    // ever connect to would leave a process waiting for a minute.
+    let Response::Status { pid, .. } = client::status(paths.sock()).await? else {
+        return Err(Error::Unexpected("something other than a status".into()));
+    };
+
+    let socket = paths.handoff_socket();
+    println!("upgrading pid {pid} to {}", binary.display());
+    let mut child = lifecycle::spawn_takeover(paths, &binary, &socket)?;
+    if !lifecycle::wait_until_bound(&socket, install::READY_TIMEOUT) {
+        // Nothing has been handed over, so the running daemon is untouched.
+        // The half-started replacement is not: leaving it would be a process
+        // holding a socket nobody will ever connect to.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&socket);
+        return Err(Error::Refused(format!(
+            "{} did not open its takeover socket within {} s; see the daemon log",
+            binary.display(),
+            install::READY_TIMEOUT.as_secs()
+        )));
+    }
+
+    let request = Request::Handoff {
+        socket: socket.to_string_lossy().into_owned(),
+    };
+    match client::request(paths.sock(), request).await {
+        Ok(Response::HandoffComplete { to_pid, sessions }) => {
+            println!("daemon upgraded: pid {pid} handed {sessions} session(s) to pid {to_pid}");
+            println!("the sockets never closed; pid {pid} is draining what it had in flight");
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&socket);
+            Err(Error::Refused(format!(
+                "the handoff failed and pid {pid} is still serving: {message}"
+            )))
+        }
+        Ok(other) => Err(Error::Unexpected(format!("{other:?}"))),
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&socket);
+            Err(err)
         }
     }
 }

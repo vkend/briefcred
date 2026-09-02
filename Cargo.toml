@@ -28,6 +28,7 @@ async-trait = "0.1"
 base64 = "0.22"
 blake2 = "0.10"
 cedar-policy = "4"
+chacha20poly1305 = "0.11"
 block2 = "0.6"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
@@ -59,6 +60,7 @@ rustls-pki-types = "1"
 security-framework = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sendfd = { version = "0.4", features = ["tokio"] }
 serde_yaml = "0.9"
 sha1 = "0.11"
 sha2 = "0.10"
@@ -72,6 +74,7 @@ tokio-postgres-rustls = "0.14"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 toml = "0.9"
 webpki-roots = "1"
+x25519-dalek = { version = "3", features = ["getrandom"] }
 x509-parser = "0.18"
 zeroize = { version = "1", features = ["derive"] }
 

@@ -148,6 +148,64 @@ pub fn daemon_binary(next_to: &Path) -> Result<std::path::PathBuf> {
     }
 }
 
+/// The flag the daemon takes to wait for a handoff.
+pub const TAKEOVER_FLAG: &str = "--takeover";
+
+/// Start `binary` in takeover mode, waiting on `socket`.
+///
+/// The one place the CLI runs `briefcred-daemon` itself, and the exception
+/// proves the rule the rest of this module is built on: the service manager
+/// owns the *installed* daemon, and this is a second process that exists only
+/// long enough to be handed the first one's sockets. It is not `wait`ed on —
+/// it outlives this command, which is the whole point.
+///
+/// `BRIEFCRED_HOME` is passed explicitly for the same reason the unit files
+/// carry it: the new daemon has to resolve the identical layout, and a daemon
+/// that guessed a different home would take over nothing and bind a second
+/// socket somewhere else.
+pub fn spawn_takeover(paths: &Paths, binary: &Path, socket: &Path) -> Result<std::process::Child> {
+    let log = paths.log_dir().join("daemon.err.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| Error::io("open", &log, e))?;
+    let stdout = stderr.try_clone().map_err(|e| Error::io("open", &log, e))?;
+    Command::new(binary)
+        .arg(TAKEOVER_FLAG)
+        .arg(socket)
+        .env("BRIEFCRED_HOME", paths.root())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr))
+        .spawn()
+        .map_err(|e| Error::io("start", binary, e))
+}
+
+/// Whether the takeover socket has appeared, polled until `timeout`.
+///
+/// The new daemon binds it before it will accept anything, so this is the
+/// signal that it has started far enough to be handed the sockets. Sending the
+/// handoff request any earlier would have the old daemon fail to connect and
+/// report an upgrade that never happened.
+///
+/// Existence, deliberately, and never a connection. The takeover socket accepts
+/// exactly once, and a probe that connected would *be* that one connection: the
+/// new daemon would greet the CLI, wait for a state blob the CLI has no way to
+/// send, and time out with the old daemon still holding everything.
+pub fn wait_until_bound(socket: &Path, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::fs::symlink_metadata(socket).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

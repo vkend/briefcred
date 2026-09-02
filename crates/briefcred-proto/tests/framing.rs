@@ -285,6 +285,9 @@ fn the_name_list_covers_every_request_variant_exactly_once() {
             args: vec![],
         },
         Request::Mcp,
+        Request::Handoff {
+            socket: "/tmp/handoff.sock".into(),
+        },
         #[cfg(feature = "debug-heapscan")]
         Request::HeapScan {
             needle_sha256: "00".into(),

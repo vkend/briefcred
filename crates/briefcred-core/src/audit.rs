@@ -271,6 +271,27 @@ pub enum AuditEntry {
         /// What asked it to stop: `sigterm`, `sigint`, or `request`.
         reason: String,
     },
+    /// One daemon handed its listeners and sessions to another.
+    ///
+    /// Written by the daemon standing down and, with the pids the other way
+    /// round, by the one taking over — so an investigator reading the log finds
+    /// both halves of the swap and can tell which process was serving at any
+    /// moment. A failed attempt is recorded too: an upgrade that did not happen
+    /// is exactly the thing somebody will be asking about afterwards.
+    DaemonHandoff {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The process that was serving before.
+        from_pid: u32,
+        /// The process serving after, absent when the handoff failed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_pid: Option<u32>,
+        /// How many sessions moved across.
+        sessions: usize,
+        /// `handed_over`, `adopted`, or `failed`.
+        outcome: String,
+    },
     /// A profile directory failed to load; the previous set is still in force.
     ProfileLoadError {
         /// When it happened.
@@ -403,6 +424,7 @@ impl AuditEntry {
             | AuditEntry::McpCall { mint_ids, .. } => mint_ids,
             AuditEntry::DaemonStart { .. }
             | AuditEntry::DaemonStop { .. }
+            | AuditEntry::DaemonHandoff { .. }
             | AuditEntry::AuthReject { .. }
             | AuditEntry::ProfileLoadError { .. }
             | AuditEntry::ProfileTrustWarning { .. }

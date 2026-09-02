@@ -123,6 +123,18 @@ impl HttpCounters {
     pub fn requests(&self) -> u64 {
         self.requests.load(Ordering::Relaxed)
     }
+
+    /// Counters resumed at what a handed-over session had already done.
+    ///
+    /// A policy written as `context.resp_bytes_so_far < 4096` is a budget for
+    /// the session, and a session whose counters reset on upgrade would be one
+    /// an agent could refill by asking for a `daemon upgrade`.
+    pub fn resumed(requests: u64, resp_bytes: u64) -> HttpCounters {
+        HttpCounters {
+            requests: AtomicU64::new(requests),
+            resp_bytes: AtomicU64::new(resp_bytes),
+        }
+    }
 }
 
 impl std::fmt::Debug for Session {
@@ -163,6 +175,17 @@ fn generate_id() -> String {
     let mut bytes = [0u8; SESSION_ID_BYTES];
     getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable");
     hex::encode(bytes)
+}
+
+/// How long before `now` `then` was, in milliseconds.
+///
+/// The handoff carries ages rather than instants: both are measured against a
+/// monotonic clock that starts with the process, so an instant from the old
+/// daemon means nothing in the new one.
+fn millis_since(now: Duration, then: Duration) -> u64 {
+    now.saturating_sub(then)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 /// Why a session could not be opened or found.
@@ -390,6 +413,59 @@ impl SessionStore {
             .iter()
             .map(|(id, s)| (id.clone(), s.profile.clone()))
             .collect()
+    }
+
+    /// Every open session, as the handoff blob carries it.
+    ///
+    /// `seal` encrypts one master to the daemon taking over. It is a parameter
+    /// rather than something this module does, so the rule that a master leaves
+    /// here only as ciphertext is visible at the one call site that matters.
+    pub async fn export(
+        &self,
+        seal: &crate::handoff::Sealer,
+    ) -> crate::error::Result<Vec<crate::handoff::SessionBlob>> {
+        let now = self.clock.now();
+        let sessions = self.sessions.read().await;
+        let mut out = Vec::with_capacity(sessions.len());
+        for session in sessions.values() {
+            let mut masters_enc = BTreeMap::new();
+            for (key, master) in &session.masters {
+                masters_enc.insert(key.clone(), seal.seal(master.as_bytes())?);
+            }
+            out.push(crate::handoff::SessionBlob {
+                id: session.id.clone(),
+                profile: session.profile.clone(),
+                opened_at: millis_since(now, session.opened_at),
+                last_used: millis_since(now, session.last_used),
+                mints: session.mints.values().cloned().collect(),
+                quota_state: session.quota.as_ref().map(|bucket| {
+                    let (tokens, spent) = bucket.snapshot();
+                    crate::handoff::QuotaState { tokens, spent }
+                }),
+                http_counters: crate::handoff::HttpCounterState {
+                    requests: session.http.requests(),
+                    resp_bytes: session.http.resp_bytes(),
+                },
+                masters_enc,
+                session_pubkey: session.pubkey.as_ref().map(|key| {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.encode(key)
+                }),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Insert sessions rebuilt from a handoff.
+    ///
+    /// Insert rather than replace: a daemon adopting a handoff has not served
+    /// anything yet, so there is nothing to replace — and making this additive
+    /// means it can never silently drop a session it has already opened.
+    pub async fn adopt(&self, sessions: Vec<Session>) {
+        let mut open = self.sessions.write().await;
+        for session in sessions {
+            open.insert(session.id.clone(), session);
+        }
     }
 
     /// Take every session, wiping every master. Used at shutdown.

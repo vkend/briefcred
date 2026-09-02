@@ -198,6 +198,27 @@ impl TokenSigner {
         ))
     }
 
+    /// Sign arbitrary bytes with the same key, for something that is not a
+    /// token.
+    ///
+    /// The handoff blob is the one caller: it is not a credential and is never
+    /// presented to anything, but it does have to be provably this machine's,
+    /// and the token-signer key is already the daemon's answer to "prove you
+    /// are the briefcred on this machine". Detached, because the bytes are
+    /// carried alongside rather than embedded, and the signature has to cover
+    /// exactly the bytes the receiver will parse.
+    pub fn sign_detached(&self, message: &[u8]) -> [u8; 64] {
+        self.key.sign(message).to_bytes()
+    }
+
+    /// Whether `signature` is this key's over `message`.
+    pub fn verify_detached(&self, message: &[u8], signature: &[u8; 64]) -> bool {
+        self.key
+            .verifying_key()
+            .verify(message, &Signature::from_bytes(signature))
+            .is_ok()
+    }
+
     /// Check `token` and return the claims it carries.
     ///
     /// `now` is Unix seconds, taken by the caller so the expiry rules can be

@@ -211,7 +211,14 @@ pub async fn serve(
                 Err(_) => continue,
             },
         };
-        tokio::spawn(serve_connection(stream, Arc::clone(&proxy)));
+        // Counted for the drain, like the HTTP proxy's: a relayed session can
+        // outlive the accept loop, and an upgrade must not cut one.
+        let guard = proxy.state.in_flight().guard();
+        let proxy = Arc::clone(&proxy);
+        tokio::spawn(async move {
+            serve_connection(stream, proxy).await;
+            drop(guard);
+        });
     }
 }
 

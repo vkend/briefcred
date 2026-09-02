@@ -180,6 +180,19 @@ impl Paths {
         self.root.join("state")
     }
 
+    /// A fresh, unguessable path for one `briefcred daemon upgrade` handoff.
+    ///
+    /// Under the state directory, which is already `0700`. Named for the
+    /// attempt rather than for the daemon: two upgrades started at once must
+    /// not collide, and a path left behind by one that crashed must never be
+    /// mistaken for a socket somebody is listening on.
+    pub fn handoff_socket(&self) -> PathBuf {
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable");
+        self.state_dir()
+            .join(format!("handoff-{}.sock", hex::encode(bytes)))
+    }
+
     /// Directory holding briefcred's configuration files.
     pub fn config_dir(&self) -> &Path {
         &self.root

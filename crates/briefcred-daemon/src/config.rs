@@ -132,6 +132,14 @@ pub struct Config {
     pub upstream_roots: Option<std::path::PathBuf>,
     /// Seconds a session may go untouched before it is evicted and wiped.
     pub session_idle_secs: u64,
+    /// Seconds an outgoing daemon gives its in-flight work after a handoff.
+    ///
+    /// `briefcred daemon upgrade` moves the listeners to the new daemon and
+    /// then waits this long for the requests and streams the old one was
+    /// already serving to finish on their own. Long enough that an ordinary
+    /// event stream is never cut; bounded, because a stream that never ends
+    /// must not keep the replaced daemon resident for the rest of the login.
+    pub handoff_drain_secs: u64,
     /// Seconds between reconciliation sweeps.
     ///
     /// The sweep also runs once at startup, which is the tick that matters:
@@ -181,6 +189,7 @@ impl Default for Config {
             pg_proxy_enabled: true,
             upstream_roots: None,
             session_idle_secs: DEFAULT_SESSION_IDLE_SECS,
+            handoff_drain_secs: crate::handoff::DEFAULT_DRAIN_SECS,
             reconcile_interval_secs: DEFAULT_RECONCILE_INTERVAL_SECS,
             mcp_query_timeout_secs: DEFAULT_MCP_QUERY_TIMEOUT_SECS,
             audit: AuditConfig::default(),
@@ -254,6 +263,11 @@ impl Config {
     }
 
     /// The idle window as a [`Duration`].
+    pub fn handoff_drain(&self) -> Duration {
+        Duration::from_secs(self.handoff_drain_secs)
+    }
+
+    /// How long a session may sit unused before eviction.
     pub fn session_idle(&self) -> Duration {
         Duration::from_secs(self.session_idle_secs)
     }

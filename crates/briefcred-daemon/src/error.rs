@@ -43,6 +43,13 @@ pub enum Error {
     #[error("proxy: {0}")]
     Proxy(String),
 
+    /// A daemon-to-daemon handoff could not be completed.
+    ///
+    /// Carries what went wrong with the socket, the signature, or the
+    /// descriptors — never a master, a token, or a signing key.
+    #[error("handoff: {0}")]
+    Handoff(String),
+
     /// The on-disk layout could not be resolved.
     #[error(transparent)]
     Layout(#[from] briefcred_core::Error),

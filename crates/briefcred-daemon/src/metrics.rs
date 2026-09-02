@@ -150,7 +150,15 @@ pub struct Metrics {
     pgproxy_bytes: Mutex<BTreeMap<&'static str, u64>>,
     quota_saturation: Mutex<BTreeMap<String, f64>>,
     quota_rejections: Mutex<BTreeMap<(String, String), u64>>,
+    handoffs: Mutex<BTreeMap<&'static str, u64>>,
 }
+
+/// The `outcome` labels on `briefcred_handoffs_total`.
+///
+/// Seeded at zero so "this daemon has never been upgraded in place" is a fact
+/// a dashboard can read, rather than three series that appear the first time
+/// somebody runs `briefcred daemon upgrade`.
+const HANDOFF_OUTCOMES: [&str; 3] = ["handed_over", "adopted", "failed"];
 
 /// The direction labels on `briefcred_pgproxy_bytes_total`.
 ///
@@ -190,7 +198,27 @@ impl Metrics {
             pgproxy_bytes: Mutex::new(PGPROXY_DIRECTIONS.iter().map(|name| (*name, 0)).collect()),
             quota_saturation: Mutex::new(BTreeMap::new()),
             quota_rejections: Mutex::new(BTreeMap::new()),
+            handoffs: Mutex::new(HANDOFF_OUTCOMES.iter().map(|name| (*name, 0)).collect()),
         }
+    }
+
+    /// Count one in-place upgrade, by how it ended.
+    ///
+    /// `handed_over` is a daemon that gave its listeners away and stood down,
+    /// `adopted` one that took them on, and `failed` an attempt that left the
+    /// old daemon serving. The three are separate because a rising `failed` is
+    /// somebody whose upgrades are silently not taking, which otherwise looks
+    /// exactly like nobody upgrading.
+    pub fn record_handoff(&self, outcome: &str) {
+        let Some(label) = HANDOFF_OUTCOMES.iter().find(|known| **known == outcome) else {
+            return;
+        };
+        *self
+            .handoffs
+            .lock()
+            .expect("metrics mutex")
+            .entry(*label)
+            .or_insert(0) += 1;
     }
 
     /// Record how full a profile's quota bucket is *not*, from 0 to 1.
@@ -404,6 +432,14 @@ impl Metrics {
         for (kind, count) in self.revoke_failures.lock().expect("metrics mutex").iter() {
             out.push_str(&format!(
                 "briefcred_revoke_failures_total{{kind=\"{kind}\"}} {count}\n"
+            ));
+        }
+
+        out.push_str("# HELP briefcred_handoffs_total Zero-downtime handoffs, by outcome.\n");
+        out.push_str("# TYPE briefcred_handoffs_total counter\n");
+        for (outcome, count) in self.handoffs.lock().expect("metrics mutex").iter() {
+            out.push_str(&format!(
+                "briefcred_handoffs_total{{outcome=\"{outcome}\"}} {count}\n"
             ));
         }
 

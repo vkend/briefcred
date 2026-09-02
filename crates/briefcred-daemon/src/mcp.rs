@@ -888,6 +888,7 @@ fn response_name(response: &briefcred_proto::Response) -> &'static str {
         Response::Minted { .. } => "minted",
         Response::ExecRecorded { .. } => "exec_recorded",
         Response::McpReady { .. } => "mcp_ready",
+        Response::HandoffComplete { .. } => "handoff_complete",
         Response::HookDecision { .. } => "hook_decision",
         Response::Denied { .. } => "denied",
         Response::Locked { .. } => "locked",

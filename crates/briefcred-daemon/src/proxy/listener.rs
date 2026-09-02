@@ -240,7 +240,14 @@ pub async fn serve(
                 Err(_) => continue,
             },
         };
-        tokio::spawn(serve_connection(stream, Arc::clone(&proxy)));
+        // Counted for the drain: an in-place upgrade must not exit on top of
+        // a request this daemon is still answering.
+        let guard = proxy.state.in_flight().guard();
+        let proxy = Arc::clone(&proxy);
+        tokio::spawn(async move {
+            serve_connection(stream, proxy).await;
+            drop(guard);
+        });
     }
 }
 
@@ -280,7 +287,14 @@ fn begin_tunnel(request: Request<Incoming>, proxy: Arc<Proxy>) -> Response<OutBo
 
     // The 200 has to be written before the TLS handshake can start, so the
     // work happens in a task that waits for the upgrade rather than here.
+    //
+    // The task takes a drain guard of its own, because it outlives the
+    // connection future that spawned it: a `CONNECT` completes as soon as it
+    // is upgraded, and the event stream inside the tunnel lives here. Without
+    // this the drain would report zero while a stream was still running.
+    let guard = proxy.state.in_flight().guard();
     tokio::spawn(async move {
+        let _guard = guard;
         let upgraded = match hyper::upgrade::on(request).await {
             Ok(upgraded) => upgraded,
             Err(err) => {
@@ -827,7 +841,11 @@ fn upgrade_websocket(response: Response<Incoming>, hand: Handshake) -> Response<
         since: std::time::Instant::now(),
     };
     let watch = stream::watch(Arc::clone(&proxy.state), Arc::clone(&proxy.issuer), live);
+    // A relay of its own again: the handshake response completes the tunnel's
+    // connection future, and the frames go on flowing here afterwards.
+    let guard = proxy.state.in_flight().guard();
     tokio::spawn(async move {
+        let _guard = guard;
         let (client, upstream) = match tokio::try_join!(client_upgrade, upstream_upgrade) {
             Ok(both) => both,
             Err(err) => {

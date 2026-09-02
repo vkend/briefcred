@@ -12,6 +12,7 @@ pub mod clock;
 pub mod config;
 pub mod error;
 pub mod exec;
+pub mod handoff;
 #[cfg(feature = "debug-heapscan")]
 pub mod heapscan;
 pub mod helper;
@@ -28,6 +29,11 @@ pub mod server;
 pub mod session;
 pub mod unlock;
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::net::SocketAddr;
+use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,9 +42,10 @@ use briefcred_core::paths::Paths;
 use time::OffsetDateTime;
 
 use crate::audit::AuditLog;
-use crate::clock::SystemClock;
+use crate::clock::{Clock, SystemClock};
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::handoff::Slot;
 use crate::metrics::Metrics;
 use crate::profiles::{ProfileStore, Reload};
 use crate::server::{State, StateParts};
@@ -48,8 +55,59 @@ use crate::unlock::{SystemUnlockGate, UnlockCache};
 /// How often the retention sweep runs after the one at startup.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// Where this daemon's listeners come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Startup {
+    /// Bind them, or adopt what systemd passed. The ordinary start.
+    Fresh,
+    /// Wait on a handoff socket for the daemon this one is replacing.
+    Takeover(PathBuf),
+}
+
+impl Startup {
+    /// Read the one flag the daemon takes.
+    ///
+    /// Deliberately hand-rolled rather than a `clap` derive: the daemon is
+    /// started by a service manager and takes exactly one option, and an
+    /// argument parser that accepted anything else would be a surface an
+    /// operator could get wrong at the one moment — an upgrade — when getting
+    /// it wrong means two daemons.
+    pub fn from_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Startup> {
+        let mut args = args.into_iter();
+        let Some(first) = args.next() else {
+            return Ok(Startup::Fresh);
+        };
+        let first = first.to_string_lossy().into_owned();
+        let socket = match first.strip_prefix(&format!("{}=", crate::handoff::TAKEOVER_FLAG)) {
+            Some(inline) => PathBuf::from(inline),
+            None if first == crate::handoff::TAKEOVER_FLAG => match args.next() {
+                Some(path) => PathBuf::from(path),
+                None => {
+                    return Err(Error::Handoff(format!(
+                        "{} needs the path of the handoff socket",
+                        crate::handoff::TAKEOVER_FLAG
+                    )))
+                }
+            },
+            None => return Err(Error::Handoff(format!("unknown argument `{first}`"))),
+        };
+        match args.next() {
+            None => Ok(Startup::Takeover(socket)),
+            Some(extra) => Err(Error::Handoff(format!(
+                "unknown argument `{}`",
+                extra.to_string_lossy()
+            ))),
+        }
+    }
+}
+
 /// Run the daemon until it is asked to stop.
 pub async fn run() -> Result<()> {
+    run_with(Startup::from_args(std::env::args_os().skip(1))?).await
+}
+
+/// Run the daemon, told where its listeners come from.
+pub async fn run_with(startup: Startup) -> Result<()> {
     let paths = Paths::discover()?;
     paths.ensure_layout()?;
 
@@ -57,20 +115,59 @@ pub async fn run() -> Result<()> {
     let audit = crate::audit::spawn(AuditLog::open(&paths.audit_dir(), config.retention_days)?);
     let metrics = Arc::new(Metrics::new(audit.write_errors_handle()));
 
-    let bound_metrics = if config.metrics_enabled {
-        let (listener, addr) = metrics::bind(config.metrics_port)
-            .map_err(|e| Error::io("bind the metrics listener on", paths.root(), e))?;
-        Some((listener, addr))
-    } else {
-        None
-    };
-    let metrics_addr = bound_metrics.as_ref().map(|(_, addr)| addr.to_string());
+    // Opened, not read: constructing a key store touches neither the keychain
+    // nor a file, so a daemon nobody upgrades and nobody proxies through still
+    // never prompts. See `ProxyIssuer` for the same reasoning about the key.
+    let keystore: Arc<dyn briefcred_core::keystore::KeyStore> =
+        Arc::from(config.ca.open_keystore(&paths)?);
 
-    // Register the signal handlers before the socket exists. `signal` installs
+    // Register the signal handlers before any socket exists. `signal` installs
     // the handler when it is called, not when the future is first polled, so
     // doing this after `bind` would leave a window where the daemon is
     // reachable but a SIGTERM still hits the default disposition and kills it.
     let signals = install_signal_handlers()?;
+
+    // Descriptors this daemon did not bind: systemd's, on an activated start,
+    // or the outgoing daemon's, on an upgrade. Whatever is left in here once
+    // every listener has been decided is closed, which is what happens to a
+    // proxy socket handed to a daemon whose `daemon.toml` turns the proxy off.
+    let mut adopted: BTreeMap<Slot, OwnedFd> = crate::handoff::socket_activation();
+    let mut accepted = match &startup {
+        Startup::Fresh => None,
+        Startup::Takeover(socket) => {
+            let takeover = crate::handoff::Takeover::bind(socket)?;
+            eprintln!(
+                "briefcred-daemon: waiting to take over on {}",
+                socket.display()
+            );
+            let signer = crate::proxy::token::TokenSigner::load_or_create(keystore.as_ref())?;
+            let mut accepted = takeover.accept(&signer).await?;
+            // A descriptor from a handoff wins over one from socket
+            // activation: this process was started to replace a running
+            // daemon, and the sockets that matter are the ones it is serving.
+            adopted.extend(std::mem::take(&mut accepted.listeners));
+            Some(accepted)
+        }
+    };
+
+    // Backdated when there is a handoff, so every session's age survives it.
+    let clock: Arc<dyn Clock> = match &accepted {
+        Some(accepted) => Arc::new(SystemClock::started_ago(crate::handoff::oldest_age(
+            &accepted.blob,
+        ))),
+        None => Arc::new(SystemClock::new()),
+    };
+
+    let bound_metrics = if config.metrics_enabled {
+        Some(match adopted.remove(&Slot::Metrics) {
+            Some(fd) => adopt_tcp(fd, "metrics")?,
+            None => metrics::bind(config.metrics_port)
+                .map_err(|e| Error::io("bind the metrics listener on", paths.root(), e))?,
+        })
+    } else {
+        None
+    };
+    let metrics_addr = bound_metrics.as_ref().map(|(_, addr)| addr.to_string());
 
     // Fail to start rather than start without a way to read masters: a daemon
     // that cannot fetch a master is a daemon whose every session fails, and
@@ -79,7 +176,6 @@ pub async fn run() -> Result<()> {
     let master_source: Arc<dyn briefcred_core::MasterSource> =
         briefcred_core::source::open(config.master_source(paths.platform()), &paths)?.into();
 
-    let clock = Arc::new(SystemClock::new());
     let profiles = Arc::new(ProfileStore::new(
         paths.profiles_dir(),
         briefcred_core::Registry::discover(),
@@ -102,8 +198,11 @@ pub async fn run() -> Result<()> {
     // listener is: a daemon that is answering `exec` but has no proxy to send
     // the token it just issued through is worse than one that failed to start.
     let bound_proxy = if config.proxy_enabled {
-        let (listener, addr) = proxy::listener::bind(config.proxy_port)
-            .map_err(|e| Error::io("bind the proxy listener on", paths.root(), e))?;
+        let (listener, addr) = match adopted.remove(&Slot::Proxy) {
+            Some(fd) => adopt_tcp(fd, "proxy")?,
+            None => proxy::listener::bind(config.proxy_port)
+                .map_err(|e| Error::io("bind the proxy listener on", paths.root(), e))?,
+        };
         // The key store is opened but not read: see `ProxyIssuer`, which loads
         // the signing key on the first token rather than at startup, so a
         // daemon nobody proxies through never prompts for keychain access.
@@ -138,8 +237,12 @@ pub async fn run() -> Result<()> {
     }
     let bound_pg_proxy = match (config.pg_proxy_enabled, issuer.as_ref()) {
         (true, Some(issuer)) => {
-            let (listener, addr) = pgproxy::listener::bind(config.pg_proxy_port)
-                .map_err(|e| Error::io("bind the postgres proxy listener on", paths.root(), e))?;
+            let (listener, addr) = match adopted.remove(&Slot::PgProxy) {
+                Some(fd) => adopt_tcp(fd, "pg_proxy")?,
+                None => pgproxy::listener::bind(config.pg_proxy_port).map_err(|e| {
+                    Error::io("bind the postgres proxy listener on", paths.root(), e)
+                })?,
+            };
             Some((listener, addr, Arc::clone(issuer)))
         }
         _ => None,
@@ -147,8 +250,33 @@ pub async fn run() -> Result<()> {
     let pg_proxy_addr = bound_pg_proxy.as_ref().map(|(_, addr, _)| addr.to_string());
 
     let paths = Arc::new(paths);
-    let listener = server::bind(paths.sock())?;
+    let listener = match adopted.remove(&Slot::Ipc) {
+        // Adopted rather than rebound, and the socket file is deliberately
+        // left alone: unlinking and rebinding it would give a client
+        // connecting at that instant "no such file", which is precisely the
+        // downtime an in-place upgrade exists to avoid.
+        Some(fd) => adopt_unix(fd)?,
+        None => server::bind(paths.sock())?,
+    };
+    for (slot, _) in std::mem::take(&mut adopted) {
+        eprintln!(
+            "briefcred-daemon: closing the handed-over {} listener; this daemon's \
+             configuration does not run it",
+            slot.as_str()
+        );
+    }
+
+    // Loaded before the sessions are rebuilt, because a handed-over session's
+    // quota comes from its profile as *this* daemon has it.
+    let reloaded = profiles.reload().await;
+
     let (shutdown, _) = tokio::sync::watch::channel(false);
+    let listener_fds = crate::handoff::listener_fds(
+        &listener,
+        bound_metrics.as_ref().map(|(listener, _)| listener),
+        bound_proxy.as_ref().map(|(listener, _, _, _)| listener),
+        bound_pg_proxy.as_ref().map(|(listener, _, _)| listener),
+    );
     let state = Arc::new(State::new(StateParts {
         audit,
         metrics: Arc::clone(&metrics),
@@ -159,7 +287,7 @@ pub async fn run() -> Result<()> {
         profiles: Arc::clone(&profiles),
         sessions: Arc::clone(&sessions),
         unlock: Arc::new(SystemUnlockGate::new()),
-        unlock_cache: UnlockCache::new(clock),
+        unlock_cache: UnlockCache::new(Arc::clone(&clock)),
         master_source: Arc::clone(&master_source),
         paths: Arc::clone(&paths),
         helper_dirs: helper_dirs.clone(),
@@ -167,21 +295,74 @@ pub async fn run() -> Result<()> {
         raw_args: config.audit.raw_args,
         mcp_query_timeout: config.mcp_query_timeout(),
         proxy: issuer.clone(),
+        keystore,
+        drain: config.handoff_drain(),
+        listener_fds,
     }));
 
     // Sweep before the first row is written, so a log left behind by a much
     // older run is gone before today's file is even opened.
     state.sweep();
 
-    // Load once here rather than leaving it to the watcher, so the daemon is
-    // already answering `list_profiles` correctly by the time it accepts its
-    // first connection.
-    report_reload(&state, profiles.reload().await);
+    // Reported here rather than where it was loaded, because the report is
+    // written to the audit log and the audit log lives on `State`.
+    report_reload(&state, reloaded);
     state.audit(&AuditEntry::DaemonStart {
         ts: OffsetDateTime::now_utc(),
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     });
+
+    // Rebuilt before a single listener starts accepting, so the first request
+    // that arrives on an adopted socket already finds its session open. A
+    // failure here is reported back to the daemon still holding the sockets,
+    // which then keeps running rather than standing down.
+    if let Some(accepted) = accepted.as_mut() {
+        let sessions = match crate::handoff::rebuild_sessions(
+            &accepted.blob,
+            &accepted.unsealer,
+            &clock,
+            &profiles,
+            &helper_dirs,
+        )
+        .await
+        {
+            Ok(sessions) => sessions,
+            Err(err) => {
+                metrics.record_handoff("failed");
+                state.audit(&AuditEntry::DaemonHandoff {
+                    ts: OffsetDateTime::now_utc(),
+                    from_pid: accepted.blob.from_pid,
+                    to_pid: None,
+                    sessions: 0,
+                    outcome: "failed".to_string(),
+                });
+                state.audit_flush().await;
+                accepted.refused(err.to_string()).await;
+                return Err(err);
+            }
+        };
+        let adopted_count = sessions.len();
+        state.sessions().adopt(sessions).await;
+        if let Some(issuer) = &issuer {
+            for entry in &accepted.blob.revocations {
+                issuer.revoke(&entry.session_id, &entry.credential, entry.expires_at);
+            }
+        }
+        metrics.record_handoff("adopted");
+        state.audit(&AuditEntry::DaemonHandoff {
+            ts: OffsetDateTime::now_utc(),
+            from_pid: accepted.blob.from_pid,
+            to_pid: Some(std::process::id()),
+            sessions: adopted_count,
+            outcome: "adopted".to_string(),
+        });
+        eprintln!(
+            "briefcred-daemon: adopted {adopted_count} session(s) and {} listener(s) from pid {}",
+            accepted.blob.listeners.len(),
+            accepted.blob.from_pid
+        );
+    }
 
     if let Some((metrics_listener, addr)) = bound_metrics {
         eprintln!("briefcred-daemon: metrics on http://{addr}/metrics");
@@ -274,14 +455,41 @@ pub async fn run() -> Result<()> {
         paths.sock().display(),
         std::process::id()
     );
+    // The last thing before this daemon starts accepting, and the thing that
+    // lets the old one stand down: every listener is live, every session is
+    // rebuilt, so there is no instant in which neither process is serving.
+    if let Some(accepted) = accepted.take() {
+        let open = state.sessions().len().await;
+        accepted.accepted(open).await?;
+    }
     server::serve(listener, Arc::clone(&state)).await;
+
+    // In-flight proxy work outlives the accept loops: a `CONNECT` tunnel
+    // carrying an event stream is a task of its own, and exiting on top of one
+    // is the dropped bytes an in-place upgrade is supposed to make impossible.
+    let handed_off = state.handed_off();
+    if handed_off.is_some() {
+        let left = state.in_flight().drained(state.drain()).await;
+        if left > 0 {
+            eprintln!(
+                "briefcred-daemon: {} s drain expired with {left} connection(s) still open",
+                state.drain().as_secs()
+            );
+        }
+    }
 
     // The socket file outlives the listener, so remove it explicitly. A client
     // that finds no socket is told to start the daemon; one that finds a stale
     // socket gets a confusing connection refused instead.
-    if let Err(err) = std::fs::remove_file(paths.sock()) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("briefcred-daemon: cannot remove the socket: {err}");
+    //
+    // Never after a handoff: the file is the new daemon's listener, and
+    // removing it would take the machine's briefcred away at the end of a
+    // successful upgrade.
+    if handed_off.is_none() {
+        if let Err(err) = std::fs::remove_file(paths.sock()) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("briefcred-daemon: cannot remove the socket: {err}");
+            }
         }
     }
 
@@ -289,14 +497,26 @@ pub async fn run() -> Result<()> {
     // rows come first, because after `close_all` there is nothing left to
     // name — and a session that vanished without a row is a session an
     // investigator cannot account for.
+    let reason = if handed_off.is_some() {
+        "handoff"
+    } else {
+        "shutdown"
+    };
     for session in sessions.close_all().await {
         state.audit(&AuditEntry::SessionClose {
             ts: OffsetDateTime::now_utc(),
             session_id: session.id.clone(),
             profile: session.profile.clone(),
-            reason: "shutdown".to_string(),
+            reason: reason.to_string(),
         });
-        server::retire(&state, session, "shutdown").await;
+        // After a handoff the mints are not orphaned: the daemon that took the
+        // session over is holding them, and queueing their revokes here would
+        // kill credentials it is still serving.
+        if handed_off.is_some() {
+            server::release(session).await;
+        } else {
+            server::retire(&state, session, "shutdown").await;
+        }
     }
 
     state.audit(&AuditEntry::DaemonStop {
@@ -309,6 +529,30 @@ pub async fn run() -> Result<()> {
     // shutdown looks exactly like a crash to whoever reads the log.
     state.audit_flush().await;
     Ok(())
+}
+
+/// Turn an adopted descriptor into a listening TCP socket.
+fn adopt_tcp(fd: OwnedFd, what: &'static str) -> Result<(tokio::net::TcpListener, SocketAddr)> {
+    let listener = std::net::TcpListener::from(fd);
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| Error::Handoff(format!("cannot adopt the {what} listener: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| Error::Handoff(format!("cannot read the {what} listener's address: {e}")))?;
+    let listener = tokio::net::TcpListener::from_std(listener)
+        .map_err(|e| Error::Handoff(format!("cannot adopt the {what} listener: {e}")))?;
+    Ok((listener, addr))
+}
+
+/// Turn an adopted descriptor into the listening IPC socket.
+fn adopt_unix(fd: OwnedFd) -> Result<tokio::net::UnixListener> {
+    let listener = crate::handoff::adopt_fd(fd);
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| Error::Handoff(format!("cannot adopt the ipc listener: {e}")))?;
+    tokio::net::UnixListener::from_std(listener)
+        .map_err(|e| Error::Handoff(format!("cannot adopt the ipc listener: {e}")))
 }
 
 /// The revoke queue's back end: a helper call with a freshly fetched master.

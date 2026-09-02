@@ -71,6 +71,21 @@ impl RevocationSet {
         entries.contains_key(&(sid.to_string(), credential.to_string()))
     }
 
+    /// Every entry, as `(session, credential, expires_at)`.
+    ///
+    /// For the handoff. The set is in memory only because a restart loses
+    /// nothing a token could still be used with — but an *upgrade* keeps every
+    /// one of those tokens alive, so a new daemon that started with an empty
+    /// set would begin serving grants the old one had already retired.
+    pub fn export(&self) -> Vec<(String, String, i64)> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|((sid, credential), expires_at)| (sid.clone(), credential.clone(), *expires_at))
+            .collect()
+    }
+
     /// How many entries are currently held. For tests and diagnostics.
     pub fn len(&self) -> usize {
         self.entries
