@@ -487,6 +487,14 @@ authenticated the first stream on a connection and trusted the rest would be
 handed only streams from the session that opened it. HTTP/1.1 upstreams are not
 pooled at all.
 
+A long-lived HTTP/2 response does not outlive its grant. Any body on an HTTP/2
+connection whose length the upstream did not state — every gRPC call among
+them — runs under the same one-second liveness poll an event stream and a
+WebSocket do, and expiry, revocation, or the session closing ends it. Without
+that, a `briefcred exec` that had finished would leave a bidirectional gRPC call
+delivering for as long as its client held the stream open, which is precisely
+the Model C exposure revocation exists to close.
+
 The `ProxyH2Connection` row carries no path, no status, and nothing from any
 stream's headers, body, or trailers. It is a shape — how many streams, how long,
 how many bytes each way — and the per-stream rows it aggregates are the ones

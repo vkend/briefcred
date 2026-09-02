@@ -26,6 +26,20 @@ All notable changes to briefcred are recorded here. The format follows
   and `grpc-message` reach the client unread. A gRPC call is a `POST` whose
   path is the service and method, so a Cedar policy names it like anything
   else, per stream.
+- **A gRPC call does not outlive its grant.** Every HTTP/2 response whose length
+  the upstream did not state is watched by the same one-second liveness poll an
+  event stream gets, so expiry, revocation, or the session closing ends a
+  server-streaming or bidirectional call within about a second and writes a
+  `proxy_stream` row of kind `h2-stream`. Nothing inside such a body is parsed,
+  so its `events_or_frames` is `0`.
+- **Upstream dials are bounded and isolated.** A ten-second deadline covers TCP
+  and TLS together, and dialling is serialised per destination rather than
+  globally, so a host that never answers delays only the requests headed for it.
+  A cached upstream connection is dropped when its grant is revoked or its
+  session closes, rather than lingering until a later dial notices.
+- **A gRPC call to an upstream that does not speak HTTP/2** is refused with
+  `upstream_error` and a reason, rather than downgraded to HTTP/1.1 and turned
+  into a response the client cannot parse.
 - **A `proxy_h2_connection` audit row** when a client's HTTP/2 connection
   closes, carrying the connection's shape — streams, duration, bytes each way —
   and nothing from any stream's headers, body, or trailers. Every

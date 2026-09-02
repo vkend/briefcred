@@ -1047,7 +1047,11 @@ connection carrying a hundred calls is a hundred decisions and a hundred
 An upstream HTTP/2 connection is kept and multiplexed, keyed on the session,
 the credential, and the destination together. Nothing looser: two sessions hold
 two different masters, and an upstream that treats a connection as
-authenticated must never be handed one session's stream on another's.
+authenticated must never be handed one session's stream on another's. It is
+dropped when the grant is revoked or the session closes, so nothing stays open
+at a vendor for a grant that has ended. Dialling is serialised per destination
+and bounded at ten seconds, so a host that never answers delays only the
+requests headed for it.
 
 **gRPC works over this with nothing gRPC-specific in the proxy.** A gRPC call is
 a `POST` whose path is the service and method, so a policy names it as one:
@@ -1064,7 +1068,16 @@ server-streaming, client-streaming, and bidirectional. Trailers are relayed
 frame for frame, which is what makes gRPC work at all — `grpc-status` and
 `grpc-message` arrive after the body, and a proxy that dropped the trailer frame
 would deliver every byte of every response and then fail every call. briefcred
-forwards trailers without reading them.
+forwards trailers without reading them. A vendor that does not speak HTTP/2
+cannot carry a gRPC call, and one is refused with a reason rather than
+downgraded into a response the client cannot parse.
+
+A gRPC call does not outlive its grant. Every HTTP/2 response whose length the
+upstream did not state is watched by the same one-second poll an event stream
+gets, so expiry, revocation, or the session closing ends a server-streaming or
+bidirectional call within about a second and writes a `proxy_stream` row of
+kind `h2-stream`. Its `events_or_frames` is `0`: nothing inside the body is
+parsed, because a gRPC message's own framing is the call's content.
 
 When a client's HTTP/2 connection closes it gets one `proxy_h2_connection` row,
 alongside the per-stream rows, which each name it:

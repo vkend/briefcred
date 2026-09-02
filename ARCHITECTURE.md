@@ -536,21 +536,52 @@ still a fresh connection per request. The cache key is
 `(session, credential, host, port)` and nothing looser. Two sessions hold two
 different masters, and connection reuse is exactly what invites an upstream to
 treat a connection as authenticated, so the key makes the isolation a type-level
-fact rather than a rule to remember. Dials happen under the cache lock, because
-two streams racing to be first to a host would otherwise each open a
-connection — which passes every correctness assertion while quietly undoing the
-multiplexing gRPC exists for.
+fact rather than a rule to remember.
 
-Headers that HTTP/2 forbids — `connection`, `keep-alive`, `proxy-connection`,
-`transfer-encoding`, `upgrade` — are stripped when an HTTP/1.1 client's request
-goes over an HTTP/2 upstream. `te` is not: gRPC sends `te: trailers`, which is
-the one value HTTP/2 keeps, and stripping it would break the requests that most
-need trailers.
+The cache takes **two** locks, and which is held across what is the whole
+design. Dialling has to be serialised per key, because two streams racing to be
+first to a host would otherwise each open a connection — passing every
+correctness assertion while quietly undoing the multiplexing gRPC exists for.
+But serialising *every* dial behind one lock would let a single blackholed host
+stall every other host's first request. So the outer map lock is held only long
+enough to find or make a slot and never across an `await`, and the per-key slot
+lock is held across the dial. Every dial, HTTP/1.1 and HTTP/2 alike, also runs
+under a ten-second deadline covering TCP and TLS together: an unbounded dial
+would hold its key's slot for as long as the host stayed silent.
+
+Entries are dropped when a grant dies, not merely when a later dial notices a
+closed socket. `ProxyIssuer::revoke` is the single place the daemon learns a
+`(session, credential)` pair has been retired, so the issuer holds the cache and
+evicts from it there; `server::retire` is the single place a session ends, and
+evicts the session's connections whether or not it minted anything. Neither is
+needed for correctness — every stream re-authorises its own token — but a
+connection held open for a grant that no longer exists is a socket at a vendor
+that nothing will ever use again.
+
+Headers that HTTP/2 forbids are **hyper's** to remove, and it removes them:
+the four RFC 9110 names, plus whatever the `Connection:` header itself listed,
+with `te: trailers` kept because gRPC needs it. The proxy does not pre-strip
+them, and the reason is ordering — removing `Connection` first would leave the
+headers it named behind for the upstream to see.
 
 Trailers are relayed as body frames, never buffered and never read. That is all
 gRPC needs from a proxy: `grpc-status` and `grpc-message` arrive after the body,
 so the trailer frame is the call's result, and briefcred forwards it without
-ever knowing what it says.
+ever knowing what it says. An upstream that does not offer `h2` cannot carry a
+gRPC call at all, so one is refused with `upstream_error` and a reason rather
+than downgraded into a response the client cannot parse.
+
+A long-lived HTTP/2 response is watched exactly as an event stream is. Any body
+on an HTTP/2 connection whose length the upstream did not state — every gRPC
+call, and every other streamed HTTP/2 response — is wrapped in the same
+`stream::LiveBody`, gets the same one-second liveness poll, and writes a
+`ProxyStream` row of kind `h2-stream` when it ends. The rule is the length
+rather than the content type because HTTP/2 gives a proxy no way to know in
+advance whether a body will take a millisecond or an hour, and guessing "short"
+is the guess that leaves a revoked grant delivering. Nothing inside such a body
+is parsed, so its `events_or_frames` is `0`: a gRPC message is length-prefixed
+inside a `DATA` frame, and counting messages would mean reading the call's own
+framing.
 
 One `ProxyH2Connection` row is written when a client's connection closes, and
 every `ProxyRequest` and `ProxyStream` row from it carries its `connection_id`.

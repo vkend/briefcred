@@ -105,7 +105,9 @@ already knows which credential the request is for from the token.
 
 **A gRPC call's trailers.** `grpc-status` and `grpc-message` arrive after the
 body, and briefcred relays them without reading them. A policy rules on which
-method may be called and never on what it answered.
+method may be called and never on what it answered. The call is still bounded
+in time: a streaming one ends within about a second of its grant being revoked,
+which is the check the policy cannot make because the policy runs once.
 
 **A WebSocket's messages.** A handshake is a `GET`, and the policy decides it as
 one: permitting `resource.path == "/ws"` for `Action::"GET"` is what opens a
