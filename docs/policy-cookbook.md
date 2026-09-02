@@ -158,7 +158,8 @@ quota:
 
 Half a token a second sustained, five available at once, fifty for the whole
 session. One token is spent per HTTP proxy request, per Postgres proxy
-connection, and per `briefcred exec` or `briefcred get` that mints.
+connection, per `briefcred exec` or `briefcred get` that mints, and per
+`briefcred_db_query` or `briefcred_exec` MCP tool call.
 
 `examples/profiles/stripe.yaml` runs that quota alongside a second policy
 clause, and the pair is the point of this section:
@@ -187,6 +188,7 @@ They are deliberately distinguishable, because the fixes are different.
 | audit `decision` | `deny` | `quota` |
 | Postgres SQLSTATE | `28000` | `53300` |
 | metric | `briefcred_proxy_requests_total{decision="deny"}` | `briefcred_quota_rejections_total{profile,surface}` |
+| `policy_mode: observe` | forwards it and logs `would_deny` | still refuses it |
 
 A rising `deny` count means a policy that is too narrow for what the workload
 actually does. A rising `quota` count means the workload is doing the right
@@ -199,6 +201,10 @@ Two more things worth knowing about the quota:
   policy is evaluated. The expensive thing to defend against is a loop, and a
   loop that is being denied is still a loop — one that would otherwise get an
   unmetered retry channel precisely because it is doing something forbidden.
+- **`policy_mode: observe` does not soften it.** Observe mode is a way to
+  trial a *rule* — it forwards the request and records the denial it would have
+  made. A quota is not a rule, it is a resource bound, so a throttled request
+  is refused in either mode.
 - **`total` does not refill.** Once a session has spent it, every charge fails
   until the session is closed, and the `429` comes back without a
   `Retry-After` because there is no time at which retrying would work. Close

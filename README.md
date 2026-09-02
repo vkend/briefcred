@@ -224,7 +224,7 @@ currently being written, and ignores any filename it did not write.
 | `briefcred_pgproxy_connections_total{outcome}` | counter | Postgres connections, by outcome |
 | `briefcred_pgproxy_bytes_total{direction}` | counter | Bytes relayed by the Postgres proxy, by direction |
 | `briefcred_quota_saturation{profile}` | gauge | How full a profile's session quota is, 0 to 1, where 1 is empty |
-| `briefcred_quota_rejections_total{profile,surface}` | counter | Charges a quota refused, by profile and by `http`/`postgres`/`exec` |
+| `briefcred_quota_rejections_total{profile,surface}` | counter | Charges a quota refused, by profile and by `http`/`postgres`/`exec`/`mcp` |
 
 The two histograms time failures as well as successes: a backend that takes
 thirty seconds to refuse is exactly what they exist to show. A rising
@@ -441,8 +441,9 @@ quota:
   total: 400               # optional hard cap for the whole session
 ```
 
-One token is spent per HTTP proxy request, per Postgres proxy connection, and
-per `briefcred exec` or `briefcred get` that mints. The bucket is created when
+One token is spent per HTTP proxy request, per Postgres proxy connection, per
+`briefcred exec` or `briefcred get` that mints, and per `briefcred_db_query` or
+`briefcred_exec` MCP tool call. The bucket is created when
 the session opens and dies with it, so two concurrent runs of the same profile
 get a budget each rather than competing for one; nothing is persisted across a
 daemon restart.
@@ -450,9 +451,9 @@ daemon restart.
 When the bucket is empty the HTTP proxy answers `429` with
 `{"error":"briefcred quota exceeded"}` and a `Retry-After` header, the Postgres
 proxy refuses the connection with SQLSTATE `53300` (`too_many_connections`)
-before it opens an upstream one, and `briefcred exec` fails with an error naming
-the profile. A spent `total` gets no `Retry-After`, because no wait would help:
-close the session and open a new one.
+before it opens an upstream one, and `briefcred exec` and the MCP tools fail
+with an error naming the profile and how long to wait. A spent `total` gets no
+`Retry-After`, because no wait would help: close the session and open a new one.
 
 Two things about the charge are worth knowing. It happens **before** the policy
 is evaluated, so a request the policy denies still costs a token — the expensive
@@ -460,7 +461,9 @@ thing to defend against is a loop, and a loop that is being denied is still a
 loop. And a policy refusal and a quota refusal are deliberately
 distinguishable: `403` against `429`, `decision: "deny"` against
 `decision: "quota"` in the audit log. Widening the policy will not fix a quota
-rejection, and raising the quota will not fix a denial.
+rejection, and raising the quota will not fix a denial. `policy_mode: observe`
+does not soften a quota refusal either: observe mode is for trialling a rule,
+and a quota is a resource bound rather than a rule.
 
 Unknown keys are errors at every level, so a typo cannot silently switch a
 control off. `${minted.<credential>.<field>}` must name a credential the

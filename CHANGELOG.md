@@ -12,18 +12,23 @@ All notable changes to briefcred are recorded here. The format follows
   set `quota: { rate, burst, total }` — a token bucket, in tokens per second,
   where `rate` may be fractional and `total` is an optional hard cap for the
   whole session. One token is spent per HTTP proxy request, per Postgres proxy
-  connection, and per `briefcred exec` or `briefcred get` that mints. The bucket
-  is built when the session opens and dies with it, so two concurrent runs of
-  one profile get a budget each rather than competing for one, and nothing
-  survives a daemon restart. `rate` must be positive and `burst` at least 1, and
+  connection, per `briefcred exec` or `briefcred get` that mints, and per
+  `briefcred_db_query` or `briefcred_exec` MCP tool call — an MCP call uses a
+  credential inside the daemon rather than handing one to a subprocess, so
+  without a charge of its own it would be the one unmetered way to spend a
+  metered profile. The bucket is built when the session opens and dies with it,
+  so two concurrent runs of one profile get a budget each rather than competing
+  for one, and nothing survives a daemon restart. `rate` must be positive and `burst` at least 1, and
   both are checked when the profile is loaded.
 - **What a throttled client is told.** The HTTP proxy answers `429` with
   `{"error":"briefcred quota exceeded"}` and a `Retry-After` header, and audits
   the request as `decision: "quota"`. The Postgres proxy refuses the connection
   with SQLSTATE `53300` (`too_many_connections`) *before* it opens an upstream
   one, so the database never sees a login the client did not get.
-  `briefcred exec` fails with an error naming the profile. A spent `total` gets
-  no `Retry-After`, because no wait would help.
+  `briefcred exec` and the MCP tools fail with an error naming the profile and
+  how long to wait. A spent `total` gets no `Retry-After`, because no wait would
+  help. `policy_mode: observe` does not soften a quota refusal: observe mode is
+  for trialling a rule, and a quota is a resource bound rather than a rule.
 - **The quota is charged before the policy is evaluated**, so a request the
   policy denies still costs a token. The expensive thing to defend against is a
   loop, and a loop that is being denied is still a loop — one that would
@@ -33,7 +38,7 @@ All notable changes to briefcred are recorded here. The format follows
   for an untouched bucket to 1 for an empty one, updated on every charge and
   pinned at exactly 1 by a refusal so `== 1` is an alert expression that works;
   and `briefcred_quota_rejections_total{profile,surface}` with `surface` one of
-  `http`, `postgres`, `exec`. The gauge is deliberately unseeded: a series that
+  `http`, `postgres`, `exec`, `mcp`. The gauge is deliberately unseeded: a series that
   exists is a profile somebody metered.
 - **A Cedar request context.** `Http` requests now carry
   `context: { hour, weekday, resp_bytes_so_far, requests_so_far }`, all `Long`.

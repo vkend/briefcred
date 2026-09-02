@@ -360,9 +360,10 @@ only credential the vendor accepts. So the proxy is the mechanism, and the
 
 Alongside it, `briefcred-daemon::quota` answers the question the policy cannot:
 *how much*. One token bucket per open session, built from the profile's
-`quota:` when the session opens and dropped with it, charged by all three
+`quota:` when the session opens and dropped with it, charged by all four
 surfaces that spend a credential — the HTTP proxy per request, the Postgres
-proxy per connection, and `exec` per run that mints. Per session rather than
+proxy per connection, `exec` per run that mints, and the MCP server per
+`briefcred_db_query` or `briefcred_exec` call. Per session rather than
 per profile, so two concurrent runs get a budget each; and never persisted,
 because a quota bounds one session's blast radius and a session does not
 survive a restart.

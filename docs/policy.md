@@ -245,5 +245,9 @@ a bodiless `403`, and a quota refusal is a `429` carrying
 `{"error":"briefcred quota exceeded"}` and, where waiting would help, a
 `Retry-After`. See **Combining with a quota** in `docs/policy-cookbook.md`.
 
+`policy_mode: observe` does not soften a quota refusal. Observe mode is a way
+to trial a *rule*, and a quota is a resource bound rather than a rule, so a
+throttled request is refused in either mode.
+
 `status` is the upstream's own code, and is absent on every row that never
 reached an upstream.
