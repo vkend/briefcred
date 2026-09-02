@@ -408,7 +408,10 @@ async fn forward(
     // A proof is for briefcred, not for the vendor, and forwarding it would
     // tell an upstream which session made the call.
     parts.headers.remove("dpop");
+    // Hop-by-hop headers addressed to the proxy, which is this process. An
+    // upstream has no business seeing either.
     parts.headers.remove(hyper::header::PROXY_AUTHORIZATION);
+    parts.headers.remove("proxy-connection");
 
     // The upstream is a fresh HTTP/1.1 connection, so the request line has to
     // be origin-form: an absolute URI is a proxy's spelling, not a server's.

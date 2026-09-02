@@ -289,6 +289,20 @@ struct QueueRevoker {
 #[async_trait::async_trait]
 impl revoke::Revoker for QueueRevoker {
     async fn revoke(&self, entry: &revoke::PendingRevoke) -> briefcred_core::RevokeOutcome {
+        // The proxy's own kinds need no master: retiring one is the daemon
+        // deciding to stop honouring a token it signed. Fetching a master
+        // anyway would make a revoke that cannot fail depend on a key store
+        // that can, and on a secret whose file the user may have deleted along
+        // with the profile.
+        if briefcred_core::Registry::discover().is_proxy(&entry.kind) {
+            return crate::exec::revoke_one(
+                &self.helpers,
+                entry,
+                &zeroize::Zeroizing::new(String::new()),
+                self.proxy.as_deref(),
+            )
+            .await;
+        }
         let master = match self.masters.fetch(&entry.source_key).await {
             Ok(master) => master,
             Err(err) => return briefcred_core::RevokeOutcome::failed(err.to_string()),

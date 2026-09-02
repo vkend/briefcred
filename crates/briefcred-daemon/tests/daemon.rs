@@ -625,15 +625,16 @@ async fn a_broken_profile_is_audited_and_the_good_ones_survive() {
         "name: broken\nbogus: 1\n",
     );
 
-    // Thirty seconds, not ten. What is under test is *that* the broken file is
-    // audited and that service is undisturbed meanwhile, not how quickly the
+    // A minute, not ten seconds. What is under test is *that* the broken file
+    // is audited and that service is undisturbed meanwhile, not how quickly the
     // filesystem watcher notices — and on a machine running the rest of the
-    // suite in parallel, several ephemeral PostgreSQL clusters among it, the
-    // notification and the reload behind it are not prompt. A budget tight
-    // enough to catch a regression in watcher *latency* would be a budget that
-    // fails under load, which is a worse test than a slow one.
+    // suite in parallel, several ephemeral PostgreSQL clusters and the proxy's
+    // end-to-end tests among it, the notification and the reload behind it are
+    // not prompt. A budget tight enough to catch a regression in watcher
+    // *latency* would be a budget that fails under load, which is a worse test
+    // than a slow one.
     let mut audited = false;
-    for _ in 0..600 {
+    for _ in 0..1_200 {
         // Keep the connection working while the reload happens: a broken file
         // must not disturb service at all.
         assert_eq!(call(&mut stream, Request::Ping).await, Response::Pong);
