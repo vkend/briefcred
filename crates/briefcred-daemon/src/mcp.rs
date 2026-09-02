@@ -286,24 +286,32 @@ impl McpServer {
         let credential = spec.name.clone();
 
         self.ensure_minted(&profile).await?;
-        let held = self.inner.held.lock().await;
-        let held = held.as_ref().expect("ensure_minted leaves a session");
-        let fields = held.fields.get(&credential).ok_or_else(|| {
-            internal(format!(
-                "credential `{credential}` did not mint, so there is nothing to query with"
-            ))
-        })?;
-        let user = fields
-            .get("PGUSER")
-            .ok_or_else(|| internal("the minted credential has no PGUSER"))?;
-        let password = zeroize::Zeroizing::new(
-            fields
-                .get("PGPASSWORD")
-                .ok_or_else(|| internal("the minted credential has no PGPASSWORD"))?
-                .clone(),
-        );
+        // Copied out of the lock rather than used under it: the connection and
+        // the query below are network calls, and holding the session lock
+        // across them would make two tool calls on one connection wait on each
+        // other for no reason.
+        let (user, password) = {
+            let held = self.inner.held.lock().await;
+            let held = held.as_ref().expect("ensure_minted leaves a session");
+            let fields = held.fields.get(&credential).ok_or_else(|| {
+                internal(format!(
+                    "credential `{credential}` did not mint, so there is nothing to query with"
+                ))
+            })?;
+            let user = fields
+                .get("PGUSER")
+                .ok_or_else(|| internal("the minted credential has no PGUSER"))?
+                .clone();
+            let password = zeroize::Zeroizing::new(
+                fields
+                    .get("PGPASSWORD")
+                    .ok_or_else(|| internal("the minted credential has no PGPASSWORD"))?
+                    .clone(),
+            );
+            (user, password)
+        };
 
-        let client = postgres::connect_as(&config, user, &password)
+        let client = postgres::connect_as(&config, &user, &password)
             .await
             .map_err(|e| internal(e.to_string()))?;
         // `query` and not `simple_query`: one statement, no multi-statement
