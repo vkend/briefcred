@@ -1033,6 +1033,23 @@ async fn handle_handoff(request: Request, state: Arc<State>) -> Response {
         };
     }
 
+    // The socket is the successor's address, and every master this daemon holds
+    // is about to be sealed and written to it. A caller who could name a path
+    // anywhere on the filesystem could name one it had a listener on, so only
+    // the directory `Paths::handoff_socket` draws from is accepted.
+    if let Err(message) = handoff_socket_is_ours(&state, &socket) {
+        return Response::Error { message };
+    }
+
+    // Then presence. Exporting is the one operation that moves every resident
+    // master at once, and it is reachable by anything running as this user, so
+    // it is gated like the sessions it is moving — at the strictest policy any
+    // open session asked for, because a handoff that prompted at the weakest
+    // would let a `none` session lower the bar for a `biometric` one.
+    if let Err(response) = prove_handoff_presence(&state).await {
+        return response;
+    }
+
     let signer = match state.token_signer() {
         Ok(signer) => signer,
         Err(err) => return handoff_failed(&state, format!("{err}")),
@@ -1098,6 +1115,106 @@ async fn handle_handoff(request: Request, state: Arc<State>) -> Response {
     state.request_shutdown("handoff");
     Response::HandoffComplete { to_pid, sessions }
 }
+
+/// Refuse a handoff socket that is not one this daemon would ever have named.
+///
+/// The path is compared after resolving the directory it sits in, so a
+/// `../../tmp/x.sock` or a symlinked parent cannot dress itself up as a state
+/// directory. The file itself is not resolved: it does not exist yet from this
+/// daemon's point of view, and a successor's socket that *was* a symlink is
+/// exactly what this is refusing.
+fn handoff_socket_is_ours(state: &Arc<State>, socket: &str) -> std::result::Result<(), String> {
+    let path = std::path::Path::new(socket);
+    let refuse = || {
+        format!(
+            "a handoff socket must be a file directly under {}; `{socket}` is not",
+            state.paths().state_dir().display()
+        )
+    };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(refuse());
+    };
+    if name.as_encoded_bytes().is_empty() {
+        return Err(refuse());
+    }
+    let state_dir = state
+        .paths()
+        .state_dir()
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve the state directory: {e}"))?;
+    let parent = parent.canonicalize().map_err(|_| refuse())?;
+    if parent != state_dir {
+        return Err(refuse());
+    }
+    Ok(())
+}
+
+/// Prove presence for a handoff, at the strictest policy any session asked for.
+///
+/// `biometric` beats `passcode` beats `none`, and a daemon with no open
+/// sessions has nothing to protect, so it prompts for nothing. The unlock cache
+/// is deliberately not consulted: a cached unlock was granted for one profile's
+/// own use, and moving every master in the daemon to another process is not
+/// that use.
+async fn prove_handoff_presence(state: &Arc<State>) -> std::result::Result<(), Response> {
+    use briefcred_core::profile::UnlockPolicy;
+
+    let rank = |policy: UnlockPolicy| match policy {
+        UnlockPolicy::None => 0,
+        UnlockPolicy::Passcode => 1,
+        UnlockPolicy::Biometric => 2,
+    };
+
+    let mut strictest = UnlockPolicy::None;
+    for (_, profile_name) in state.sessions().open_sessions().await {
+        if let Some(profile) = state.profiles().get(&profile_name).await {
+            if rank(profile.unlock.policy) > rank(strictest) {
+                strictest = profile.unlock.policy;
+            }
+        }
+    }
+    if strictest == UnlockPolicy::None {
+        return Ok(());
+    }
+
+    if crate::unlock::is_headless() {
+        let err = crate::unlock::UnlockError::NoAquaSession;
+        state.audit(&AuditEntry::UnlockDenied {
+            ts: OffsetDateTime::now_utc(),
+            profile: HANDOFF_UNLOCK_PROFILE.to_string(),
+            policy: policy_name(strictest).to_string(),
+            reason: err.reason().to_string(),
+        });
+        return Err(Response::Locked {
+            reason: err.reason().to_string(),
+            message: err.to_string(),
+        });
+    }
+
+    if let Err(err) = state.unlock.unlock(strictest, HANDOFF_UNLOCK_REASON).await {
+        state.audit(&AuditEntry::UnlockDenied {
+            ts: OffsetDateTime::now_utc(),
+            profile: HANDOFF_UNLOCK_PROFILE.to_string(),
+            policy: policy_name(strictest).to_string(),
+            reason: err.reason().to_string(),
+        });
+        return Err(Response::Locked {
+            reason: err.reason().to_string(),
+            message: err.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// What the prompt says when a handoff asks for presence.
+const HANDOFF_UNLOCK_REASON: &str = "daemon upgrade";
+
+/// The `profile` an `UnlockDenied` row carries for a handoff.
+///
+/// A handoff is not for one profile — it moves every session at once — so the
+/// row names the operation instead. The leading `@` cannot collide with a
+/// profile name, which are file stems.
+const HANDOFF_UNLOCK_PROFILE: &str = "@handoff";
 
 /// Record a handoff that did not happen, and say so without stopping.
 ///
@@ -1501,6 +1618,67 @@ mod tests {
             !state.was_handed_over("opened-in-the-window"),
             "a session the blob never carried was not handed anywhere"
         );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_prompts_once_at_the_strictest_policy_any_session_holds() {
+        let (_home, state, prompts) = test_state(GUARDED).await;
+
+        // No sessions: there is nothing resident to protect, so nobody is asked.
+        prove_handoff_presence(&state)
+            .await
+            .expect("an empty daemon hands over without a prompt");
+        assert_eq!(prompts.load(Ordering::SeqCst), 0);
+
+        let opened = handle_open_session(
+            Request::OpenSession {
+                profile: "dev".into(),
+                client_headless: false,
+                session_pubkey: None,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(
+            matches!(opened, Response::SessionOpened { .. }),
+            "{opened:?}"
+        );
+        let after_open = prompts.load(Ordering::SeqCst);
+
+        // One session, and its profile is guarded: exactly one prompt, and it
+        // is not served by the unlock the session itself already paid for.
+        prove_handoff_presence(&state)
+            .await
+            .expect("the gate answers yes in this test");
+        assert_eq!(
+            prompts.load(Ordering::SeqCst),
+            after_open + 1,
+            "a handoff asks for presence itself rather than riding the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_socket_outside_the_state_directory_is_refused() {
+        let (home, state, _prompts) = test_state(GUARDED).await;
+        let state_dir = state.paths().state_dir();
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let ours = state.paths().handoff_socket();
+        handoff_socket_is_ours(&state, &ours.display().to_string())
+            .expect("the path this daemon would name itself");
+
+        for outside in [
+            home.path().join("elsewhere.sock"),
+            state_dir.join("nested").join("x.sock"),
+            std::path::PathBuf::from("/tmp/briefcred-handoff.sock"),
+            state_dir.join("..").join("evil.sock"),
+        ] {
+            assert!(
+                handoff_socket_is_ours(&state, &outside.display().to_string()).is_err(),
+                "{} must not be accepted as a handoff socket",
+                outside.display()
+            );
+        }
     }
 
     const GUARDED: &str = "name: dev\ncredentials:\n  - name: db\n    kind: postgres-dynamic\n    config:\n      host: 127.0.0.1\n      dbname: app\n      user: m\n      sslmode: disable\n      role_template: {}\n";

@@ -8,6 +8,13 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Fixed
 
+- **A handoff proves presence and checks its socket path.** `briefcred daemon
+  upgrade` exported every resident master to whatever socket the caller named,
+  with no unlock prompt. It now runs the unlock gate at the strictest
+  `unlock.policy` among the open sessions, with the reason "daemon upgrade",
+  and refuses a socket path that is not directly inside briefcred's own state
+  directory.
+
 - **Idle eviction now counts proxied and MCP use.** A session's idle timer
   was only reset by a request on the daemon's own socket, so an agent doing all
   its work through the HTTP proxy, the Postgres proxy, or an MCP tool call had
@@ -831,6 +838,13 @@ All notable changes to briefcred are recorded here. The format follows
   binary.
 
 ### Fixed
+
+- **A handoff proves presence and checks its socket path.** `briefcred daemon
+  upgrade` exported every resident master to whatever socket the caller named,
+  with no unlock prompt. It now runs the unlock gate at the strictest
+  `unlock.policy` among the open sessions, with the reason "daemon upgrade",
+  and refuses a socket path that is not directly inside briefcred's own state
+  directory.
 
 - **The end-to-end harness refuses to start when any helper binary is
   missing**, not only the PostgreSQL one. A test reads the workspace's

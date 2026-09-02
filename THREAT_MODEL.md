@@ -362,6 +362,21 @@ A stolen token is useful only:
 - **until its `exp`, or until the grant is revoked.** `briefcred exec` finishing
   revokes it, and the proxy refuses it from that moment.
 
+- **Presence, at the strictest policy in the daemon.** Exporting is the one
+  operation that moves every resident master at once, and the IPC socket is
+  reachable by anything running as this user. So a handoff proves presence
+  before it exports, at the strictest `unlock.policy` among the open sessions —
+  `biometric` over `passcode` over `none` — with the reason "daemon upgrade". A
+  daemon holding no sessions has nothing to move and prompts for nothing. The
+  unlock cache is deliberately not consulted: a cached unlock was granted for
+  one profile's own use, and handing every master to another process is not
+  that use.
+- **The socket path.** The successor's address is where the sealed blob is
+  written, so a caller cannot name an arbitrary path: the socket must sit
+  directly in briefcred's own state directory, the one `handoff_socket` draws
+  from. The parent directory is resolved before it is compared, so a symlinked
+  or `..`-relative path cannot dress itself up as that directory.
+
 ### What it is not bounded by, and this is the important part
 
 **Possession.** The token's `cnf.jkt` names a per-session key, and a client that
@@ -631,6 +646,21 @@ dangerous state, so it is worth being exact about what protects it.
   and each session keeps its per-session public key. An upgrade is therefore not
   a way to refill a `quota:`, to reset a `context.resp_bytes_so_far` budget, to
   un-revoke a grant, or to shed a `DPoP` binding.
+
+- **Presence, at the strictest policy in the daemon.** Exporting is the one
+  operation that moves every resident master at once, and the IPC socket is
+  reachable by anything running as this user. So a handoff proves presence
+  before it exports, at the strictest `unlock.policy` among the open sessions —
+  `biometric` over `passcode` over `none` — with the reason "daemon upgrade". A
+  daemon holding no sessions has nothing to move and prompts for nothing. The
+  unlock cache is deliberately not consulted: a cached unlock was granted for
+  one profile's own use, and handing every master to another process is not
+  that use.
+- **The socket path.** The successor's address is where the sealed blob is
+  written, so a caller cannot name an arbitrary path: the socket must sit
+  directly in briefcred's own state directory, the one `handoff_socket` draws
+  from. The parent directory is resolved before it is compared, so a symlinked
+  or `..`-relative path cannot dress itself up as that directory.
 
 ### What it is not bounded by, and this is the important part
 
