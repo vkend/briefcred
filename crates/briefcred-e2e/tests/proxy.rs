@@ -27,6 +27,14 @@ const REAL_KEY: &str = "sk-the-real-openai-key";
 
 /// A profile permitting exactly one method on one path.
 fn profile(policy_mode: &str) -> String {
+    quota_profile(policy_mode, "")
+}
+
+/// The same, with a `quota:` block spliced in.
+///
+/// `quota` is the whole YAML block or the empty string, rather than a rate and
+/// a burst, so a test can say "no quota at all" in the same call.
+fn quota_profile(policy_mode: &str, quota: &str) -> String {
     format!(
         "\
 name: openai
@@ -36,7 +44,7 @@ credentials:
   - name: openai
     kind: http-bearer
     ttl_secs: 300
-policy_mode: {policy_mode}
+{quota}policy_mode: {policy_mode}
 policy: |
   permit(principal, action == Action::\"GET\", resource)
   when {{ resource.host == \"{UPSTREAM_HOST}\" && resource.path == \"/v1/models\" }};
@@ -184,12 +192,39 @@ impl ProxyClient {
         self.request("GET", path, headers).await
     }
 
+    /// The same as [`ProxyClient::get`], also reporting one response header.
+    ///
+    /// A separate method rather than a fourth element on every tuple: exactly
+    /// one test cares what came back in a header, and widening the common
+    /// return type for it would touch every other call site.
+    async fn get_with_header(
+        &self,
+        path: &str,
+        headers: &[(&str, String)],
+        header: &str,
+    ) -> Result<(u16, Vec<u8>, Option<String>), String> {
+        let (status, body, seen) = self.send("GET", path, headers, Some(header)).await?;
+        Ok((status, body, seen.1))
+    }
+
     async fn request(
         &self,
         method: &str,
         path: &str,
         headers: &[(&str, String)],
     ) -> Result<(u16, Vec<u8>, Duration), String> {
+        let (status, body, (first_byte_at, _)) = self.send(method, path, headers, None).await?;
+        Ok((status, body, first_byte_at))
+    }
+
+    /// One request through the tunnel, timed, optionally reading one header.
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, String)],
+        want_header: Option<&str>,
+    ) -> Result<(u16, Vec<u8>, (Duration, Option<String>)), String> {
         let mut stream = TcpStream::connect(&self.proxy_addr)
             .await
             .map_err(|e| e.to_string())?;
@@ -265,6 +300,13 @@ impl ProxyClient {
             .await
             .map_err(|e| e.to_string())?;
         let status = response.status().as_u16();
+        let seen_header = want_header.and_then(|name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        });
 
         // Timed to the *first* body byte, which is what tells a streamed
         // response from a buffered one.
@@ -281,7 +323,11 @@ impl ProxyClient {
                 bytes.extend_from_slice(data);
             }
         }
-        Ok((status, bytes, first_byte_at.unwrap_or(started.elapsed())))
+        Ok((
+            status,
+            bytes,
+            (first_byte_at.unwrap_or(started.elapsed()), seen_header),
+        ))
     }
 }
 
@@ -298,6 +344,10 @@ struct Fixture {
 }
 
 async fn start(policy_mode: &str) -> Fixture {
+    start_with(&profile(policy_mode)).await
+}
+
+async fn start_with(profile_yaml: &str) -> Fixture {
     let upstream = start_upstream().await;
 
     let daemon = Daemon::prepare("");
@@ -308,7 +358,7 @@ async fn start(policy_mode: &str) -> Fixture {
     std::fs::write(
         daemon.home().join("daemon.toml"),
         format!(
-            "metrics_enabled = false\nmetrics_port = 0\nproxy_port = 0\npg_proxy_port = 0\n\
+            "metrics_enabled = true\nmetrics_port = 0\nproxy_port = 0\npg_proxy_port = 0\n\
              master_source = \"file\"\nupstream_roots = {:?}\n[ca]\nkeystore = \"file\"\n",
             roots.display().to_string()
         ),
@@ -328,7 +378,7 @@ async fn start(policy_mode: &str) -> Fixture {
     ca.save(&paths, &store).unwrap();
     let briefcred_ca = ca.cert_pem().to_string();
 
-    daemon.write_profile("openai", &profile(policy_mode));
+    daemon.write_profile("openai", profile_yaml);
     daemon.write_master("openai", REAL_KEY);
 
     let mut daemon = daemon;
@@ -715,6 +765,163 @@ async fn a_large_response_is_streamed_rather_than_buffered() {
         first_byte_at < Duration::from_millis(500),
         "the first byte took {first_byte_at:?}; the response was buffered"
     );
+}
+
+// --------------------------------------------------------------- the quota
+
+/// The profile's own quota, once the `exec` in `start_with` has spent one.
+///
+/// `burst: 3` and a rate slow enough that nothing refills inside a test: the
+/// mint takes one token, so two proxied requests succeed and the third does
+/// not. Written as the number of tokens a *request* gets rather than the
+/// number in the bucket, because that is what the assertions below count.
+const REQUESTS_BEFORE_THROTTLING: usize = 2;
+
+#[tokio::test]
+async fn a_session_over_its_quota_gets_a_429_with_a_retry_after() {
+    let fixture = start_with(&quota_profile(
+        "enforce",
+        // One token every ten seconds, three at once. The `exec` that opened
+        // the session already spent one.
+        "quota:\n  rate: 0.1\n  burst: 3\n",
+    ))
+    .await;
+
+    for n in 0..REQUESTS_BEFORE_THROTTLING {
+        let (status, _, _) = fixture
+            .client
+            .get("/v1/models", &bearer(&fixture.token))
+            .await
+            .unwrap_or_else(|e| panic!("request {n}: {e}\n{}", fixture.daemon.log()));
+        assert_eq!(status, 200, "request {n}\n{}", fixture.daemon.log());
+    }
+
+    let (status, body, retry_after) = fixture
+        .client
+        .get_with_header("/v1/models", &bearer(&fixture.token), "retry-after")
+        .await
+        .unwrap();
+    assert_eq!(status, 429, "the bucket is empty\n{}", fixture.daemon.log());
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        r#"{"error":"briefcred quota exceeded"}"#
+    );
+    // Ten seconds a token, so the wait is ten. Asserted as a number rather
+    // than as a string so a header of `10s` or `0` would fail.
+    assert_eq!(
+        retry_after.as_deref().map(str::parse::<u64>),
+        Some(Ok(10)),
+        "a throttled client must be told when to come back"
+    );
+
+    // The upstream never heard about the throttled request.
+    assert_eq!(
+        fixture.upstream.seen.lock().unwrap().len(),
+        REQUESTS_BEFORE_THROTTLING,
+        "a throttled request must not reach the upstream"
+    );
+}
+
+#[tokio::test]
+async fn a_throttled_request_is_audited_as_a_quota_refusal_and_not_a_denial() {
+    let fixture = start_with(&quota_profile(
+        "enforce",
+        "quota:\n  rate: 0.1\n  burst: 1\n",
+    ))
+    .await;
+
+    // The `exec` spent the only token, so the first request is already over.
+    let (status, _, _) = fixture
+        .client
+        .get("/v1/models", &bearer(&fixture.token))
+        .await
+        .unwrap();
+    assert_eq!(status, 429);
+
+    assert!(
+        proxy_row_written(&fixture.daemon).await,
+        "a throttled request must be audited:\n{}",
+        fixture.daemon.log()
+    );
+    let rows = fixture.daemon.audit_rows();
+    let row = rows.iter().find(|r| r["event"] == "proxy_request").unwrap();
+    assert_eq!(
+        row["decision"], "quota",
+        "the row must say the quota refused it, not the policy"
+    );
+    assert_eq!(row["method"], "GET");
+    assert_eq!(row["path"], "/v1/models");
+    assert!(
+        row["status"].is_null(),
+        "nothing reached an upstream, so there is no upstream status"
+    );
+}
+
+#[tokio::test]
+async fn the_scrape_shows_the_saturation_and_the_rejection() {
+    let fixture = start_with(&quota_profile(
+        "enforce",
+        "quota:\n  rate: 0.1\n  burst: 1\n",
+    ))
+    .await;
+
+    let (status, _, _) = fixture
+        .client
+        .get("/v1/models", &bearer(&fixture.token))
+        .await
+        .unwrap();
+    assert_eq!(status, 429);
+
+    let scrape = scrape(&fixture.daemon).await;
+    assert!(
+        scrape.contains("briefcred_quota_saturation{profile=\"openai\"} 1"),
+        "an empty bucket must read 1:\n{scrape}"
+    );
+    assert!(
+        scrape.contains("briefcred_quota_rejections_total{profile=\"openai\",surface=\"http\"} 1"),
+        "{scrape}"
+    );
+    assert!(
+        scrape
+            .contains("briefcred_proxy_requests_total{decision=\"quota\",status_class=\"none\"} 1"),
+        "{scrape}"
+    );
+}
+
+#[tokio::test]
+async fn a_profile_with_no_quota_is_not_throttled_and_is_not_measured() {
+    let fixture = start("enforce").await;
+    for _ in 0..12 {
+        let (status, _, _) = fixture
+            .client
+            .get("/v1/models", &bearer(&fixture.token))
+            .await
+            .unwrap();
+        assert_eq!(status, 200, "{}", fixture.daemon.log());
+    }
+    let scrape = scrape(&fixture.daemon).await;
+    assert!(
+        !scrape.contains("briefcred_quota_saturation{"),
+        "an unmetered profile must not appear on the gauge:\n{scrape}"
+    );
+}
+
+/// Scrape the daemon's Prometheus endpoint.
+async fn scrape(daemon: &Daemon) -> String {
+    let Response::Status { metrics_addr, .. } =
+        daemon.request(Request::Status).await.expect("status")
+    else {
+        panic!("expected a status\n{}", daemon.log());
+    };
+    let addr = metrics_addr.expect("metrics are enabled for this daemon");
+    let mut stream = TcpStream::connect(&addr).await.expect("connect to metrics");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("send the scrape");
+    let mut body = String::new();
+    stream.read_to_string(&mut body).await.expect("read it");
+    body
 }
 
 /// Wait until a `ProxyRequest` row has reached the disk.

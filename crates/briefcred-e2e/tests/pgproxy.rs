@@ -129,13 +129,15 @@ struct Fixture {
     _cluster: PgCluster,
 }
 
-fn profile(tap_port: u16, ttl_secs: u64) -> String {
+/// `quota` is the whole YAML block or the empty string, so a test can say "no
+/// quota at all" in the same call.
+fn profile(tap_port: u16, ttl_secs: u64, quota: &str) -> String {
     format!(
         "\
 name: warehouse
 unlock:
   policy: none
-credentials:
+{quota}credentials:
   - name: {CREDENTIAL}
     kind: postgres-proxy
     ttl_secs: {ttl_secs}
@@ -158,6 +160,11 @@ async fn start(test: &str) -> Option<Fixture> {
 
 /// The same, with a credential lifetime a test can outlive on purpose.
 async fn start_with_ttl(test: &str, ttl_secs: u64) -> Option<Fixture> {
+    start_with(test, ttl_secs, "").await
+}
+
+/// The same, with a `quota:` block on the profile.
+async fn start_with(test: &str, ttl_secs: u64, quota: &str) -> Option<Fixture> {
     let cluster = cluster_or_skip(test).await?;
     let tap = start_tap(cluster.port()).await;
 
@@ -167,7 +174,7 @@ async fn start_with_ttl(test: &str, ttl_secs: u64) -> Option<Fixture> {
         "metrics_enabled = false\nmetrics_port = 0\nproxy_port = 0\npg_proxy_port = 0\n\
          master_source = \"file\"\n[ca]\nkeystore = \"file\"\n",
     );
-    daemon.write_profile("warehouse", &profile(tap.port, ttl_secs));
+    daemon.write_profile("warehouse", &profile(tap.port, ttl_secs, quota));
     // The master is the cluster's superuser password, and nothing else: the
     // role is named in the credential's `config`, so having it here too would
     // be a way for the two to disagree.
@@ -426,6 +433,47 @@ async fn a_token_for_one_database_cannot_open_another() {
         "{err}"
     );
     assert_eq!(fixture.tap.connections(), 0);
+}
+
+#[tokio::test]
+async fn a_session_over_its_quota_is_refused_with_too_many_connections() {
+    // `burst: 2` and a rate slow enough that nothing refills inside the test:
+    // the `exec` in the fixture spends one token, the first connection spends
+    // the other, and the second connection has none.
+    let Some(fixture) = start_with(
+        "a_session_over_its_quota_is_refused_with_too_many_connections",
+        300,
+        "quota:\n  rate: 0.1\n  burst: 2\n",
+    )
+    .await
+    else {
+        return;
+    };
+
+    let output = psql(&fixture.database_url, "SELECT 1").await;
+    assert!(
+        output.status.success(),
+        "the first connection is inside the quota: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        fixture.daemon.log()
+    );
+    assert_eq!(fixture.tap.connections(), 1);
+
+    let err = fixture
+        .connect(&fixture.session_id, &fixture.token, DBNAME)
+        .await;
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::TOO_MANY_CONNECTIONS),
+        "a throttled client must get 53300, not the 28000 that says its \
+         credential is wrong: {err}"
+    );
+    assert_eq!(
+        fixture.tap.connections(),
+        1,
+        "the refusal must come before the upstream connect, so the database \
+         never sees a login the client did not get"
+    );
 }
 
 #[tokio::test]
