@@ -129,7 +129,7 @@ struct Fixture {
     _cluster: PgCluster,
 }
 
-fn profile(tap_port: u16) -> String {
+fn profile(tap_port: u16, ttl_secs: u64) -> String {
     format!(
         "\
 name: warehouse
@@ -138,7 +138,7 @@ unlock:
 credentials:
   - name: {CREDENTIAL}
     kind: postgres-proxy
-    ttl_secs: 300
+    ttl_secs: {ttl_secs}
     config:
       host: 127.0.0.1
       port: {tap_port}
@@ -153,6 +153,11 @@ env:
 
 /// Start everything, or return `None` when there is no PostgreSQL to test with.
 async fn start(test: &str) -> Option<Fixture> {
+    start_with_ttl(test, 300).await
+}
+
+/// The same, with a credential lifetime a test can outlive on purpose.
+async fn start_with_ttl(test: &str, ttl_secs: u64) -> Option<Fixture> {
     let cluster = cluster_or_skip(test).await?;
     let tap = start_tap(cluster.port()).await;
 
@@ -162,7 +167,7 @@ async fn start(test: &str) -> Option<Fixture> {
         "metrics_enabled = false\nmetrics_port = 0\nproxy_port = 0\npg_proxy_port = 0\n\
          master_source = \"file\"\n[ca]\nkeystore = \"file\"\n",
     );
-    daemon.write_profile("warehouse", &profile(tap.port));
+    daemon.write_profile("warehouse", &profile(tap.port, ttl_secs));
     // The master is the cluster's superuser password, and nothing else: the
     // role is named in the credential's `config`, so having it here too would
     // be a way for the two to disagree.
@@ -227,6 +232,44 @@ impl Fixture {
             panic!("expected a status");
         };
         pg_proxy_addr.expect("the postgres proxy is enabled")
+    }
+
+    /// Open a connection through the proxy and keep it.
+    ///
+    /// The join handle carries the connection task's own result, which is where
+    /// a server-sent `ErrorResponse` ends up: it is how a test can assert that
+    /// briefcred told the client *why* rather than just dropping the socket.
+    async fn connect_live(
+        &self,
+    ) -> (
+        tokio_postgres::Client,
+        tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+    ) {
+        let address = self.proxy_addr().await;
+        let (host, port) = address.rsplit_once(':').expect("host:port");
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(host)
+            .port(port.parse().unwrap())
+            .dbname(DBNAME)
+            .user(&self.session_id)
+            .password(&self.token)
+            .ssl_mode(tokio_postgres::config::SslMode::Disable);
+        let (client, connection) = config
+            .connect(tokio_postgres::NoTls)
+            .await
+            .expect("the proxy accepts a good token");
+        (client, tokio::spawn(connection))
+    }
+
+    /// The mint identifiers the daemon recorded for this session.
+    fn mint_ids(&self) -> Vec<String> {
+        self.daemon
+            .audit_rows()
+            .iter()
+            .filter(|row| row["event"] == "mint")
+            .filter_map(|row| row["mint_id"].as_str().map(str::to_string))
+            .collect()
     }
 
     /// Connect through the proxy as a driver would, with an explicit password.
@@ -449,18 +492,11 @@ async fn a_revoked_grant_stops_opening_connections() {
         .success());
 
     // What `briefcred exec` sends when the child exits.
-    let mint_ids: Vec<String> = fixture
-        .daemon
-        .audit_rows()
-        .iter()
-        .filter(|row| row["event"] == "mint")
-        .filter_map(|row| row["mint_id"].as_str().map(str::to_string))
-        .collect();
     fixture
         .daemon
         .request(Request::ExecDone {
             session_id: fixture.session_id.clone(),
-            mint_ids,
+            mint_ids: fixture.mint_ids(),
             exit_code: Some(0),
             duration_ms: 1,
             hold_until_expiry: false,
@@ -480,4 +516,145 @@ async fn a_revoked_grant_stops_opening_connections() {
         "a revoked grant must stop opening connections:\n{}",
         fixture.daemon.log()
     );
+}
+
+/// How long a test waits for the proxy to notice a grant has gone.
+///
+/// The proxy re-checks once a second, so this is that plus room for a loaded
+/// machine — generous on purpose, because what is under test is that the
+/// connection closes at all, not how quickly.
+const LIVENESS_BUDGET: Duration = Duration::from_secs(15);
+
+/// Wait for a live connection to be closed, and report why the server said.
+///
+/// `None` means it was still open when the budget ran out.
+async fn closed_reason(
+    connection: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+) -> Option<tokio_postgres::Error> {
+    match tokio::time::timeout(LIVENESS_BUDGET, connection).await {
+        Ok(joined) => Some(
+            joined
+                .expect("the connection task did not panic")
+                .expect_err("briefcred ends a connection with an error, not with a clean close"),
+        ),
+        Err(_) => None,
+    }
+}
+
+/// Whether an error is the `admin_shutdown` briefcred ends a connection with.
+fn is_admin_shutdown(err: &tokio_postgres::Error) -> bool {
+    err.code() == Some(&tokio_postgres::error::SqlState::ADMIN_SHUTDOWN)
+}
+
+#[tokio::test]
+async fn revoking_a_grant_closes_the_connection_it_already_opened() {
+    // The finding this covers: a subprocess that connects at the start of a run
+    // must not keep master-privileged access after `briefcred exec` finishes.
+    // Checking the token once at connect time and then relaying forever would
+    // make the proxy a chokepoint that waves everything through.
+    let Some(fixture) = start("revoking_a_grant_closes_the_connection_it_already_opened").await
+    else {
+        return;
+    };
+    let (client, connection) = fixture.connect_live().await;
+    let row = client.query_one("SELECT current_user", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), MASTER_USER);
+
+    fixture
+        .daemon
+        .request(Request::ExecDone {
+            session_id: fixture.session_id.clone(),
+            mint_ids: fixture.mint_ids(),
+            exit_code: Some(0),
+            duration_ms: 1,
+            hold_until_expiry: false,
+        })
+        .await
+        .unwrap();
+
+    let err = closed_reason(connection).await.unwrap_or_else(|| {
+        panic!(
+            "the connection outlived its revoked grant:\n{}",
+            fixture.daemon.log()
+        )
+    });
+    assert!(
+        is_admin_shutdown(&err),
+        "the client must be told why, under 57P01: {err}"
+    );
+    // And the connection really is gone, not merely reporting an error.
+    assert!(client.query_one("SELECT 1", &[]).await.is_err());
+}
+
+#[tokio::test]
+async fn a_connection_does_not_outlive_the_credential_that_opened_it() {
+    // `ttl_secs: 2`, so the token expires while the connection is idle.
+    let Some(fixture) = start_with_ttl(
+        "a_connection_does_not_outlive_the_credential_that_opened_it",
+        2,
+    )
+    .await
+    else {
+        return;
+    };
+    let (client, connection) = fixture.connect_live().await;
+    assert!(client.query_one("SELECT 1", &[]).await.is_ok());
+
+    let err = closed_reason(connection).await.unwrap_or_else(|| {
+        panic!(
+            "the connection outlived its expired credential:\n{}",
+            fixture.daemon.log()
+        )
+    });
+    assert!(is_admin_shutdown(&err), "{err}");
+    assert!(client.query_one("SELECT 1", &[]).await.is_err());
+}
+
+#[tokio::test]
+async fn closing_the_session_closes_the_connections_it_opened() {
+    let Some(fixture) = start("closing_the_session_closes_the_connections_it_opened").await else {
+        return;
+    };
+    let (client, connection) = fixture.connect_live().await;
+    assert!(client.query_one("SELECT 1", &[]).await.is_ok());
+
+    fixture
+        .daemon
+        .request(Request::CloseSession {
+            session_id: fixture.session_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let err = closed_reason(connection).await.unwrap_or_else(|| {
+        panic!(
+            "the connection outlived the session that opened it:\n{}",
+            fixture.daemon.log()
+        )
+    });
+    assert!(is_admin_shutdown(&err), "{err}");
+    assert!(client.query_one("SELECT 1", &[]).await.is_err());
+}
+
+#[tokio::test]
+async fn a_connection_whose_grant_is_still_good_is_left_alone() {
+    // The other half of the bound: the liveness check must not close a
+    // connection that has done nothing wrong. Several times the check interval,
+    // idle throughout, and still usable.
+    let Some(fixture) = start("a_connection_whose_grant_is_still_good_is_left_alone").await else {
+        return;
+    };
+    let (client, connection) = fixture.connect_live().await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        client
+            .query_one("SELECT current_user", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        MASTER_USER,
+        "an unrevoked, unexpired connection must survive:\n{}",
+        fixture.daemon.log()
+    );
+    assert!(!connection.is_finished());
 }
