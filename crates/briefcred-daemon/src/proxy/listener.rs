@@ -431,10 +431,19 @@ async fn forward(
         }
     }
 
-    // 4. Is there budget left? Before the policy, not after: the expensive
-    // thing to defend against is a loop, and a loop that is being denied is
-    // still a loop. Charging afterwards would give a request the profile
-    // forbids an unmetered retry channel.
+    // 4. Count the request, then charge for it.
+    //
+    // Counted first so `requests_so_far` means every request this session
+    // made, whatever became of it. Counting after the charge would make a
+    // throttled request invisible to a policy while a policy-denied one was
+    // not, and a counter that skips some refusals and not others is one no
+    // budget can be written against.
+    let requests_so_far = session.http.begin_request();
+
+    // The charge is before the policy, not after: the expensive thing to
+    // defend against is a loop, and a loop that is being denied is still a
+    // loop. Charging afterwards would give a request the profile forbids an
+    // unmetered retry channel.
     if let Err(refusal) = crate::quota::charge(
         session.quota.as_deref(),
         &session.profile.name,
@@ -458,7 +467,7 @@ async fn forward(
     // written as `context.requests_so_far < 100` permits exactly a hundred.
     let context = briefcred_core::policy::RequestContext::new(
         OffsetDateTime::now_utc(),
-        session.http.begin_request(),
+        requests_so_far,
         session.http.resp_bytes(),
     );
     let decision = proxy.policies.decide(
