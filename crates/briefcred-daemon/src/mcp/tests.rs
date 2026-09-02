@@ -92,3 +92,116 @@ fn a_cut_never_lands_inside_a_character() {
 fn an_empty_output_is_an_empty_string_rather_than_a_truncation() {
     assert_eq!(capped(b""), (String::new(), false));
 }
+
+/// `run_capped` is the thing standing between the daemon's memory and a
+/// command a model asked for, so it is tested against a command that really
+/// does write without stopping.
+#[tokio::test]
+async fn a_command_that_never_stops_writing_is_cut_and_killed() {
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "while :; do printf 'xxxxxxxxxxxxxxxx'; done"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), run_capped(command))
+        .await
+        .expect("an unbounded writer must not hang the daemon")
+        .expect("the command runs");
+
+    assert!(output.truncated, "the cap must be reported");
+    assert!(
+        output.stdout.len() <= MAX_OUTPUT_BYTES,
+        "{} bytes came back",
+        output.stdout.len()
+    );
+    // Killed rather than exited: `start_kill` sends SIGKILL, which has no exit
+    // code. A `Some(_)` here would mean the child was allowed to finish, which
+    // for this command means it never was.
+    assert_eq!(output.exit_code, None, "the child must have been killed");
+}
+
+#[tokio::test]
+async fn a_command_that_stops_on_its_own_keeps_its_exit_code_and_both_streams() {
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "printf out; printf err >&2; exit 3"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = run_capped(command).await.unwrap();
+    assert_eq!(output.stdout, "out");
+    assert_eq!(output.stderr, "err");
+    assert_eq!(output.exit_code, Some(3));
+    assert!(!output.truncated);
+}
+
+/// A child that fills one pipe while the other is being drained deadlocks if
+/// the two are read in sequence, so both are read at once. This is the shape
+/// that catches it: far more on stderr than a pipe buffer holds.
+#[tokio::test]
+async fn a_child_writing_heavily_to_both_streams_does_not_deadlock() {
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "i=0; while [ $i -lt 400 ]; do printf '%1024s' '' >&2; printf '%1024s' ''; \
+             i=$((i+1)); done",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), run_capped(command))
+        .await
+        .expect("reading one stream at a time would hang here")
+        .unwrap();
+    assert_eq!(output.stdout.len(), 400 * 1024);
+    assert_eq!(output.stderr.len(), 400 * 1024);
+    assert_eq!(output.exit_code, Some(0));
+}
+
+/// The audit detail and the caller's message are deliberately different
+/// strings, and the difference is the whole point of `ToolFailure`.
+#[test]
+fn a_redacted_failure_tells_the_caller_more_than_the_audit_log() {
+    let failure = ToolFailure::redacted(
+        invalid("42P01: relation \"salaries\" does not exist"),
+        "the database refused the statement: 42P01",
+    );
+    assert!(failure.reported.message.contains("salaries"));
+    assert!(!failure.audited.contains("salaries"), "{}", failure.audited);
+    assert!(failure.audited.contains("42P01"), "{}", failure.audited);
+}
+
+#[test]
+fn a_failure_briefcred_wrote_itself_is_audited_as_written() {
+    let failure: ToolFailure = invalid("no profile `analytics`").into();
+    assert_eq!(failure.audited, "no profile `analytics`");
+}
+
+#[test]
+fn an_unexpected_unlock_answer_is_named_rather_than_debug_printed() {
+    // `Minted` carries credential material. If the unlock gate ever answered
+    // one, a `{:?}` fallback would put it in a tool result.
+    let message = locked_or_internal(briefcred_proto::Response::Minted {
+        mints: Vec::new(),
+        env: std::collections::BTreeMap::from([(
+            "PGPASSWORD".to_string(),
+            briefcred_proto::SecretString::new("hunter2"),
+        )]),
+        passthrough: Vec::new(),
+    })
+    .message
+    .to_string();
+    assert!(!message.contains("hunter2"), "{message}");
+    assert!(message.contains("minted"), "{message}");
+
+    let locked = locked_or_internal(briefcred_proto::Response::Locked {
+        reason: "cancelled".into(),
+        message: "the prompt was cancelled".into(),
+    });
+    assert!(locked.message.contains("cancelled"));
+}

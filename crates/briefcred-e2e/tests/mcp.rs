@@ -151,6 +151,16 @@ async fn a_command_the_profile_forbids_is_refused_without_minting() {
         !serde_json::to_string(&rows).unwrap().contains("-rf"),
         "an audit row must not carry the arguments a caller typed"
     );
+    let refused = calls
+        .iter()
+        .find(|c| c["outcome"] == "error")
+        .expect("the refusal is audited");
+    assert!(
+        refused["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("/bin/rm") && d.contains("exec policy")),
+        "{refused:#?}"
+    );
 }
 
 /// A profile whose `postgres-dynamic` credential points at `cluster`.
@@ -351,6 +361,159 @@ async fn a_bad_statement_reports_the_databases_own_complaint() {
         "the SQLSTATE belongs in the message: {text}"
     );
     assert!(text.contains("no_such_table"), "{text}");
+
+    client.cancel().await.ok();
+    daemon.shutdown().await;
+
+    // ...and the audit log records the SQLSTATE without the statement. A
+    // database's complaint quotes the SQL back, which is caller text an audit
+    // row may not hold.
+    let log = serde_json::to_string(&daemon.audit_rows()).unwrap();
+    assert!(
+        log.contains("42P01"),
+        "the SQLSTATE is what an operator acts on"
+    );
+    assert!(
+        !log.contains("no_such_table"),
+        "the caller's SQL reached the audit log:\n{log}"
+    );
+}
+
+/// Two tool calls arriving together on a fresh connection must mint once.
+///
+/// `rmcp` runs each request as its own task, so a check-then-act
+/// `ensure_minted` has both find the slot empty, both mint, and the second
+/// overwrite the first — leaving a role that nothing revokes, because the
+/// disconnect can only close the session it can still see.
+#[tokio::test]
+async fn two_concurrent_tool_calls_on_a_fresh_connection_mint_once() {
+    let Some(cluster) = cluster_or_skip("two_concurrent_tool_calls").await else {
+        return;
+    };
+    let mut daemon = Daemon::prepare("metrics_enabled = false\nmaster_source = \"file\"\n");
+    daemon.write_profile("analytics", &db_profile(&cluster));
+    daemon.write_master("pg-master", &cluster.master_password());
+    daemon.start().await.expect("start");
+    let client = mcp_client(&daemon).await;
+
+    let query = |sql: &'static str| {
+        client.call_tool(
+            CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                serde_json::json!({ "profile": "analytics", "sql": sql })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+    };
+    let (first, second) = tokio::join!(query("SELECT 1 AS a"), query("SELECT 2 AS b"));
+    first.expect("the first call succeeds");
+    second.expect("the second call succeeds");
+
+    assert_eq!(
+        cluster.leaked_role_count().await,
+        1,
+        "two concurrent calls must share one mint, not race to two"
+    );
+
+    client.cancel().await.ok();
+    let cleaned = wait_until(Duration::from_secs(20), || async {
+        cluster.leaked_role_count().await == 0
+    })
+    .await;
+    assert!(
+        cleaned,
+        "a role survived the disconnect, so a session was stranded\n{}",
+        daemon.log()
+    );
+    daemon.shutdown().await;
+
+    let rows = daemon.audit_rows();
+    let mints = rows.iter().filter(|r| r["event"] == "mint").count();
+    assert_eq!(mints, 1, "{rows:#?}");
+    let opened = rows.iter().filter(|r| r["event"] == "session_open").count();
+    let closed = rows
+        .iter()
+        .filter(|r| r["event"] == "session_close")
+        .count();
+    assert_eq!(opened, 1, "one session for one connection");
+    assert_eq!(closed, opened, "every session opened must be closed");
+}
+
+/// `max_rows` must bound what the daemon *fetches*, not only what it returns.
+#[tokio::test]
+async fn max_rows_stops_the_fetch_rather_than_trimming_the_answer() {
+    let Some(cluster) = cluster_or_skip("max_rows_stops_the_fetch").await else {
+        return;
+    };
+    let mut daemon = Daemon::prepare("metrics_enabled = false\nmaster_source = \"file\"\n");
+    daemon.write_profile("analytics", &db_profile(&cluster));
+    daemon.write_master("pg-master", &cluster.master_password());
+    daemon.start().await.expect("start");
+    let client = mcp_client(&daemon).await;
+
+    // A generator of a hundred million rows. Streaming and stopping at five
+    // returns in milliseconds; collecting the result set first takes minutes
+    // and gigabytes, so the timeout *is* the assertion — this test passed in
+    // under ten seconds only because the fetch stopped.
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                serde_json::json!({
+                    "profile": "analytics",
+                    "sql": "SELECT i FROM generate_series(1, 100000000) AS i",
+                    "max_rows": 5,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        ),
+    )
+    .await
+    .expect("the fetch must stop at max_rows rather than collecting the result set")
+    .expect("the query runs");
+
+    let result = json_of(&result);
+    assert_eq!(result["row_count"], 5);
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["rows"][0]["i"], 1);
+
+    client.cancel().await.ok();
+    daemon.shutdown().await;
+}
+
+/// A statement with no end is ended by the server, not waited out here.
+#[tokio::test]
+async fn a_runaway_statement_is_cancelled_by_the_configured_timeout() {
+    let Some(cluster) = cluster_or_skip("a_runaway_statement").await else {
+        return;
+    };
+    let mut daemon = Daemon::prepare(
+        "metrics_enabled = false\nmaster_source = \"file\"\nmcp_query_timeout_secs = 1\n",
+    );
+    daemon.write_profile("analytics", &db_profile(&cluster));
+    daemon.write_master("pg-master", &cluster.master_password());
+    daemon.start().await.expect("start");
+    let client = mcp_client(&daemon).await;
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.call_tool(
+            CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                serde_json::json!({ "profile": "analytics", "sql": "SELECT pg_sleep(60)" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        ),
+    )
+    .await
+    .expect("the server must cancel it long before this timeout")
+    .expect_err("a cancelled statement is a failure");
+    // 57014: query_canceled.
+    assert!(err.to_string().contains("57014"), "{err}");
 
     client.cancel().await.ok();
     daemon.shutdown().await;

@@ -26,6 +26,7 @@ debug-heapscan = ["briefcred-proto/debug-heapscan", "dep:mach2", "dep:sha2"]
 briefcred-core.workspace = true
 briefcred-proto.workspace = true
 async-trait.workspace = true
+futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 http-body-util.workspace = true

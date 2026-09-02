@@ -43,6 +43,7 @@ use briefcred_core::audit::AuditEntry;
 use briefcred_core::minters::postgres::{self, PostgresConfig};
 use briefcred_core::profile::Profile;
 use briefcred_proto::{MintSummary, SecretString};
+use futures_util::TryStreamExt as _;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
@@ -139,6 +140,48 @@ pub struct ExecArgs {
 /// One row of a `briefcred_db_query` result.
 type Row = serde_json::Map<String, serde_json::Value>;
 
+/// A tool call that failed, and the two different things to say about it.
+///
+/// These are not the same string and must not be allowed to become one. What
+/// the *caller* is told may quote the caller's own input back — a database's
+/// complaint names the table in the statement, and a refused command names the
+/// argument that was refused, and both are what make the failure fixable. What
+/// the *audit row* records may not: SQL and command lines are exactly the
+/// free-form text `AuditEntry` forbids, and an audit log that accumulates them
+/// is a log that has to be protected like the credentials it exists to
+/// account for.
+///
+/// So every failure states both, and the `From` impl below is only for
+/// failures whose message briefcred wrote itself out of metadata it already
+/// records elsewhere.
+struct ToolFailure {
+    /// What the caller is told.
+    reported: McpError,
+    /// What the audit row records. Metadata only.
+    audited: String,
+}
+
+impl From<McpError> for ToolFailure {
+    /// For a message briefcred composed from a profile name, a credential
+    /// name, or a kind — all of which the row already carries in a field.
+    fn from(reported: McpError) -> ToolFailure {
+        ToolFailure {
+            audited: reported.message.to_string(),
+            reported,
+        }
+    }
+}
+
+impl ToolFailure {
+    /// A failure whose caller-facing message quotes something the caller sent.
+    fn redacted(reported: McpError, audited: impl Into<String>) -> ToolFailure {
+        ToolFailure {
+            reported,
+            audited: audited.into(),
+        }
+    }
+}
+
 #[tool_router]
 impl McpServer {
     /// A server bound to the daemon's state, serving one connection.
@@ -221,13 +264,10 @@ impl McpServer {
             "briefcred_db_query",
             Some(&args.profile),
             &mint_ids,
-            outcome
-                .as_ref()
-                .map(|_| ())
-                .map_err(|e| e.message.to_string()),
+            outcome.as_ref().map(|_| ()).map_err(|e| e.audited.clone()),
             started,
         );
-        json_result(&outcome?)
+        json_result(&outcome.map_err(|e| e.reported)?)
     }
 
     /// Run one command with the profile's credentials, inside the daemon.
@@ -250,18 +290,15 @@ impl McpServer {
             "briefcred_exec",
             Some(&args.profile),
             &mint_ids,
-            outcome
-                .as_ref()
-                .map(|_| ())
-                .map_err(|e| e.message.to_string()),
+            outcome.as_ref().map(|_| ()).map_err(|e| e.audited.clone()),
             started,
         );
-        json_result(&outcome?)
+        json_result(&outcome.map_err(|e| e.reported)?)
     }
 }
 
 impl McpServer {
-    async fn db_query_inner(&self, args: &DbQueryArgs) -> Result<serde_json::Value, McpError> {
+    async fn db_query_inner(&self, args: &DbQueryArgs) -> Result<serde_json::Value, ToolFailure> {
         let max_rows = args
             .max_rows
             .unwrap_or(DEFAULT_MAX_ROWS)
@@ -314,26 +351,60 @@ impl McpServer {
         let client = postgres::connect_as(&config, &user, &password)
             .await
             .map_err(|e| internal(e.to_string()))?;
-        // `query` and not `simple_query`: one statement, no multi-statement
-        // batch, and the server refuses anything with a `;` in the middle of
-        // it. An agent that wants two statements sends two calls, each of
-        // which is one audit row.
-        let rows = client
-            .query(args.sql.as_str(), &[])
-            .await
-            .map_err(|e| invalid(describe_sql_error(&e)))?;
 
-        let truncated = rows.len() > max_rows;
-        let columns: Vec<serde_json::Value> = rows
-            .first()
-            .map(|row| {
-                row.columns()
-                    .iter()
-                    .map(|c| serde_json::json!({ "name": c.name(), "type": c.type_().name() }))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let json_rows: Vec<Row> = rows.iter().take(max_rows).map(row_to_json).collect();
+        // A statement with no bound is a statement that holds a connection and
+        // a minted role open for as long as it likes. The server enforces this
+        // one, so a query that runs away is killed at the database rather than
+        // waited out here.
+        let timeout = self.inner.state.mcp_query_timeout();
+        client
+            .batch_execute(&format!(
+                "SET statement_timeout = {}",
+                timeout.as_millis().clamp(1, i32::MAX as u128)
+            ))
+            .await
+            .map_err(|e| internal(describe_sql_error(&e)))?;
+
+        // `query_raw` and not `query`: `query` collects the whole result set
+        // into memory before this code sees a single row, so `max_rows` would
+        // bound only what is *returned* and not what a `SELECT *` on a large
+        // table costs the daemon. This reads one row at a time and stops.
+        //
+        // Still the extended protocol rather than `simple_query`, so the
+        // statement is one statement: the server refuses a second one after a
+        // semicolon, which is what keeps a tool that takes SQL from a model
+        // out of multi-statement territory.
+        let no_params: [&(dyn tokio_postgres::types::ToSql + Sync); 0] = [];
+
+        let mut columns: Vec<serde_json::Value> = Vec::new();
+        let mut json_rows: Vec<Row> = Vec::new();
+        let mut truncated = false;
+        // Scoped, so the stream is dropped — and the unread portal with it —
+        // before anything else happens, rather than being held while the
+        // result is assembled.
+        {
+            let stream = client
+                .query_raw(args.sql.as_str(), no_params)
+                .await
+                .map_err(|e| sql_failure(&e))?;
+            let mut stream = std::pin::pin!(stream);
+            // Stopping *at* the cap rather than after it means one extra row is
+            // fetched and decoded to learn there was more, and no others are.
+            while let Some(row) = stream.try_next().await.map_err(|e| sql_failure(&e))? {
+                if json_rows.len() == max_rows {
+                    truncated = true;
+                    break;
+                }
+                if columns.is_empty() {
+                    columns = row
+                        .columns()
+                        .iter()
+                        .map(|c| serde_json::json!({ "name": c.name(), "type": c.type_().name() }))
+                        .collect();
+                }
+                json_rows.push(row_to_json(&row));
+            }
+        }
 
         Ok(serde_json::json!({
             "columns": columns,
@@ -343,16 +414,28 @@ impl McpServer {
         }))
     }
 
-    async fn exec_inner(&self, args: &ExecArgs) -> Result<serde_json::Value, McpError> {
+    async fn exec_inner(&self, args: &ExecArgs) -> Result<serde_json::Value, ToolFailure> {
         let Some((argv0, rest)) = args.argv.split_first() else {
-            return Err(invalid("`argv` must name a program to run"));
+            return Err(invalid("`argv` must name a program to run").into());
         };
         let profile = self.profile(&args.profile).await?;
 
         // Before anything is minted, exactly as `briefcred exec` does it: a
         // command the profile forbids must not create a principal.
-        briefcred_core::exec::check_command(&profile, argv0, rest)
-            .map_err(|denied| invalid(denied.to_string()))?;
+        // The refusal names the offending value, which for an `allow_args`
+        // denial is an argument the caller sent. The caller needs it; the
+        // audit row must not have it, so the row records `argv[0]` — which
+        // every `exec_start` row already carries verbatim — and the fact of
+        // the refusal.
+        briefcred_core::exec::check_command(&profile, argv0, rest).map_err(|denied| {
+            ToolFailure::redacted(
+                invalid(denied.to_string()),
+                format!(
+                    "`{argv0}` was refused by profile `{}`'s exec policy",
+                    profile.name
+                ),
+            )
+        })?;
 
         self.ensure_minted(&profile).await?;
         let (env, passthrough, session_id) = {
@@ -400,8 +483,7 @@ impl McpServer {
             pid: std::process::id(),
         });
 
-        let output = command
-            .output()
+        let output = run_capped(command)
             .await
             .map_err(|e| invalid(format!("cannot run `{argv0}`: {e}")))?;
 
@@ -411,17 +493,15 @@ impl McpServer {
             session_id,
             mint_ids,
             profile: profile.name.clone(),
-            exit_code: output.status.code(),
+            exit_code: output.exit_code,
             duration_ms,
         });
 
-        let (stdout, stdout_truncated) = capped(&output.stdout);
-        let (stderr, stderr_truncated) = capped(&output.stderr);
         Ok(serde_json::json!({
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": output.status.code(),
-            "truncated": stdout_truncated || stderr_truncated,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "exit_code": output.exit_code,
+            "truncated": output.truncated,
             "duration_ms": duration_ms,
         }))
     }
@@ -436,20 +516,34 @@ impl McpServer {
     }
 
     /// Open the session and mint, once per connection.
+    ///
+    /// # Why the lock is held across the whole sequence
+    ///
+    /// `rmcp` dispatches every request as its own task, so two tool calls
+    /// arriving together on a fresh connection run this concurrently. Checking
+    /// the slot, releasing the lock, and then minting would have both find it
+    /// empty, both prompt, both open a session, and both mint — and the second
+    /// would overwrite the first in the slot. `close()` only closes the
+    /// session it can see, so the first would be left open with a live
+    /// credential nothing ever revokes, until the daemon's idle eviction found
+    /// it.
+    ///
+    /// So the guard spans the check *and* the work. The cost is that a second
+    /// tool call waits for the first connection's mint rather than starting
+    /// its own, which is exactly what "one mint per MCP session" means.
+    /// `briefcred_list_profiles` never takes this lock and is unaffected.
     async fn ensure_minted(&self, profile: &Profile) -> Result<(), McpError> {
-        {
-            let held = self.inner.held.lock().await;
-            if let Some(held) = held.as_ref() {
-                return if held.profile == profile.name {
-                    Ok(())
-                } else {
-                    Err(invalid(format!(
-                        "this MCP connection is already using profile `{}`; one connection mints \
-                         for one profile. Start a new connection to use `{}`.",
-                        held.profile, profile.name
-                    )))
-                };
-            }
+        let mut held = self.inner.held.lock().await;
+        if let Some(existing) = held.as_ref() {
+            return if existing.profile == profile.name {
+                Ok(())
+            } else {
+                Err(invalid(format!(
+                    "this MCP connection is already using profile `{}`; one connection mints \
+                     for one profile. Start a new connection to use `{}`.",
+                    existing.profile, profile.name
+                )))
+            };
         }
 
         // The unlock gate first, then the masters, then the mint: the same
@@ -458,10 +552,7 @@ impl McpServer {
         // this machine, which is as local as a `briefcred exec`.
         crate::server::prove_presence(&self.inner.state, profile, false)
             .await
-            .map_err(|locked| match locked {
-                briefcred_proto::Response::Locked { message, .. } => invalid(message),
-                other => internal(format!("{other:?}")),
-            })?;
+            .map_err(locked_or_internal)?;
 
         let (session_id, _) = self
             .inner
@@ -527,7 +618,7 @@ impl McpServer {
             })
             .collect();
 
-        *self.inner.held.lock().await = Some(Held {
+        *held = Some(Held {
             profile: profile.name.clone(),
             session_id,
             fields,
@@ -662,6 +753,49 @@ fn json_result(value: &serde_json::Value) -> Result<CallToolResult, McpError> {
     )]))
 }
 
+/// Turn a refused `prove_presence` into an error for the caller.
+///
+/// An exhaustive match rather than a `{:?}` fallback: `prove_presence`'s error
+/// half is a `Response`, and debug-printing an unexpected one would put
+/// whatever a future variant carries into a tool result. Only `Locked` is
+/// reachable today, and anything else is briefcred's own bug.
+fn locked_or_internal(response: briefcred_proto::Response) -> McpError {
+    match response {
+        briefcred_proto::Response::Locked { message, .. } => invalid(message),
+        briefcred_proto::Response::Error { .. } => {
+            internal("the unlock gate reported an error instead of a decision".to_string())
+        }
+        other => internal(format!(
+            "internal error: the unlock gate answered `{}`",
+            response_name(&other)
+        )),
+    }
+}
+
+/// A response's variant name, for a message that must carry no payload.
+fn response_name(response: &briefcred_proto::Response) -> &'static str {
+    use briefcred_proto::Response;
+    match response {
+        Response::Pong => "pong",
+        Response::Status { .. } => "status",
+        Response::ShuttingDown => "shutting_down",
+        Response::Profiles { .. } => "profiles",
+        Response::Profile { .. } => "profile",
+        Response::SessionOpened { .. } => "session_opened",
+        Response::SessionClosed { .. } => "session_closed",
+        Response::Unlocked { .. } => "unlocked",
+        Response::Minted { .. } => "minted",
+        Response::ExecRecorded { .. } => "exec_recorded",
+        Response::McpReady { .. } => "mcp_ready",
+        Response::HookDecision { .. } => "hook_decision",
+        Response::Denied { .. } => "denied",
+        Response::Locked { .. } => "locked",
+        Response::Error { .. } => "error",
+        #[cfg(feature = "debug-heapscan")]
+        Response::HeapScanned { .. } => "heap_scanned",
+    }
+}
+
 /// The caller asked for something briefcred will not or cannot do.
 fn invalid(message: impl Into<String>) -> McpError {
     McpError::invalid_params(message.into(), None)
@@ -670,6 +804,91 @@ fn invalid(message: impl Into<String>) -> McpError {
 /// briefcred could not do something it should have been able to.
 fn internal(message: impl Into<String>) -> McpError {
     McpError::internal_error(message.into(), None)
+}
+
+/// What a child process produced, already bounded.
+struct CappedOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    truncated: bool,
+}
+
+/// Run `command`, reading at most [`MAX_OUTPUT_BYTES`] from each stream.
+///
+/// `Command::output` would collect everything the child writes before this
+/// code saw any of it, so a command that prints without stopping — a `yes`, a
+/// `cat` of something enormous, a log tail an agent thought was finite — would
+/// take the daemon's memory whatever cap were applied afterwards. Here each
+/// stream is read through a `take` that stops one byte past the cap, so the
+/// allocation is bounded before the bytes arrive.
+///
+/// The two streams are read concurrently, which is not an optimisation: a
+/// child that fills its stderr pipe while this code is only draining stdout
+/// blocks forever, and so does the reverse.
+///
+/// A child that goes over the cap is **killed**. It has to be: this code has
+/// stopped reading its pipe, so it would block on the next write and never
+/// exit, and it is a process a model asked for. The output collected up to
+/// that point is returned with `truncated` set.
+async fn run_capped(mut command: tokio::process::Command) -> std::io::Result<CappedOutput> {
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+
+    let mut out_task = tokio::spawn(read_capped(stdout));
+    let mut err_task = tokio::spawn(read_capped(stderr));
+    let mut out: Option<(Vec<u8>, bool)> = None;
+    let mut err: Option<(Vec<u8>, bool)> = None;
+
+    while out.is_none() || err.is_none() {
+        tokio::select! {
+            finished = &mut out_task, if out.is_none() => {
+                let finished = finished.map_err(std::io::Error::other)??;
+                if finished.1 {
+                    let _ = child.start_kill();
+                }
+                out = Some(finished);
+            }
+            finished = &mut err_task, if err.is_none() => {
+                let finished = finished.map_err(std::io::Error::other)??;
+                if finished.1 {
+                    let _ = child.start_kill();
+                }
+                err = Some(finished);
+            }
+        }
+    }
+
+    let status = child.wait().await?;
+    let (stdout, stdout_over) = out.expect("the loop exits with both");
+    let (stderr, stderr_over) = err.expect("the loop exits with both");
+    let (stdout, stdout_cut) = capped(&stdout);
+    let (stderr, stderr_cut) = capped(&stderr);
+    Ok(CappedOutput {
+        stdout,
+        stderr,
+        exit_code: status.code(),
+        truncated: stdout_over || stderr_over || stdout_cut || stderr_cut,
+    })
+}
+
+/// Read one stream to end-of-file, or to one byte past the cap.
+///
+/// The extra byte is how "there was more" is observed rather than guessed: a
+/// stream that is exactly [`MAX_OUTPUT_BYTES`] long is complete, and one that
+/// is a byte longer is not.
+async fn read_capped<R>(stream: R) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut buffer = Vec::new();
+    tokio::io::AsyncReadExt::take(stream, MAX_OUTPUT_BYTES as u64 + 1)
+        .read_to_end(&mut buffer)
+        .await?;
+    let over = buffer.len() > MAX_OUTPUT_BYTES;
+    Ok((buffer, over))
 }
 
 /// Truncate output to [`MAX_OUTPUT_BYTES`], saying whether it was truncated.
@@ -694,6 +913,22 @@ fn describe_sql_error(error: &tokio_postgres::Error) -> String {
         Some(db) => format!("{}: {}", db.code().code(), db.message()),
         None => error.to_string(),
     }
+}
+
+/// A failed statement: the whole complaint to the caller, the SQLSTATE alone
+/// to the audit log.
+///
+/// The server's message quotes the statement — `relation "orders" does not
+/// exist` — which is the caller's own SQL coming back, and an audit row may
+/// not hold it. The SQLSTATE is the part an operator acts on anyway: `42P01`
+/// says "that table is not there" without saying which table somebody asked
+/// for.
+fn sql_failure(error: &tokio_postgres::Error) -> ToolFailure {
+    let audited = match error.as_db_error() {
+        Some(db) => format!("the database refused the statement: {}", db.code().code()),
+        None => "the database connection failed".to_string(),
+    };
+    ToolFailure::redacted(invalid(describe_sql_error(error)), audited)
 }
 
 /// One result row as JSON.
