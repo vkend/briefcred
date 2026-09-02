@@ -1,0 +1,64 @@
+# An Anthropic API key that only works during working hours.
+#
+# The credential is an `http-header` one rather than a bearer token, because
+# that is what the Anthropic API wants: the key goes in `x-api-key`, and
+# briefcred puts the real value there after the policy has allowed the request.
+# The subprocess only ever holds a synthetic token.
+#
+# The subject of this example is the *time window*. A key that is only useful
+# between 08:00 and 19:00 UTC on a weekday is a key whose stolen copy is inert
+# for two thirds of the week, and an agent that wakes up at three in the
+# morning to do something nobody asked for gets a 403 and an audit row.
+#
+#     briefcred profile bootstrap anthropic
+#
+# See `docs/policy-cookbook.md` for the rest of the recipe, including why the
+# clock is UTC.
+
+name: anthropic
+description: the Anthropic API, on an allowlist and inside a time window
+
+unlock:
+  policy: biometric
+  cache_secs: 300
+
+credentials:
+  - name: anthropic
+    kind: http-header
+    ttl_secs: 900
+    source_key: anthropic
+    config:
+      # The header the Anthropic API reads its key from. The real value goes
+      # here; the subprocess never sees it.
+      name: x-api-key
+
+# One a second, ten at once, six hundred for the session. Roughly what an
+# interactive agent uses in an hour of real work, and far below what one in a
+# loop gets through in a minute.
+quota:
+  rate: 1
+  burst: 10
+  total: 600
+
+policy_mode: enforce
+
+# `context.weekday` is 0 for Monday through 6 for Sunday, and `context.hour`
+# is 0 to 23. Both are UTC, always: a policy that meant "business hours" and
+# read them from whatever timezone the daemon happened to start in would be a
+# policy that silently changed meaning when the laptop travelled. Shift the
+# numbers for your own timezone rather than expecting briefcred to.
+policy: |
+  permit(principal, action in [Action::"http"], resource)
+  when {
+    resource.host == "api.anthropic.com"
+      && resource.path == "/v1/messages"
+      && context.weekday <= 4
+      && context.hour >= 8
+      && context.hour < 19
+  };
+
+exec:
+  allow_argv0: []
+
+env:
+  ANTHROPIC_API_KEY: ${minted.anthropic.TOKEN}

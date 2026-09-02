@@ -21,6 +21,8 @@
 # trust it. `briefcred install` generates one; `briefcred ca trust` installs it.
 # `briefcred exec` also sets the CA-bundle variables for runtimes that ignore
 # the system trust store, so `curl`, Node and Python all work as they are.
+#
+# `docs/policy-cookbook.md` walks through the policy below and four others.
 
 name: openai
 description: the OpenAI API, through briefcred's proxy, on an allowlist
@@ -40,6 +42,15 @@ credentials:
     # The real key, stored under `openai` in the master source.
     source_key: openai
 
+# The policy says *what*; this says *how much*. Two a second sustained, twenty
+# at once, and no more than four hundred for the whole session. An agent stuck
+# in a retry loop hits this long before it hits the vendor's own rate limit or
+# your card. The bucket is per session, so two concurrent runs get one each.
+quota:
+  rate: 2
+  burst: 20
+  total: 400
+
 # `enforce` refuses anything the policy below does not permit. Write a new
 # policy in `observe` first: it forwards the request and writes a
 # `ProxyRequest { decision: would_deny }` row instead, so you can read the
@@ -47,32 +58,27 @@ credentials:
 # promote. Leaving a profile in `observe` is leaving it unguarded.
 policy_mode: enforce
 
-# Cedar. `principal` is the session, `action` is the HTTP method, and
-# `resource` carries `host`, `path` and `scheme`. There is deliberately no
-# query string: it routinely carries credentials, and a policy that could
+# Cedar. `principal` is the session, `action` is the HTTP method, `resource`
+# carries `host`, `path` and `scheme`, and `context` carries `hour`,
+# `weekday`, `requests_so_far` and `resp_bytes_so_far`. There is deliberately
+# no query string: it routinely carries credentials, and a policy that could
 # match on one would be a policy that had to hold one.
 #
 # Default deny. Everything not permitted here is refused, including a profile
 # with no `policy:` block at all.
+#
+# Reading the model list is harmless and every SDK does it at startup. Chat
+# completions is the only thing here that costs money. Add `/v1/embeddings`
+# or `/v1/responses` when you need them; do not widen this to `like "/v1/*"`,
+# which permits fine-tuning jobs and file uploads too.
 policy: |
-  // Reading the model list is harmless and every SDK does it at startup.
-  permit(
-    principal,
-    action == Action::"GET",
-    resource
-  ) when {
+  permit(principal, action == Action::"GET", resource)
+  when {
     resource.host == "api.openai.com" && resource.path == "/v1/models"
   };
 
-  // Chat completions, and nothing else that costs money. Add
-  // `/v1/embeddings` or `/v1/responses` here when you need them; do not
-  // widen this to `like "/v1/*"`, which permits fine-tuning jobs and
-  // file uploads too.
-  permit(
-    principal,
-    action == Action::"POST",
-    resource
-  ) when {
+  permit(principal, action == Action::"POST", resource)
+  when {
     resource.host == "api.openai.com"
       && resource.path == "/v1/chat/completions"
   };

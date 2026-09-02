@@ -1,0 +1,57 @@
+# A GitHub token that can read one organisation's repositories, five hundred
+# times, and then stop.
+#
+# The subject of this example is the *per-session budget*. A token scoped to an
+# organisation is still a token that can walk every repository in it; a policy
+# that also says "and not more than five hundred requests in this session" is
+# the difference between an agent reading the file it was asked about and an
+# agent cloning the org one API call at a time.
+#
+# `context.requests_so_far` counts the requests this session made *before* the
+# one being decided, so the first sees 0 and `< 500` permits exactly five
+# hundred. Request 501 gets a 403 and a `ProxyRequest { decision: deny }` row.
+#
+#     briefcred profile bootstrap github
+#
+# The policy is read-only on purpose: `GET` and `HEAD` and nothing else, so no
+# session opened with this profile can push, merge, or delete anything.
+
+name: github
+description: read-only GitHub for one organisation, with a per-session request cap
+
+unlock:
+  policy: biometric
+  cache_secs: 300
+
+credentials:
+  - name: github
+    kind: http-bearer
+    ttl_secs: 900
+    source_key: github
+
+# The quota bounds the *speed*; the policy below bounds the *total*. They are
+# not the same control, and this profile wants both — see the last section of
+# `docs/policy-cookbook.md`.
+quota:
+  rate: 5
+  burst: 25
+
+policy_mode: enforce
+
+# `like` uses `*` as its wildcard. A prefix is the right shape here because
+# repository names are not knowable in advance; the organisation is, so that
+# part stays exact. Widening this to `resource.host == "api.github.com"` alone
+# would permit `/user`, `/orgs`, and every other repository the token can see.
+policy: |
+  permit(principal, action in [Action::"GET", Action::"HEAD"], resource)
+  when {
+    resource.host == "api.github.com"
+      && resource.path like "/repos/acme/*"
+      && context.requests_so_far < 500
+  };
+
+exec:
+  allow_argv0: []
+
+env:
+  GITHUB_TOKEN: ${minted.github.TOKEN}

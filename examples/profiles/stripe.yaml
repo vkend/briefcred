@@ -1,0 +1,68 @@
+# A Stripe key an agent can read charges with, and issue twenty refunds with,
+# and nothing else.
+#
+# This is the profile with the most to lose, so it is the one that uses every
+# control briefcred has. Two things are being bounded and they are different
+# things:
+#
+#   - **How much data leaves.** `context.resp_bytes_so_far` is the bytes this
+#     session has already been sent. A ten-mebibyte budget is a lot of charge
+#     records for one task and nowhere near a copy of the ledger.
+#   - **How much money moves.** A refund is not a read, so it gets a count of
+#     its own, and a `quota` on top so that twenty refunds cannot happen in
+#     four seconds even if twenty is the right number for a day's work.
+#
+#     briefcred profile bootstrap stripe
+#
+# See the last two sections of `docs/policy-cookbook.md`.
+
+name: stripe
+description: read charges within a byte budget, and refund within a hard count
+
+unlock:
+  # The one profile here where a passcode fallback is not good enough: this
+  # session can move money.
+  policy: biometric
+  cache_secs: 60
+
+credentials:
+  - name: stripe
+    kind: http-bearer
+    # Five minutes. Short even by the standards of the other examples, because
+    # what this key can do does not get less bad with time.
+    ttl_secs: 300
+    source_key: stripe
+
+# Half a token a second, five at once, fifty for the whole session. The rate is
+# what stops a loop; `total` is what stops a long slow one.
+quota:
+  rate: 0.5
+  burst: 5
+  total: 50
+
+policy_mode: enforce
+
+# Two clauses, because they are two different permissions with two different
+# limits. Reading is bounded by bytes and writing is bounded by count: a
+# thousand tiny refunds is a catastrophe and a thousand tiny reads is a
+# Tuesday, so a single shared limit would have to be wrong for one of them.
+policy: |
+  permit(principal, action == Action::"GET", resource)
+  when {
+    resource.host == "api.stripe.com"
+      && resource.path like "/v1/charges*"
+      && context.resp_bytes_so_far < 10485760
+  };
+
+  permit(principal, action == Action::"POST", resource)
+  when {
+    resource.host == "api.stripe.com"
+      && resource.path == "/v1/refunds"
+      && context.requests_so_far < 20
+  };
+
+exec:
+  allow_argv0: []
+
+env:
+  STRIPE_API_KEY: ${minted.stripe.TOKEN}
