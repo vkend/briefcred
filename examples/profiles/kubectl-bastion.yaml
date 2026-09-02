@@ -1,0 +1,97 @@
+# kubectl through an SSH bastion, on a short-lived certificate.
+#
+# There is no Kubernetes minter and there does not need to be one. The thing
+# that has to be short-lived is the *route* to the cluster: the API server is
+# not reachable from a laptop, and the bastion is what stands between them. So
+# briefcred mints an SSH certificate valid for ten minutes, `kubectl` reaches
+# the API server through a tunnel that certificate opens, and when the command
+# finishes the certificate's key is deleted and its serial goes on the machine's
+# key revocation list.
+#
+# What this profile does *not* do is issue Kubernetes credentials. The
+# kubeconfig it names is the operator's own, and its lifetime is the cluster's
+# business. briefcred's claim here is narrower and worth stating plainly: after
+# the command exits, this laptop can no longer open the tunnel.
+#
+# Copy this file into your profiles directory and change the four values marked
+# `CHANGE ME`. The master credential is the CA private key, in OpenSSH format
+# with no passphrase, stored under the key `ssh-ca`:
+#
+#     briefcred profile bootstrap kubectl-bastion
+#
+# The bastion has to trust that CA. On the bastion:
+#
+#     TrustedUserCAKeys /etc/ssh/briefcred_ca.pub
+#     RevokedKeys       /etc/ssh/briefcred_krl
+#
+# See `docs/ssh-krl.md` for how the revocation list gets there.
+
+name: kubectl-bastion
+description: kubectl against a private cluster, tunnelled through a bastion
+
+unlock:
+  # A tunnel into a production cluster is worth a fingerprint.
+  policy: biometric
+  cache_secs: 300
+
+credentials:
+  - name: bastion
+    kind: ssh-cert
+    # Ten minutes. Long enough for a `kubectl apply` and a look at the result,
+    # short enough that a certificate copied off the machine is worth little.
+    ttl_secs: 600
+    source_key: ssh-ca
+    config:
+      # CHANGE ME: the login the bastion knows you by.
+      principals:
+        - kube-operator
+      extensions:
+        # Both are needed. Port forwarding is the tunnel itself; without a pty
+        # `ssh -N` still works but nothing interactive does, and an operator
+        # who wants a shell on the bastion should not need a second profile.
+        - permit-port-forwarding
+        - permit-pty
+      critical_options:
+        # CHANGE ME, or delete this block. A source-address restriction is
+        # checked by the *server*, so a certificate that leaks off this machine
+        # is useless from anywhere else. Set it to your office or VPN range.
+        source-address: "203.0.113.0/24"
+
+exec:
+  # `kubectl` and nothing else. The certificate this profile mints can open a
+  # port forward to anywhere the bastion can reach, so the allowlist is what
+  # stops `briefcred exec kubectl-bastion -- ssh ...` being a general-purpose
+  # key to the private network.
+  allow_argv0:
+    - /opt/homebrew/bin/kubectl
+    - /usr/local/bin/kubectl
+
+env:
+  # `kubectl` has no idea an SSH certificate exists. It is given a kubeconfig
+  # whose cluster address points at the local end of the tunnel, and a
+  # `GIT_SSH_COMMAND`-shaped ssh invocation is not what opens it — see the note
+  # below.
+  #
+  # CHANGE ME: the kubeconfig to use.
+  #
+  # `${config.<key>}` is the profile schema's hook for a value the daemon
+  # supplies at exec time. Nothing supplies one yet — the daemon passes an
+  # empty set — so an exec against this profile as written fails with
+  # "no configuration value `kubeconfig`". Until a configuration source
+  # lands, replace the line below with the literal path:
+  #
+  #     KUBECONFIG: /Users/you/.kube/private-cluster.yaml
+  KUBECONFIG: "${config.kubeconfig}"
+  # The identity `ssh` needs to open the tunnel, for whatever opens it.
+  SSH_IDENTITY_FILE: "${minted.bastion.SSH_IDENTITY_FILE}"
+  SSH_CERT_FILE: "${minted.bastion.SSH_CERT_FILE}"
+  # Anything in this environment that shells out to ssh — `git`, `kubectl
+  # --kubeconfig` with an exec plugin, a wrapper script — picks the minted
+  # certificate up from here rather than from the agent.
+  GIT_SSH_COMMAND: "${minted.bastion.GIT_SSH_COMMAND}"
+
+env_passthrough:
+  # `kubectl` writes its cache and reads plugins from the caller's HOME, and
+  # a kubeconfig commonly names a context by an environment variable.
+  - KUBECACHEDIR
+  - KUBE_EDITOR

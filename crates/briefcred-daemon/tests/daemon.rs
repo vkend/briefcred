@@ -30,11 +30,22 @@ impl Daemon {
     /// Profiles and master secrets have to exist before the process starts, or
     /// the test is racing the daemon's own startup load.
     fn start_with(config: &str, populate: impl FnOnce(&Path)) -> Daemon {
+        Daemon::start_with_env(config, &[], populate)
+    }
+
+    /// Start a daemon with extra environment, for a test that has to control
+    /// something the daemon reads from it — `TMPDIR`, in the SSH case, so a
+    /// minted private key lands somewhere the test can watch and clean up.
+    fn start_with_env(config: &str, env: &[(&str, &Path)], populate: impl FnOnce(&Path)) -> Daemon {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("daemon.toml"), config).unwrap();
         populate(home.path());
-        let child = Command::new(env!("CARGO_BIN_EXE_briefcred-daemon"))
-            .env("BRIEFCRED_HOME", home.path())
+        let mut command = Command::new(env!("CARGO_BIN_EXE_briefcred-daemon"));
+        command.env("BRIEFCRED_HOME", home.path());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -853,6 +864,154 @@ async fn an_unattended_profile_still_opens_for_a_headless_client() {
     else {
         panic!("`unlock.policy: none` must open regardless of the client's session");
     };
+
+    call(&mut stream, Request::Shutdown).await;
+    assert!(daemon.wait());
+}
+
+/// A profile that mints an SSH certificate, which is the one minter kind the
+/// daemon runs in its own process rather than in a helper.
+const SSH_PROFILE: &str = "\
+name: bastion
+unlock:
+  policy: none
+credentials:
+  - name: host
+    kind: ssh-cert
+    ttl_secs: 300
+    source_key: ssh-ca
+    config:
+      principals: [ubuntu]
+env:
+  GIT_SSH_COMMAND: \"${minted.host.GIT_SSH_COMMAND}\"
+exec:
+  allow_argv0: [\"/usr/bin/true\"]
+";
+
+fn ssh_keygen() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join("ssh-keygen"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The whole in-daemon minting path, through the real binary: no helper
+/// process exists for `ssh-cert`, so this fails outright if the daemon has not
+/// routed the kind to itself.
+#[tokio::test]
+async fn the_daemon_mints_an_ssh_certificate_itself_and_revokes_it_into_the_krl() {
+    let Some(ssh_keygen) = ssh_keygen() else {
+        eprintln!("skipping: no `ssh-keygen` on PATH to make a CA key with");
+        return;
+    };
+    let keys = tempfile::tempdir().unwrap();
+    let ca_path = keys.path().join("ca");
+    assert!(Command::new(&ssh_keygen)
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "briefcred-ca", "-f"])
+        .arg(&ca_path)
+        .status()
+        .unwrap()
+        .success());
+    let ca = std::fs::read_to_string(&ca_path).unwrap();
+
+    // The daemon writes minted keys under `TMPDIR`, so it is pointed at a
+    // directory this test owns and can prove is empty at the end.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut daemon = Daemon::start_with_env(
+        "metrics_enabled = false\nmaster_source = \"file\"\n",
+        &[("TMPDIR", tmp.path())],
+        |home| {
+            write_profile(home, "bastion.yaml", SSH_PROFILE);
+            write_master(home, "ssh-ca", &ca);
+        },
+    );
+    let mut stream = daemon.connect().await;
+
+    let Response::SessionOpened { session_id, .. } = call(
+        &mut stream,
+        Request::OpenSession {
+            profile: "bastion".into(),
+            client_headless: false,
+        },
+    )
+    .await
+    else {
+        panic!("expected a session");
+    };
+
+    let Response::Minted { mints, env, .. } = call(
+        &mut stream,
+        Request::Exec {
+            session_id: session_id.clone(),
+            credentials: None,
+            argv0: "/usr/bin/true".into(),
+            args: Vec::new(),
+            pid: std::process::id(),
+        },
+    )
+    .await
+    else {
+        panic!("expected a mint");
+    };
+    assert_eq!(mints.len(), 1, "{mints:?}");
+    let mint_id = mints[0].mint_id.clone();
+    let key_path = PathBuf::from(mints[0].fields["SSH_IDENTITY_FILE"].expose());
+    assert!(key_path.starts_with(tmp.path()), "{key_path:?}");
+    assert!(key_path.exists(), "the private key must be on disk");
+    assert!(
+        env["GIT_SSH_COMMAND"].expose().starts_with("ssh -i "),
+        "the profile's template must have been filled from the mint"
+    );
+
+    // The certificate next to the key is a real one the CA signed, which
+    // `ssh-keygen -L` will only print if it parses.
+    let listed = Command::new(&ssh_keygen)
+        .arg("-L")
+        .arg("-f")
+        .arg(key_path.with_file_name("id_ed25519-cert.pub"))
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(
+        listed.contains(&mint_id),
+        "the key id is the mint id:\n{listed}"
+    );
+    assert!(listed.contains("ubuntu"), "{listed}");
+
+    call(
+        &mut stream,
+        Request::ExecDone {
+            session_id: session_id.clone(),
+            mint_ids: vec![mint_id],
+            exit_code: Some(0),
+            duration_ms: 1,
+            hold_until_expiry: false,
+        },
+    )
+    .await;
+
+    // The revoke queue runs in the background, so this waits for it.
+    let krl = daemon.home.path().join("state").join("ssh-krl");
+    let mut revoked = false;
+    for _ in 0..200 {
+        if krl.exists() && !key_path.exists() {
+            revoked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        revoked,
+        "the key was never deleted or the KRL never written"
+    );
+    assert!(
+        std::fs::read(&krl).unwrap().starts_with(b"SSHKRL\n\0"),
+        "the revocation list must be an OpenSSH KRL"
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        0,
+        "the mint directory must be gone"
+    );
 
     call(&mut stream, Request::Shutdown).await;
     assert!(daemon.wait());
