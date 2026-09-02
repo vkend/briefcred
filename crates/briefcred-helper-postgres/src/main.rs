@@ -1,7 +1,13 @@
-//! The `briefcred-helper-postgres` binary.
+//! The `briefcred-helper-postgres-dynamic` binary.
 //!
 //! Reads newline-delimited JSON-RPC on stdin and writes it on stdout. Nothing
 //! else: the daemon owns both ends of those pipes.
+//!
+//! The binary is named for the *minter kind* it serves rather than for its
+//! crate, because that is how the daemon finds it: a profile naming
+//! `kind: postgres-dynamic` makes the daemon look for
+//! `briefcred-helper-postgres-dynamic`. One crate can grow a second kind and a
+//! second binary without a lookup table in the middle.
 
 use briefcred_helper_postgres::PostgresHelper;
 
@@ -15,7 +21,7 @@ async fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             // stderr, never stdout: stdout is protocol.
-            eprintln!("briefcred-helper-postgres: {err}");
+            eprintln!("briefcred-helper-postgres-dynamic: {err}");
             std::process::ExitCode::FAILURE
         }
     }

@@ -95,15 +95,6 @@ pub enum HelperFailure {
         #[source]
         source: HelperError,
     },
-
-    /// The helper answered with the result of a different method.
-    #[error("`{HELPER_PREFIX}{kind}` answered a `{method}` call with something else")]
-    Mismatched {
-        /// The minter kind that misbehaved.
-        kind: String,
-        /// The method that was called.
-        method: String,
-    },
 }
 
 /// The directories a helper binary is looked for, in order.
@@ -116,8 +107,12 @@ pub fn search_path(exe_dir: Option<&Path>) -> Vec<PathBuf> {
         dirs.push(dir.to_path_buf());
     }
     if let Some(dir) = std::env::var_os(HELPER_DIR_ENV) {
-        if !dir.is_empty() {
-            dirs.push(PathBuf::from(dir));
+        let dir = PathBuf::from(dir);
+        // Deduplicated so a development setup that points the variable at the
+        // directory the daemon is already in does not report every "not found"
+        // twice.
+        if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
+            dirs.push(dir);
         }
     }
     dirs
@@ -355,6 +350,19 @@ mod tests {
     fn the_executables_own_directory_is_searched_before_the_override() {
         let dirs = search_path(Some(Path::new("/opt/briefcred/bin")));
         assert_eq!(dirs.first().unwrap(), Path::new("/opt/briefcred/bin"));
+    }
+
+    #[test]
+    fn a_helper_is_named_for_the_minter_kind_it_serves() {
+        // `kind: postgres-dynamic` in a profile means
+        // `briefcred-helper-postgres-dynamic` on disk. The daemon holds only
+        // the kind string, so the mapping has to be the name itself.
+        let err = locate("postgres-dynamic", &[PathBuf::from("/nowhere")]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("briefcred-helper-postgres-dynamic"),
+            "{err}"
+        );
     }
 
     #[test]

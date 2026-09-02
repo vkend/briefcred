@@ -272,11 +272,15 @@ name = "briefcred-e2e"
 version = "0.1.0"
 dependencies = [
  "briefcred-core",
+ "briefcred-proto",
  "getrandom 0.3.4",
+ "hex",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "time",
  "tokio",

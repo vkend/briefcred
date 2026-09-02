@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "briefcred-helper-postgres"
+name = "briefcred-helper-postgres-dynamic"
 path = "src/main.rs"
 
 [lib]

@@ -62,3 +62,14 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 toml = "0.9"
 x509-parser = "0.18"
 zeroize = { version = "1", features = ["derive"] }
+
+# The memory-hygiene self-scan hashes a 32-byte window at every offset of the
+# daemon's resident heap, which is tens of millions of SHA-256 blocks. Debug
+# `sha2` is roughly two orders of magnitude slower than optimised `sha2`, which
+# is the difference between a four-second check and one nobody ever runs. The
+# override costs nothing else: no briefcred code is compiled differently.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.cpufeatures]
+opt-level = 3

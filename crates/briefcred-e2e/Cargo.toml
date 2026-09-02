@@ -10,15 +10,25 @@ publish = false
 
 [dependencies]
 briefcred-core.workspace = true
+briefcred-proto.workspace = true
+serde_json.workspace = true
 serde_yaml.workspace = true
 getrandom.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "net"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
 tokio-postgres.workspace = true
 zeroize.workspace = true
 
+[features]
+# Enables `briefcred-proto`'s `HeapScan` request so the memory-hygiene test can
+# build. The daemon it talks to has to be built with its own `debug-heapscan`
+# feature separately; `just mem-hygiene` does both.
+debug-heapscan = ["briefcred-proto/debug-heapscan"]
+
 [dev-dependencies]
+hex.workspace = true
 rustls.workspace = true
+sha2.workspace = true
 rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true
 time.workspace = true
