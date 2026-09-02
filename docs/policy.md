@@ -246,7 +246,7 @@ Every request through the proxy writes one audit row, whatever happened to it:
  "req_bytes":0,"resp_bytes":8241,"latency_ms":312,"decision":"allow"}
 ```
 
-`decision` is one of six labels, which also appear on
+`decision` is one of seven labels, which also appear on
 `briefcred_proxy_requests_total{decision,status_class}`:
 
 | `decision` | what it tells you |
