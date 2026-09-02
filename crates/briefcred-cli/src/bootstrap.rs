@@ -23,11 +23,13 @@
 //! wait for the daemon's watcher to report it through `ShowProfile`, run the
 //! gate, and only then ask for the master.
 //!
-//! That ordering means a bootstrap can fail with a file already on disk, so
-//! every failure after the write takes the file back off again. A profile whose
-//! master was never stored is worse than no profile: it fails at the first
-//! `briefcred exec`, a week later, with a message about a missing master rather
-//! than about an abandoned setup.
+//! That ordering means a bootstrap can fail with a file already on disk, so the
+//! write is wrapped in a guard that puts the directory back exactly as it found
+//! it: a new profile is removed, and a *re-bootstrap* restores the previous
+//! contents byte for byte. Both halves matter. A profile whose master was never
+//! stored fails at the first `briefcred exec`, a week later, complaining about a
+//! missing master — and deleting somebody's working profile because they
+//! cancelled the password prompt would be worse still.
 //!
 //! [`MasterSource`]: briefcred_core::MasterSource
 
@@ -43,6 +45,11 @@ use zeroize::Zeroizing;
 use crate::error::{Error, Result};
 
 /// What the interview produced.
+///
+/// `Debug` is derived and safe to derive: every field is a path or a key name.
+/// The master itself is never held here — it goes straight from the prompt to
+/// the key store and is dropped.
+#[derive(Debug)]
 pub struct Bootstrapped {
     /// The profile file that was written.
     pub path: PathBuf,
@@ -95,57 +102,142 @@ pub async fn run(paths: &Paths, sock: &Path, source_kind: SourceKind) -> Result<
     let config = ask_config(kind)?;
     let yaml = render_profile(&name, &description, kind, &config);
 
+    finish(
+        paths,
+        sock,
+        source_kind,
+        &registry,
+        &name,
+        &path,
+        &yaml,
+        &|key| {
+            Password::new()
+                .with_prompt(format!("Master credential for `{key}`"))
+                .with_confirmation("Confirm", "They did not match")
+                .interact()
+                .map(Zeroizing::new)
+                .map_err(prompt_failed)
+        },
+    )
+    .await
+}
+
+/// Everything after the interview: write, gate, collect the master, store it.
+///
+/// Split from [`run`] so it can be driven by a test. The interview above is
+/// `dialoguer` talking to a terminal and cannot be driven without a pty; this
+/// half is where every decision that can damage something lives, so this is the
+/// half that has to be tested. `ask_master` is injected for the same reason.
+#[allow(clippy::too_many_arguments)]
+async fn finish(
+    paths: &Paths,
+    sock: &Path,
+    source_kind: SourceKind,
+    registry: &Registry,
+    name: &str,
+    path: &Path,
+    yaml: &str,
+    ask_master: &dyn Fn(&str) -> Result<Zeroizing<String>>,
+) -> Result<Bootstrapped> {
     // Parsed and validated before it is written, so a bootstrap can never
     // leave behind a file the daemon will refuse to load.
-    let profile = briefcred_core::Profile::from_yaml_str(&yaml)?;
-    profile.validate(&registry)?;
+    let profile = briefcred_core::Profile::from_yaml_str(yaml)?;
+    profile.validate(registry)?;
     let source_key = profile.credentials[0].source_key().to_string();
 
     // The profile is written *before* the gate, because the gate is the
     // profile's own `unlock.policy` and the daemon cannot apply a policy for a
     // profile it has never seen. Writing first, waiting for the hot reload, and
     // then asking is what makes the check real rather than decorative.
+    //
+    // Every `?` from here to `commit` puts the profiles directory back exactly
+    // as it was. That is the guard's whole job, and it is a guard rather than
+    // an unwind at each exit because the first version of this function did the
+    // unwinding by hand — and deleted the user's existing profile when a
+    // re-bootstrap was abandoned.
     briefcred_core::paths::ensure_private_dir(&paths.profiles_dir())?;
-    std::fs::write(&path, &yaml).map_err(|e| Error::io("write", &path, e))?;
+    let written = ProfileFile::write(path, yaml)?;
 
-    // Anything from here on removes the file again: a profile on disk whose
-    // master was never stored is a profile whose every `exec` fails with a
-    // confusing "no master credential" a week later.
-    if let Err(err) = gate(sock, &name).await {
-        remove_written(&path);
-        return Err(err);
-    }
+    gate(sock, name).await?;
 
-    let master = match Password::new()
-        .with_prompt(format!("Master credential for `{source_key}`"))
-        .with_confirmation("Confirm", "They did not match")
-        .interact()
-    {
-        Ok(master) => Zeroizing::new(master),
-        Err(err) => {
-            remove_written(&path);
-            return Err(prompt_failed(err));
-        }
-    };
+    let master = ask_master(&source_key)?;
     if master.is_empty() {
-        remove_written(&path);
         return Err(Error::Refused(
             "an empty master credential is not usable; nothing was written".to_string(),
         ));
     }
 
-    let location = match store_master(paths, source_kind, &source_key, &master) {
-        Ok(location) => location,
-        Err(err) => {
-            remove_written(&path);
-            return Err(err);
-        }
-    };
+    let location = store_master(paths, source_kind, &source_key, &master)?;
+
+    written.commit();
     Ok(Bootstrapped {
-        path,
+        path: path.to_path_buf(),
         source_key,
         location,
     })
+}
+
+/// A profile file that undoes itself unless it is committed.
+///
+/// A bootstrap has to write the profile before it can ask the daemon about it,
+/// and can then fail for half a dozen reasons: a cancelled Touch ID prompt, a
+/// mistyped confirmation, an empty master, a key store that refused, a daemon
+/// that never loaded the file. Each of those has to leave the profiles
+/// directory exactly as it found it — which for a *new* profile means removing
+/// the file, and for a **re-bootstrap of an existing one means putting the old
+/// contents back**. Deleting a user's working profile because they changed
+/// their mind at the password prompt is the worst thing this command could do.
+struct ProfileFile {
+    path: PathBuf,
+    /// What was there before, or `None` if the file is new.
+    previous: Option<Vec<u8>>,
+    committed: bool,
+}
+
+impl ProfileFile {
+    /// Write `yaml` to `path`, remembering whatever was there.
+    fn write(path: &Path, yaml: &str) -> Result<ProfileFile> {
+        let previous = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(Error::io("read", path, err)),
+        };
+        std::fs::write(path, yaml).map_err(|e| Error::io("write", path, e))?;
+        Ok(ProfileFile {
+            path: path.to_path_buf(),
+            previous,
+            committed: false,
+        })
+    }
+
+    /// Keep the new contents.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ProfileFile {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let restored = match &self.previous {
+            Some(bytes) => std::fs::write(&self.path, bytes),
+            None => match std::fs::remove_file(&self.path) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        if let Err(err) = restored {
+            // Nothing useful to return to from a `Drop`, and this is the one
+            // case where the user has to be told loudly: their profile may be
+            // in a state neither they nor briefcred chose.
+            eprintln!(
+                "briefcred: could not restore {} after an abandoned bootstrap: {err}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 /// How long to wait for the daemon's profile watcher to pick the file up.
@@ -218,18 +310,6 @@ async fn wait_for_profile(connection: &mut crate::client::Connection, profile: &
             )));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Take the profile back off the disk after a bootstrap that did not finish.
-fn remove_written(path: &Path) {
-    if let Err(err) = std::fs::remove_file(path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "briefcred: could not remove the half-written profile {}: {err}",
-                path.display()
-            );
-        }
     }
 }
 
@@ -419,23 +499,36 @@ mod tests {
         })
     }
 
-    /// A profile file, already written, as `run` would have left it.
-    fn written_profile(dir: &Path) -> PathBuf {
-        let path = dir.join("db-ro.yaml");
-        std::fs::write(&path, "name: db-ro\n").unwrap();
-        path
+    /// A layout rooted at `dir`, so a test never touches real directories.
+    fn test_paths(dir: &Path) -> Paths {
+        Paths::resolve(briefcred_core::paths::Platform::Linux, &|key| {
+            (key == briefcred_core::paths::HOME_ENV).then(|| dir.as_os_str().to_os_string())
+        })
+        .unwrap()
     }
 
-    #[tokio::test]
-    async fn a_refused_unlock_aborts_and_takes_the_profile_back_off_the_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("sock");
-        let path = written_profile(dir.path());
+    /// A valid `postgres-dynamic` profile document.
+    fn valid_yaml(name: &str) -> String {
+        render_profile(
+            name,
+            "",
+            briefcred_core::minters::postgres::KIND,
+            &[
+                ("host".into(), "127.0.0.1".into()),
+                ("port".into(), "5432".into()),
+                ("dbname".into(), "app".into()),
+                ("user".into(), "briefcred_master".into()),
+                ("sslmode".into(), "require".into()),
+            ],
+        )
+    }
 
-        let daemon = stub_daemon(
-            sock.clone(),
+    /// A daemon that reports the profile as loaded and then refuses the unlock,
+    /// which is the cancelled-Touch-ID path.
+    async fn refusing_daemon(sock: &Path) -> tokio::task::JoinHandle<()> {
+        stub_daemon(
+            sock.to_path_buf(),
             vec![
-                // The watcher has seen it...
                 Response::Profile {
                     profile: briefcred_proto::ProfileSummary {
                         name: "db-ro".into(),
@@ -445,27 +538,227 @@ mod tests {
                         credentials: Vec::new(),
                     },
                 },
-                // ...and then the user cancels the Touch ID prompt.
                 Response::Locked {
                     reason: "cancelled".into(),
                     message: "the unlock prompt was cancelled".into(),
                 },
             ],
         )
-        .await;
+        .await
+    }
 
-        let err = gate(&sock, "db-ro").await.unwrap_err();
+    /// The master prompt, for a test that should never reach it.
+    fn never_asked(_key: &str) -> Result<Zeroizing<String>> {
+        panic!("the master must not be asked for after the gate refused")
+    }
+
+    #[tokio::test]
+    async fn an_aborted_bootstrap_of_a_new_profile_leaves_no_file_behind() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(home.path());
+        briefcred_core::paths::ensure_private_dir(&paths.profiles_dir()).unwrap();
+        let sock = home.path().join("sock");
+        let path = paths.profiles_dir().join("db-ro.yaml");
+
+        let daemon = refusing_daemon(&sock).await;
+        let err = finish(
+            &paths,
+            &sock,
+            SourceKind::File,
+            &Registry::discover(),
+            "db-ro",
+            &path,
+            &valid_yaml("db-ro"),
+            &never_asked,
+        )
+        .await
+        .unwrap_err();
+
         assert!(matches!(err, Error::Locked { .. }), "{err}");
-        assert_eq!(err.exit_code(), crate::error::EXIT_LOCKED);
-
-        // `run` removes the file on any gate failure; this asserts the helper
-        // it calls to do so leaves nothing behind.
-        remove_written(&path);
         assert!(
             !path.exists(),
             "a bootstrap that did not finish must not leave a profile behind"
         );
         daemon.abort();
+    }
+
+    #[tokio::test]
+    async fn an_aborted_re_bootstrap_restores_the_existing_profile_byte_for_byte() {
+        // The regression this test exists for: the first version of `finish`
+        // removed the file on any failure, so abandoning a *re*-bootstrap —
+        // cancelling the Touch ID prompt, mistyping the confirmation — deleted
+        // the user's working profile while reporting "nothing was written".
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(home.path());
+        briefcred_core::paths::ensure_private_dir(&paths.profiles_dir()).unwrap();
+        let sock = home.path().join("sock");
+        let path = paths.profiles_dir().join("db-ro.yaml");
+
+        let original = "name: db-ro\ndescription: the one that already worked\n";
+        std::fs::write(&path, original).unwrap();
+
+        let daemon = refusing_daemon(&sock).await;
+        let err = finish(
+            &paths,
+            &sock,
+            SourceKind::File,
+            &Registry::discover(),
+            "db-ro",
+            &path,
+            &valid_yaml("db-ro"),
+            &never_asked,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Locked { .. }), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "an abandoned re-bootstrap must leave the previous profile exactly as it was"
+        );
+        daemon.abort();
+    }
+
+    #[tokio::test]
+    async fn every_later_failure_also_restores_the_previous_profile() {
+        // The gate is not the only way out. An empty master and a key store
+        // that refuses both happen after the write, and both used to delete.
+        let original = "name: db-ro\ndescription: the one that already worked\n";
+
+        for (label, source_kind, master) in [
+            ("an empty master", SourceKind::File, ""),
+            // `env` is read-only, so `store_master` refuses: the last failure
+            // point before the commit.
+            ("a refusing key store", SourceKind::Env, "s3cret"),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let paths = test_paths(home.path());
+            briefcred_core::paths::ensure_private_dir(&paths.profiles_dir()).unwrap();
+            let sock = home.path().join("sock");
+            let path = paths.profiles_dir().join("db-ro.yaml");
+            std::fs::write(&path, original).unwrap();
+
+            let daemon = stub_daemon(
+                sock.clone(),
+                vec![
+                    Response::Profile {
+                        profile: briefcred_proto::ProfileSummary {
+                            name: "db-ro".into(),
+                            description: None,
+                            unlock_policy: "none".into(),
+                            unlock_cache_secs: 0,
+                            credentials: Vec::new(),
+                        },
+                    },
+                    Response::Unlocked {
+                        profile: "db-ro".into(),
+                    },
+                ],
+            )
+            .await;
+
+            let err = finish(
+                &paths,
+                &sock,
+                source_kind,
+                &Registry::discover(),
+                "db-ro",
+                &path,
+                &valid_yaml("db-ro"),
+                &|_| Ok(Zeroizing::new(master.to_string())),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(err.to_string().len() > 1, "{label}: {err}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "{label} must leave the previous profile exactly as it was"
+            );
+            daemon.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bootstrap_that_finishes_keeps_the_new_profile_and_stores_the_master() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = test_paths(home.path());
+        briefcred_core::paths::ensure_private_dir(&paths.profiles_dir()).unwrap();
+        let sock = home.path().join("sock");
+        let path = paths.profiles_dir().join("db-ro.yaml");
+        std::fs::write(&path, "name: db-ro\n").unwrap();
+
+        let daemon = stub_daemon(
+            sock.clone(),
+            vec![
+                Response::Profile {
+                    profile: briefcred_proto::ProfileSummary {
+                        name: "db-ro".into(),
+                        description: None,
+                        unlock_policy: "none".into(),
+                        unlock_cache_secs: 0,
+                        credentials: Vec::new(),
+                    },
+                },
+                Response::Unlocked {
+                    profile: "db-ro".into(),
+                },
+            ],
+        )
+        .await;
+
+        let yaml = valid_yaml("db-ro");
+        let done = finish(
+            &paths,
+            &sock,
+            SourceKind::File,
+            &Registry::discover(),
+            "db-ro",
+            &path,
+            &yaml,
+            &|_| Ok(Zeroizing::new("s3cret".to_string())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(done.source_key, "db");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            yaml,
+            "a committed bootstrap keeps the new profile"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.secrets_dir().join("db")).unwrap(),
+            "s3cret"
+        );
+        daemon.abort();
+    }
+
+    #[test]
+    fn the_guard_restores_on_drop_and_keeps_on_commit() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // New file, dropped: removed.
+        let fresh = dir.path().join("fresh.yaml");
+        drop(ProfileFile::write(&fresh, "name: fresh\n").unwrap());
+        assert!(!fresh.exists());
+
+        // Existing file, dropped: restored.
+        let existing = dir.path().join("existing.yaml");
+        std::fs::write(&existing, "name: before\n").unwrap();
+        drop(ProfileFile::write(&existing, "name: after\n").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "name: before\n"
+        );
+
+        // Committed: kept.
+        ProfileFile::write(&existing, "name: after\n")
+            .unwrap()
+            .commit();
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "name: after\n");
     }
 
     #[tokio::test]

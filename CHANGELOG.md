@@ -79,7 +79,6 @@ All notable changes to briefcred are recorded here. The format follows
   gate previously treated "no such profile" as success, which made it a no-op on
   the first bootstrap of any profile. Any failure after the write removes the
   file again.
-
 - The audit log moved from a `std::sync::Mutex<AuditLog>` held across `fsync` to
   a dedicated writer task on a blocking thread, fed by a channel. Appends no
   longer block a request handler on the disk; `fsync`-per-row and the write-error
@@ -97,8 +96,6 @@ All notable changes to briefcred are recorded here. The format follows
   arguments.
 - `cli::run` returns an exit code, so `briefcred exec` can exit with its
   child's.
-
-
 - Cargo workspace with `briefcred-core`, `briefcred-proto`, `briefcred-daemon`,
   `briefcred-cli`, `briefcred-hook`, and the test-only `briefcred-e2e`. The
   daemon, CLI, and hook binaries are stubs that report the phase that
@@ -282,27 +279,6 @@ All notable changes to briefcred are recorded here. The format follows
   `ensure_layout`.
 - `CONTRIBUTING.md`, with the "Adding a minter" section describing the registry
   contract.
-
-### Changed
-
-- `briefcred get` no longer revokes the credential it just printed. `ExecDone`
-  gained `hold_until_expiry`; `get` sets it, and the daemon schedules the first
-  revoke attempt for the mint's own expiry, so the value is usable for its
-  `ttl_secs` and is still cleaned up promptly afterwards rather than left to the
-  reconciler.
-- The reconciler's and the revoke queue's helper processes are stopped at the
-  end of every pass. Both sets are idle almost all of the time, and a helper
-  kept between passes is a master credential resident in a process with nothing
-  to do.
-- Replies on the helper pipe are capped at `MAX_FRAME_BYTES`, the same 16 MiB
-  ceiling the client socket enforces, so a helper that never emits a newline
-  cannot make the daemon allocate without bound.
-- `briefcred profile bootstrap` writes the profile first, waits for the daemon
-  to load it, and only then runs the unlock gate and asks for the master. The
-  gate previously treated "no such profile" as success, which made it a no-op on
-  the first bootstrap of any profile. Any failure after the write removes the
-  file again.
-
 - The daemon's dispatch table now maps a request name to an async handler
   taking the deserialised `Request` and `Arc<State>`, rather than a synchronous
   `fn(&State) -> Response`. Requests carry payloads now, and opening a session
@@ -323,27 +299,6 @@ All notable changes to briefcred are recorded here. The format follows
   and `THREAT_MODEL.md` now state what the check is and is not: it is
   best-effort and advisory, worth real money against an honest client on SSH
   and nothing at all against a hostile same-uid caller.
-
-### Changed
-
-- `briefcred get` no longer revokes the credential it just printed. `ExecDone`
-  gained `hold_until_expiry`; `get` sets it, and the daemon schedules the first
-  revoke attempt for the mint's own expiry, so the value is usable for its
-  `ttl_secs` and is still cleaned up promptly afterwards rather than left to the
-  reconciler.
-- The reconciler's and the revoke queue's helper processes are stopped at the
-  end of every pass. Both sets are idle almost all of the time, and a helper
-  kept between passes is a master credential resident in a process with nothing
-  to do.
-- Replies on the helper pipe are capped at `MAX_FRAME_BYTES`, the same 16 MiB
-  ceiling the client socket enforces, so a helper that never emits a newline
-  cannot make the daemon allocate without bound.
-- `briefcred profile bootstrap` writes the profile first, waits for the daemon
-  to load it, and only then runs the unlock gate and asks for the master. The
-  gate previously treated "no such profile" as success, which made it a no-op on
-  the first bootstrap of any profile. Any failure after the write removes the
-  file again.
-
 - `briefcred-core` uses `deny(unsafe_code)` rather than `forbid`, for the one
   `extern "C"` call into the Security framework in `session_env`. Every other
   module is unsafe-free, and `deny` still fails the build on any `unsafe` not

@@ -288,8 +288,10 @@ value to you, and revoking on return would print something that was dead on
 arrival. So the revoke is queued and scheduled for the credential's own expiry.
 Two things follow. Set `ttl_secs` on a profile you use with `get` to the
 shortest window the work needs, because that is how long the value lives. And a
-`get` value is not revoked early by anything short of `briefcred daemon stop` —
-if you need a credential gone now, use `exec`.
+`get` value is not revoked early by anything short of the expiry itself —
+stopping the daemon does not bring it forward, because the queue is persisted
+and the entry simply resumes its schedule on the next start. If you need a
+credential gone as soon as the work is done, use `exec`.
 
 `get` is exempt from `exec.allow_argv0`, because it spawns nothing. That is not
 a hole in the allowlist — the allowlist constrains what briefcred is willing to

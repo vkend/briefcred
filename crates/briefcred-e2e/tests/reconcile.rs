@@ -152,8 +152,16 @@ async fn a_role_stranded_by_a_sigkill_is_cleaned_up_by_the_next_reconcile() {
         restarted.log()
     );
 
-    // And it is on the record: an operator has to be able to see that a
-    // credential was cleaned up by reconciliation rather than by its owner.
+    // The audit rows are asserted *after* the shutdown, deliberately. The audit
+    // log is written by a task, so a row is queued rather than on the disk at
+    // the moment the backend changes — polling `pg_roles` can and does win that
+    // race. The daemon flushes before it exits, so a clean shutdown is the point
+    // at which the rows are guaranteed durable, and that is the stronger
+    // property to be asserting anyway.
+    restarted.shutdown().await;
+
+    // An operator has to be able to see that a credential was cleaned up by
+    // reconciliation rather than by its owner.
     let rows = restarted.audit_rows();
     assert!(
         rows.iter().any(|row| row["event"] == "revoke"
@@ -168,7 +176,6 @@ async fn a_role_stranded_by_a_sigkill_is_cleaned_up_by_the_next_reconcile() {
         "no reconcile row in {rows:#?}"
     );
 
-    restarted.shutdown().await;
     assert_eq!(
         cluster.leaked_role_count().await,
         0,

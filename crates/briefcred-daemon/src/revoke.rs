@@ -51,6 +51,16 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// How many times one revoke is attempted before the queue gives up.
 pub const MAX_ATTEMPTS: u32 = 8;
 
+/// How soon an entry has to be due for the pass to keep its helpers alive.
+///
+/// Releasing the helpers between passes is what stops a master sitting in an
+/// idle process. But a queue that is *retrying* is not idle: with a one-second
+/// backoff, releasing after every pass would stop and restart a helper — and
+/// reopen a database connection — once a second for as long as the backend is
+/// unhappy, which is both wasteful and the worst possible time to be adding
+/// load. So the release is skipped while something is due soon.
+pub const HELPER_KEEP_ALIVE: Duration = Duration::from_secs(10);
+
 /// The delay before attempt number `attempt`, counting the first as 1.
 ///
 /// 1 s, 2 s, 4 s … capped at [`MAX_BACKOFF`]. Attempt 1 is immediate: the
@@ -398,8 +408,16 @@ pub async fn drain_loop(
             }
         };
         // Before the sleep, not after: the whole point is that nothing holds a
-        // master while the queue is idle, and the queue is idle most of the time.
-        revoker.end_of_pass().await;
+        // master while the queue is idle, and the queue is idle most of the
+        // time. The exception is a queue that is mid-retry — see
+        // `HELPER_KEEP_ALIVE`.
+        let due_soon = queue
+            .next_due_in()
+            .await
+            .is_some_and(|wait| wait <= HELPER_KEEP_ALIVE);
+        if !due_soon {
+            revoker.end_of_pass().await;
+        }
 
         // Sleep until the earliest thing on the queue is due, so one stubborn
         // entry does not hold up one that has only just arrived.
@@ -766,6 +784,70 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let queue = RevokeQueue::open(dir.path().join("never-written.jsonl")).unwrap();
         assert!(queue.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn a_pass_keeps_its_helpers_while_a_retry_is_due_soon() {
+        // A failing revoke backs off one second, so without the keep-alive the
+        // loop would stop and restart a helper process — and reopen a database
+        // connection — once a second for as long as the backend stayed unhappy.
+        #[derive(Debug, Default)]
+        struct Failing {
+            releases: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Revoker for Failing {
+            async fn revoke(&self, _entry: &PendingRevoke) -> RevokeOutcome {
+                RevokeOutcome::failed("42501: permission denied")
+            }
+            async fn end_of_pass(&self) {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Arc::new(RevokeQueue::open(dir.path().join(QUEUE_FILE)).unwrap());
+        queue.enqueue(vec![one()]).await.unwrap();
+
+        let revoker = Arc::new(Failing::default());
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(drain_loop(
+            Arc::clone(&queue),
+            Arc::clone(&revoker) as Arc<dyn Revoker>,
+            audit(dir.path()),
+            Arc::new(metrics()),
+            shutdown.subscribe(),
+        ));
+
+        // Long enough for several passes if it were thrashing.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the drain loop must stop")
+            .unwrap();
+
+        assert_eq!(
+            revoker.releases.load(Ordering::SeqCst),
+            0,
+            "a retry due within {}s must not cost a helper restart",
+            HELPER_KEEP_ALIVE.as_secs()
+        );
+        assert_eq!(queue.len().await, 1, "and the entry is still queued");
+    }
+
+    #[test]
+    fn the_keep_alive_window_covers_the_whole_early_backoff() {
+        // The early attempts are the ones that come thick and fast; the window
+        // has to cover them or the thrash is only postponed.
+        for attempt in 2..=5 {
+            assert!(
+                backoff(attempt) <= HELPER_KEEP_ALIVE,
+                "attempt {attempt} backs off {:?}, past the keep-alive window",
+                backoff(attempt)
+            );
+        }
     }
 
     #[tokio::test]
