@@ -8,6 +8,7 @@ members = [
     "crates/briefcred-hook",
     "crates/briefcred-e2e",
     "crates/briefcred-helper-postgres",
+    "crates/briefcred-helper-sts",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ repository = "https://github.com/briefcred/briefcred"
 briefcred-core = { path = "crates/briefcred-core", version = "0.1.0" }
 briefcred-proto = { path = "crates/briefcred-proto", version = "0.1.0" }
 briefcred-helper-postgres = { path = "crates/briefcred-helper-postgres", version = "0.1.0" }
+briefcred-helper-sts = { path = "crates/briefcred-helper-sts", version = "0.1.0" }
 
 async-trait = "0.1"
 base64 = "0.22"

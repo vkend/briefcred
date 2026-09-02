@@ -1,0 +1,45 @@
+[package]
+name = "briefcred-helper-sts"
+description = "The briefcred AWS STS minting helper process."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "briefcred-helper-aws-sts"
+path = "src/main.rs"
+
+[lib]
+name = "briefcred_helper_sts"
+path = "src/lib.rs"
+
+[dependencies]
+briefcred-core.workspace = true
+briefcred-proto.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "rt-multi-thread"] }
+zeroize.workspace = true
+aws-config = "1.11.0"
+aws-sdk-sts = "1.113.0"
+aws-smithy-runtime-api = "1"
+sha2.workspace = true
+aws-sdk-iam = "1.122.0"
+
+[features]
+# Exposes `AwsStsMinter::with_http_client`, which replaces the HTTP layer so a
+# test can replay canned STS and IAM responses. Never enabled in a shipping
+# binary; the crate's own tests enable it implicitly through `cfg(test)`.
+test-util = []
+
+[dev-dependencies]
+aws-smithy-http-client = { version = "1.4.0", features = ["test-util"] }
+aws-smithy-mocks = "0.3.0"
+aws-smithy-runtime-api = "1.15.0"
+aws-smithy-types = "1.6.2"
+http = "1.5.0"

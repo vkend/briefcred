@@ -21,6 +21,7 @@ pub mod audit;
 pub mod ca;
 pub mod error;
 pub mod exec;
+pub mod helper_adapter;
 pub mod keystore;
 pub mod minters;
 pub mod paths;
@@ -33,6 +34,7 @@ pub mod types;
 
 pub use ca::CertificateAuthority;
 pub use error::{Error, Result};
+pub use helper_adapter::MinterAdapter;
 pub use keystore::{KeyStore, KeystoreKind};
 pub use profile::Profile;
 pub use registry::{Hosting, MinterFactory, Registry};

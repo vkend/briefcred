@@ -276,7 +276,7 @@ impl Profile {
             if !registry.contains(&spec.kind) {
                 return Err(Error::profile(registry.unknown_kind(&spec.kind)));
             }
-            registry.build(&spec.kind, &spec.config)?;
+            registry.validate(&spec.kind, &spec.config)?;
         }
         Ok(())
     }

@@ -267,10 +267,11 @@ inventory::submit! {
     crate::registry::MinterFactory {
         kind: KIND,
         hosting: crate::registry::Hosting::Helper,
-        build: |config| {
+        validate: |config| {
             PostgresConfig::from_value(config)?;
-            Ok(std::sync::Arc::new(PostgresDynamicMinter::new()))
+            Ok(())
         },
+        construct: Some(|| std::sync::Arc::new(PostgresDynamicMinter::new())),
     }
 }
 

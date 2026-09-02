@@ -258,10 +258,11 @@ inventory::submit! {
     crate::registry::MinterFactory {
         kind: KIND,
         hosting: crate::registry::Hosting::Daemon,
-        build: |config| {
+        validate: |config| {
             SshCertConfig::from_value(config)?;
-            Ok(std::sync::Arc::new(SshCertMinter::new()))
+            Ok(())
         },
+        construct: Some(|| std::sync::Arc::new(SshCertMinter::new())),
     }
 }
 

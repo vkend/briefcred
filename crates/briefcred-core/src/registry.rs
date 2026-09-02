@@ -46,11 +46,23 @@ pub struct MinterFactory {
     pub kind: &'static str,
     /// Where the daemon runs this minter. Almost always [`Hosting::Helper`].
     pub hosting: Hosting,
-    /// Build a minter from a credential spec's `config` block.
+    /// Check a credential spec's `config` block.
     ///
-    /// Must validate the config and return [`Error::MinterConfig`] rather than
-    /// panicking or deferring the failure to the first mint.
-    pub build: fn(&serde_yaml::Value) -> Result<Arc<dyn Minter>>,
+    /// Called from [`crate::Profile::validate`] whenever the daemon loads its
+    /// profile directory, so it must return [`Error::MinterConfig`] rather
+    /// than panicking or deferring the failure to the first mint.
+    pub validate: fn(&serde_yaml::Value) -> Result<()>,
+    /// Construct the minter, where this binary is the one that runs it.
+    ///
+    /// `None` says "the implementation is not linked here". A minter whose
+    /// code lives in its own helper crate — because it drags in a vendor SDK
+    /// nothing else needs — registers its *schema* in `briefcred-core`, so the
+    /// daemon can validate a profile that names it, and leaves this `None`.
+    /// The helper binary constructs the minter directly.
+    ///
+    /// [`Hosting::Daemon`] and `None` are a contradiction, and
+    /// [`Registry::build`] reports it as one.
+    pub construct: Option<fn() -> Arc<dyn Minter>>,
 }
 
 inventory::collect!(MinterFactory);
@@ -91,13 +103,35 @@ impl Registry {
         self.factories.get(kind).map(|factory| factory.hosting)
     }
 
-    /// Build the minter for `kind` from `config`.
+    /// Check `config` against the schema `kind` expects.
+    ///
+    /// This is what profile loading runs, and it is deliberately separate from
+    /// [`Registry::build`]: every binary that reads profiles must be able to
+    /// reject a bad one, but only the binary that actually mints needs the
+    /// minter itself.
+    pub fn validate(&self, kind: &str, config: &serde_yaml::Value) -> Result<()> {
+        (self.factory(kind)?.validate)(config)
+    }
+
+    /// Build the minter for `kind` from `config`, after validating it.
     pub fn build(&self, kind: &str, config: &serde_yaml::Value) -> Result<Arc<dyn Minter>> {
-        let factory = self
-            .factories
+        let factory = self.factory(kind)?;
+        (factory.validate)(config)?;
+        let construct = factory.construct.ok_or_else(|| Error::MinterConfig {
+            kind: factory.kind,
+            message: format!(
+                "`{kind}` is minted by `briefcred-helper-{kind}`; this binary has its \
+                 configuration schema but not its implementation"
+            ),
+        })?;
+        Ok(construct())
+    }
+
+    fn factory(&self, kind: &str) -> Result<&'static MinterFactory> {
+        self.factories
             .get(kind)
-            .ok_or_else(|| Error::profile(self.unknown_kind(kind)))?;
-        (factory.build)(config)
+            .copied()
+            .ok_or_else(|| Error::profile(self.unknown_kind(kind)))
     }
 
     /// The exact wording used whenever a profile names a kind nobody registered.

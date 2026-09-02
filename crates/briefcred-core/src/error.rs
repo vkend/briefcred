@@ -57,6 +57,12 @@ pub enum Error {
     #[error("ssh: {0}")]
     Ssh(String),
 
+    /// An AWS call, or the credentials for one, could not be used.
+    ///
+    /// Carries the service's own code and message, never a credential.
+    #[error("aws: {0}")]
+    Aws(String),
+
     /// TLS could not be configured for an outbound database connection.
     #[error("tls: {0}")]
     Tls(String),

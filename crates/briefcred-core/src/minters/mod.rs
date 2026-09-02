@@ -9,8 +9,10 @@
 //! inside the daemon, because it talks to nothing; its module documentation
 //! says what that costs.
 
+pub mod aws_sts;
 pub mod postgres;
 pub mod ssh_cert;
 
+pub use aws_sts::AwsStsConfig;
 pub use postgres::PostgresDynamicMinter;
 pub use ssh_cert::SshCertMinter;
