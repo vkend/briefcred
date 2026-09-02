@@ -268,7 +268,10 @@ pub enum AuditEntry {
         pid: u32,
         /// How long it had been running.
         uptime_secs: u64,
-        /// What asked it to stop: `sigterm`, `sigint`, or `request`.
+        /// What asked it to stop: `sigterm`, `sigint`, `request`, or
+        /// `handoff` — the last being a daemon that gave its listeners and
+        /// sessions to a successor and stood down. See
+        /// [`AuditEntry::DaemonHandoff`].
         reason: String,
     },
     /// One daemon handed its listeners and sessions to another.
