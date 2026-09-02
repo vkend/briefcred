@@ -57,10 +57,12 @@ cargo install cargo-deny cargo-vet --locked
 ```
 
 `cargo deny` enforces `deny.toml`: permissive licences only, nothing from a
-registry other than crates.io, and no open advisory. `cargo vet check --locked`
-is offline — `supply-chain/` imports no third-party audit sets — and asserts
-that the exemption list still covers the lockfile, which turns a new dependency
-into a diff somebody has to look at.
+registry other than crates.io, and no open advisory. `cargo vet check --locked
+--frozen` is offline: `--frozen` forbids the network and requires `--locked`
+alongside it, which is why both are passed. `supply-chain/` imports no
+third-party audit sets, so the check asserts that the exemption list still
+covers the lockfile — which turns a new dependency into a diff somebody has to
+look at.
 
 Without `just`:
 
@@ -68,7 +70,7 @@ Without `just`:
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo deny check
-cargo vet check --locked
+cargo vet check --locked --frozen
 cargo build --workspace
 cargo test --workspace
 ```
@@ -1288,6 +1290,18 @@ binaries — `briefcred` and `briefcred-daemon`, the two helper processes the
 daemon spawns to mint, and `briefcred-hook` for the agent — and carries a
 `service` block so `brew services start briefcred` runs the daemon as a
 LaunchAgent, equivalently to what `briefcred install` writes.
+
+Its `url` and `sha256` in the tree are placeholders, because the checksum of a
+release that has not been built yet does not exist. The workflow runs
+`release/scripts/stamp-formula.sh`, which rewrites exactly those two lines from
+the tarball it just built, and uploads the stamped formula as a release asset
+named `briefcred.rb`.
+
+**Publishing the tap is a separate, manual step.** The tap is its own
+repository, created out of band, and the release workflow holds no token for
+it: updating it means copying the `briefcred.rb` asset from the release into
+the tap and committing it. That is one deliberate manual act per release rather
+than a release workflow with write access to a second repository.
 
 ## Licence
 

@@ -9,7 +9,8 @@ default: check test
 #
 #     cargo install cargo-deny cargo-vet --locked
 #
-# `cargo vet check --locked` is deliberately offline: `supply-chain/config.toml`
+# The vet check is offline: `--frozen` forbids the network and requires
+# `--locked` alongside it, which is why both are passed. `supply-chain/config.toml`
 # imports no third-party audit sets, so the whole graph sits in `exemptions` and
 # the check asserts that the exemption list still covers the lockfile. That
 # turns a new dependency into a diff somebody has to look at, which is the part
@@ -18,7 +19,7 @@ check:
     cargo fmt --all -- --check
     cargo clippy --all-targets -- -D warnings
     cargo deny check
-    cargo vet check --locked
+    cargo vet check --locked --frozen
 
 # The whole workspace: unit tests and end-to-end tests.
 #

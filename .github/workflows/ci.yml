@@ -57,11 +57,12 @@ jobs:
         with:
           tool: cargo-deny,cargo-vet
       - run: cargo deny check
-      # `--locked` keeps this offline. `supply-chain/config.toml` imports no
-      # third-party audit sets, so the check is that the exemption list still
-      # covers the lockfile — which is exactly the thing a new dependency
-      # changes.
-      - run: cargo vet check --locked
+      # `--frozen` is what forbids the network, and it requires `--locked`
+      # alongside it; `--locked` on its own only means "do not change the
+      # lockfile". `supply-chain/config.toml` imports no third-party audit
+      # sets, so the check is that the exemption list still covers the
+      # lockfile — which is exactly the thing a new dependency changes.
+      - run: cargo vet check --locked --frozen
 
   test:
     name: test (${{ matrix.os }}, PostgreSQL ${{ matrix.pg }})
@@ -128,5 +129,9 @@ jobs:
       # and the end-to-end tests fail for a reason that looks nothing like the
       # cause. The harness now refuses to start when one is missing; building
       # first is what stops it having to.
-      - run: cargo build --workspace
-      - run: cargo test --workspace
+      #
+      # `--locked` on both: CI must fail on a lockfile that does not match the
+      # manifests rather than quietly resolving a different graph than the one
+      # `cargo deny` and `cargo vet` were run against in the job above.
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked

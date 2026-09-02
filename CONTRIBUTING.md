@@ -14,9 +14,11 @@ no "fix it later" tier.
 
 `just check` includes the two supply-chain gates because a dependency is added
 on the same afternoon somebody runs it, and a gate nobody runs until release is
-one that fails at release. `cargo deny` enforces `deny.toml`; `cargo vet check
---locked` is offline and asserts that `supply-chain/config.toml`'s exemption
-list still covers the lockfile. Adding a dependency therefore adds a line
+one that fails at release. `cargo deny` enforces `deny.toml`; `cargo vet
+check --locked --frozen` asserts that `supply-chain/config.toml`'s exemption
+list still covers the lockfile. `--frozen` is what makes it offline and it
+requires `--locked` alongside it, so both are passed: `--locked` alone only
+means "do not change the lockfile", which is not the same claim. Adding a dependency therefore adds a line
 somebody has to look at, which is the point.
 
 `just test` builds the workspace's binaries first. `cargo test` does not build
