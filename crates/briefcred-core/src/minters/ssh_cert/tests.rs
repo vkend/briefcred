@@ -134,14 +134,25 @@ async fn a_minted_certificate_validates_against_the_ca_that_signed_it() {
     assert_eq!(certificate.key_id(), mint_id.as_str());
     assert_eq!(certificate.valid_principals(), ["ubuntu", "deploy"]);
     assert_ne!(certificate.serial(), 0, "a serial of 0 means `unnumbered`");
-    assert_eq!(
+    // A range, not an equality: the mint reads its own clock, so a second
+    // ticking over between `before` and the signature would fail an exact
+    // comparison without anything being wrong.
+    let after = OffsetDateTime::now_utc().unix_timestamp() as u64;
+    let before = before.unix_timestamp() as u64;
+    assert!(
+        (before - CLOCK_SKEW_GRACE_SECS..=after - CLOCK_SKEW_GRACE_SECS)
+            .contains(&certificate.valid_after()),
+        "a minute of grace absorbs a server clock that is behind: {} not in {}..={}",
         certificate.valid_after(),
-        (before.unix_timestamp() as u64) - CLOCK_SKEW_GRACE_SECS,
-        "a minute of grace absorbs a server clock that is behind"
+        before - CLOCK_SKEW_GRACE_SECS,
+        after - CLOCK_SKEW_GRACE_SECS
     );
-    assert_eq!(
+    assert!(
+        (before + 900..=after + 900).contains(&certificate.valid_before()),
+        "{} not in {}..={}",
         certificate.valid_before(),
-        (before.unix_timestamp() as u64) + 900
+        before + 900,
+        after + 900
     );
     assert_eq!(
         minted.expires_at.unix_timestamp(),

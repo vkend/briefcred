@@ -497,9 +497,16 @@ fn write_identity(
 }
 
 /// Create `path` with exactly `mode` and write `bytes` to it.
+///
+/// `create_new`, so a file that is already there is an error rather than
+/// something to truncate. A mint directory is named for its [`MintId`], so
+/// finding one occupied means either a 48-bit identifier collision or another
+/// process writing into this mint's directory, and neither is a condition
+/// under which to overwrite a private key. It also removes the window in which
+/// an existing file's old mode applies to new content.
 fn write_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let io = |source| Error::Io {
         path: path.to_path_buf(),
@@ -507,14 +514,11 @@ fn write_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     };
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(mode)
         .open(path)
         .map_err(io)?;
-    file.write_all(bytes).map_err(io)?;
-    // An existing file keeps its old mode, so it is set explicitly as well.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(io)
+    file.write_all(bytes).map_err(io)
 }
 
 /// Remove a mint directory, treating an absent one as success.
