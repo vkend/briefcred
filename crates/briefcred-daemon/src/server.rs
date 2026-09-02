@@ -858,6 +858,7 @@ fn summarise(loaded: &LoadedProfile) -> ProfileSummary {
         signature: loaded.signature.to_string(),
         signer_key_id: loaded.signer_key_id.clone(),
         overrides: loaded.overrides.clone(),
+        path: loaded.path.clone(),
         credentials: profile
             .credentials
             .iter()

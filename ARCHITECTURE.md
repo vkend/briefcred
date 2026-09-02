@@ -109,7 +109,7 @@ two things every crate has to agree on.
 | `ca` | The root CA, leaf issuance, and the runtime trust environment. |
 | `exec` | The two pure decisions behind `briefcred exec`: is the command allowed, and what environment does it get. |
 | `policy` | The fixed Cedar schema, the request context, the compiled form of a profile's `policy`, and the enforce/observe split. |
-| `minisign` | Minisign-compatible Ed25519 keys, detached signatures, and their file formats. Signs nothing but profiles. |
+| `minisign` | Minisign-compatible Ed25519 keys and detached signatures. Verifies both the legacy `Ed` and the prehashed `ED` form; only ever produces `Ed`. |
 | `distribution` | The `[profiles]` config, the three registry URL schemes, the fetch, and the trusted profile set with its precedence rules. |
 
 `minters::http` and `minters::postgres_proxy` are the two modules that register
@@ -257,6 +257,7 @@ Two failure modes, deliberately handled differently:
 | --- | --- |
 | A file does not parse or does not validate | The whole reload fails; the previous set stays in force; `profile_load_error` |
 | A registry file does not verify | That file is dropped; the rest of the set loads; `profile_trust_warning` |
+| A fetch yields no profiles over a registry that has some | The swap is refused; the previous set stays; `sync` exits non-zero |
 
 Last-good exists so one typo does not cost you every profile. Applying it to a
 signature failure would mean continuing to run a profile *because* its

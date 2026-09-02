@@ -14,9 +14,14 @@ All notable changes to briefcred are recorded here. The format follows
   profile apart: `profiles/*.yaml` are yours and need no vouching, while
   `profiles/registry/<name>/*.yaml` are **dropped unless a detached signature
   beside them verifies against a trust root**. The format is minisign's,
-  unmodified — `<file>.minisig`, Ed25519 over the file's bytes, plus a second
-  signature over the trusted comment — so `minisign -S` can sign a profile
-  briefcred accepts and `minisign -V` can check one briefcred produced.
+  unmodified — `<file>.minisig`, plus a second signature over the trusted
+  comment. briefcred verifies both minisign signature forms, the legacy `Ed`
+  over the file's bytes and the prehashed `ED` over BLAKE2b-512 of it, which is
+  what stock `minisign -S` writes by default; it only ever produces `Ed`, so a
+  briefcred signature verifies under every minisign release. Password-less
+  minisign secret keys are read as they are written, all-zero checksum
+  included. All three directions are covered by tests that run when `minisign`
+  is installed and skip with a reason when it is not.
 - **`daemon.toml` gains a `[profiles]` table**: `trust_roots` (minisign public
   key lines), `registries` (`{ name, url }`), and `dev_mode`. A trust root that
   is not a well-formed key stops the daemon starting rather than being silently
@@ -28,9 +33,11 @@ All notable changes to briefcred are recorded here. The format follows
   SHA-256 is checked before the signature, and `git+https://` for a shallow
   clone through the system `git`. Each fetch lands in a staging directory and is
   moved into place at the end, so a failed sync leaves the previous contents
-  rather than a mix of two, and a withdrawn profile really does disappear. One
-  unreachable registry never stops the others; the exit code is non-zero if any
-  file was skipped.
+  rather than a mix of two, and a withdrawn profile really does disappear — but
+  a fetch that produced *no* profiles will not replace a registry that
+  currently has some, because that is evidence of a bad URL rather than of a
+  publisher who withdrew everything. One unreachable registry never stops the
+  others; the exit code is non-zero if any file was skipped.
 - **`briefcred profile keygen`, `sign`, and `verify`.** `keygen --out <dir>`
   writes `briefcred.key` (mode `0600`, password-less, and the command says so)
   and `briefcred.pub`, and prints the line to paste into `trust_roots`. Signing
@@ -39,8 +46,8 @@ All notable changes to briefcred are recorded here. The format follows
   made for.
 - **Provenance on every profile.** `briefcred profiles` gains `SOURCE` and
   `SIGNATURE` columns, and `briefcred profile show` prints where a profile came
-  from, what its signature was worth, which key vouched for it, and what it
-  overrides. A local profile of the same name overrides a registry one, which is
+  from, the file it was read from, what its signature was worth, which key
+  vouched for it, and what it overrides. A local profile of the same name overrides a registry one, which is
   what makes a registry usable: take the set somebody publishes and change the
   one profile you need to.
 - **A `profile_trust_warning` audit row** per file that failed verification,

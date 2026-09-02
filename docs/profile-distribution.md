@@ -24,10 +24,31 @@ Minisign, unmodified. A signature is a `<file>.minisig` beside the profile, and
 briefcred's keys are minisign keys, so `minisign -S` can sign a profile
 briefcred will accept, and `minisign -V` can check one briefcred produced.
 
-The wire format is four lines: an untrusted comment, base64 of `"Ed"` plus the
-eight-byte key id plus the raw Ed25519 signature of the file's bytes, a
-*trusted* comment, and base64 of a second signature over the first signature
-concatenated with the trusted comment.
+The wire format is four lines: an untrusted comment, base64 of an algorithm
+tag plus the eight-byte key id plus an Ed25519 signature, a *trusted* comment,
+and base64 of a second signature over the first signature concatenated with the
+trusted comment.
+
+There are two algorithm tags, and **briefcred accepts both**:
+
+| Tag | Signature is over | Who writes it |
+| --- | --- | --- |
+| `Ed` | the file's bytes | briefcred, and `minisign -S -H`-less older releases |
+| `ED` | BLAKE2b-512 of the file | stock `minisign -S` since 0.10 |
+
+briefcred only ever *produces* `Ed`, so a briefcred signature verifies under
+every minisign release; it accepts `ED` as well, because refusing it would mean
+refusing the reference implementation's ordinary output. Secret keys are read
+in minisign's password-less form, including the all-zero checksum that
+`minisign -G -W` writes in place of a real one — an all-zero field means
+"unchecked", not "wrong", and the key's public half is still checked against
+its private half either way.
+
+All three directions are covered by tests that run whenever `minisign` is on
+the machine and skip with a printed reason when it is not: a briefcred
+signature checked by `minisign -V`, a stock `minisign -S` signature checked by
+`briefcred profile verify`, and a `minisign -G -W` key used by
+`briefcred profile sign`.
 
 The two signatures are both checked. Only the trusted comment is covered by the
 second one, which is why briefcred puts the file name there: a signature lifted
@@ -116,6 +137,15 @@ end, so a sync that fails halfway leaves the previous contents intact rather
 than a directory holding half of two registries. A withdrawn profile really
 does disappear: the directory is replaced, not merged into.
 
+One exception, and it is deliberate: **a fetch that produced no profiles at all
+will not replace a registry directory that currently has some.** An empty
+result over a working set is evidence of a bad URL or a moved branch, not of a
+publisher who withdrew everything, and replacing a working profile set with an
+empty directory on that evidence is the worst available answer. The sync
+reports it as an error, keeps what is there, and exits non-zero. A first sync
+of a genuinely empty registry still succeeds, because there is nothing to
+destroy.
+
 The exit code is non-zero if any file was skipped or any registry failed, so a
 pipeline notices that half a registry did not arrive. One unreachable registry
 never stops the others.
@@ -133,6 +163,7 @@ analytics
   description  read-only analytics shell
   unlock       biometric (300s cache)
   source       local
+  file         ~/Library/Application Support/briefcred/profiles/analytics.yaml
   signature    unsigned
   overrides    the `analytics` profile published by platform
   credentials

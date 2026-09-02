@@ -96,11 +96,21 @@ async fn a_synced_registry_profile_loads_and_an_unsigned_one_never_arrives() {
         Some(public.key_id().to_string().as_str())
     );
 
+    assert!(
+        profiles[0].path.ends_with("registry/acme/published.yaml"),
+        "the summary must name the file it was read from: {:?}",
+        profiles[0].path
+    );
+
     // `profile show` prints the provenance the daemon reported.
     let (ok, output) = briefcred(daemon.home(), &["profile", "show", "published"]);
     assert!(ok, "{output}");
     assert!(output.contains("registry(acme)"), "{output}");
     assert!(output.contains("verified"), "{output}");
+    assert!(
+        output.contains("registry/acme/published.yaml"),
+        "profile show must print the source file: {output}"
+    );
 
     daemon.shutdown().await;
 }

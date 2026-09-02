@@ -331,6 +331,7 @@ fn print_profile_detail(profile: &briefcred_proto::ProfileSummary) {
         profile.unlock_policy, profile.unlock_cache_secs
     );
     println!("  source       {}", profile.source);
+    println!("  file         {}", profile.path.display());
     println!("  signature    {}", profile.signature);
     if let Some(key_id) = &profile.signer_key_id {
         println!("  signed by    {key_id}");

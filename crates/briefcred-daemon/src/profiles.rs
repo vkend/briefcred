@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use briefcred_core::distribution::{LoadedProfile, ProfileSet, Trust};
+use briefcred_core::distribution::{LoadedProfile, ProfileSet, Trust, TrustWarning};
 use briefcred_core::{Profile, Registry};
 use tokio::sync::RwLock;
 
@@ -51,11 +51,11 @@ pub enum Reload {
     Loaded {
         /// How many profiles are loaded.
         count: usize,
-        /// One line per file that was dropped or distrusted.
+        /// One entry per file that was dropped, distrusted, or shadowed.
         ///
         /// A reload can succeed and still have complaints: one registry file
         /// failing verification does not stop the other twenty from loading.
-        warnings: Vec<String>,
+        warnings: Vec<TrustWarning>,
     },
     /// The directory did not parse. The previous set is still in force.
     Failed {
@@ -291,7 +291,11 @@ mod tests {
         assert!(store.get("alpha").await.is_some());
         assert!(store.get("beta").await.is_none(), "unsigned must not load");
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("beta.yaml"), "{warnings:?}");
+        assert_eq!(
+            warnings[0].action,
+            briefcred_core::distribution::TrustAction::Dropped
+        );
+        assert!(warnings[0].path.ends_with("beta.yaml"), "{warnings:?}");
         assert!(!store.has_dev_mode_profiles().await);
     }
 
@@ -316,7 +320,11 @@ mod tests {
         };
         assert_eq!(count, 0, "the tampered profile must be gone, not stale");
         assert!(store.get("alpha").await.is_none());
-        assert!(warnings[0].contains("invalid"), "{warnings:?}");
+        assert_eq!(
+            warnings[0].action,
+            briefcred_core::distribution::TrustAction::Dropped
+        );
+        assert!(warnings[0].reason.contains("invalid"), "{warnings:?}");
     }
 
     #[tokio::test]
@@ -336,7 +344,10 @@ mod tests {
             panic!("dev_mode must load it");
         };
         assert_eq!(count, 1);
-        assert!(warnings[0].contains("dev_mode"), "{warnings:?}");
+        assert_eq!(
+            warnings[0].action,
+            briefcred_core::distribution::TrustAction::LoadedDevMode
+        );
         assert!(store.has_dev_mode_profiles().await);
         let loaded = store.get_loaded("alpha").await.unwrap();
         assert_eq!(

@@ -34,6 +34,7 @@ fn sample_profile() -> ProfileSummary {
         signature: "verified".into(),
         signer_key_id: Some("0102030405060708".into()),
         overrides: None,
+        path: PathBuf::from("/tmp/t/profiles/registry/acme/analytics.yaml"),
         credentials: vec![CredentialSummary {
             name: "db".into(),
             kind: "postgres-dynamic".into(),

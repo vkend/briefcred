@@ -449,6 +449,13 @@ pub struct ProfileSummary {
     /// The registry whose profile of the same name this one shadows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides: Option<String>,
+    /// The file the profile was read from.
+    ///
+    /// A path, not the contents: "which of these four files am I actually
+    /// running" is the first question when a profile does not behave the way
+    /// the one you just edited should.
+    #[serde(default)]
+    pub path: PathBuf,
 }
 
 fn local_source() -> String {

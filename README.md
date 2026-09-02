@@ -336,7 +336,7 @@ always run whatever you liked with it. `THREAT_MODEL.md` says this at length.
 | `briefcred profile show <name>` | One profile, as the daemon parsed it, and where it came from. |
 | `briefcred profile keygen --out <dir>` | A minisign signing key pair for publishing profiles. |
 | `briefcred profile sign <file> --key <path>` | Sign a profile, writing `<file>.minisig` beside it. |
-| `briefcred profile verify <file> --pub <path>` | Check a profile against its `.minisig`. |
+| `briefcred profile verify <file> --pub <path>` | Check a profile against its `.minisig`. Accepts signatures from stock `minisign` too. |
 | `briefcred profile sync` | Fetch every registry in `daemon.toml`, verifying as it goes. |
 | `briefcred mcp` | Serve the Model Context Protocol tools on stdin and stdout, for an agent. |
 
