@@ -34,7 +34,10 @@ tar -czf "$OUT/$NAME.tar.gz" -C "$STAGING" .
 # the paths of whoever built them. A checksum whose left column is somebody's
 # home directory is one nobody can check.
 (cd "$OUT" && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
-(cd "$OUT" && shasum -a 256 ./*.tar.gz > SHA256SUMS)
+# `*.tar.gz` rather than `./*.tar.gz`: `shasum` prints the path it was given,
+# and a `SHA256SUMS` whose right column starts `./` does not match what
+# `shasum -c` is run against from a directory of downloaded files.
+(cd "$OUT" && shasum -a 256 -- *.tar.gz > SHA256SUMS)
 
 echo "package: wrote $OUT/$NAME.tar.gz"
 cat "$OUT/SHA256SUMS"
