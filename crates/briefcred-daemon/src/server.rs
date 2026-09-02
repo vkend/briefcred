@@ -581,6 +581,27 @@ async fn handle_exec(request: Request, state: Arc<State>) -> Response {
         }
     };
 
+    // Before anything is minted, for the same reason the command check is: a
+    // run the quota refuses must leave no principal behind. One token per run
+    // rather than per credential, because what is being bounded is how often
+    // the profile is used, not how many credentials it happens to declare.
+    let quota = state
+        .sessions
+        .with_session(&session_id, |s| s.quota.clone())
+        .await
+        .ok()
+        .flatten();
+    if let Err(refusal) = crate::quota::charge(
+        quota.as_deref(),
+        &profile.name,
+        crate::quota::SURFACE_EXEC,
+        state.metrics(),
+    ) {
+        return Response::Error {
+            message: quota_message(&profile.name, refusal),
+        };
+    }
+
     // Both taken out of the store before the mint, so the session map is not
     // held locked across a round trip to a database.
     let Ok((masters, helpers)) = state
@@ -663,6 +684,24 @@ async fn handle_exec(request: Request, state: Arc<State>) -> Response {
         mints: minted.mints,
         env: minted.env,
         passthrough: minted.passthrough,
+    }
+}
+
+/// What a caller whose quota refused the run is told.
+///
+/// Names the profile and says which of the two limits was hit, because the
+/// fixes are different: a rate that is too tight is a `quota.rate` to raise,
+/// and a spent `total` is a session to close and reopen.
+fn quota_message(profile: &str, refusal: crate::quota::Refusal) -> String {
+    match refusal {
+        crate::quota::Refusal::Refill { retry_after } => format!(
+            "profile `{profile}` is over its quota; try again in {}s",
+            retry_after.as_secs()
+        ),
+        crate::quota::Refusal::Exhausted => format!(
+            "profile `{profile}` has spent its session quota (`quota.total`); \
+             close the session and open a new one"
+        ),
     }
 }
 
@@ -1175,6 +1214,67 @@ mod tests {
             "{response:?}"
         );
         assert_eq!(prompts.load(Ordering::SeqCst), 0, "`none` prompts nobody");
+    }
+
+    #[tokio::test]
+    async fn an_exec_over_the_session_quota_is_refused_by_name() {
+        // A profile with no credentials, so the run reaches the quota and
+        // nothing else: `burst: 1` means the second `exec` has no token.
+        let (_home, state, _) =
+            test_state("name: dev\nunlock:\n  policy: none\nquota:\n  rate: 0.1\n  burst: 1\n")
+                .await;
+        let Response::SessionOpened { session_id, .. } = handle_open_session(
+            Request::OpenSession {
+                profile: "dev".into(),
+                client_headless: true,
+                session_pubkey: None,
+            },
+            Arc::clone(&state),
+        )
+        .await
+        else {
+            panic!("the session must open");
+        };
+
+        let exec = |state: Arc<State>, session_id: String| async move {
+            handle_exec(
+                Request::Exec {
+                    session_id,
+                    credentials: None,
+                    argv0: "true".into(),
+                    args: Vec::new(),
+                    pid: std::process::id(),
+                },
+                state,
+            )
+            .await
+        };
+
+        let first = exec(Arc::clone(&state), session_id.clone()).await;
+        assert!(matches!(first, Response::Minted { .. }), "{first:?}");
+
+        let second = exec(Arc::clone(&state), session_id).await;
+        let Response::Error { message } = second else {
+            panic!("the second exec must be refused: {second:?}");
+        };
+        assert!(message.contains("quota"), "{message}");
+        assert!(message.contains("dev"), "{message}");
+    }
+
+    #[test]
+    fn a_quota_refusal_names_the_profile_and_the_way_out_of_it() {
+        let refill = crate::quota::Refusal::Refill {
+            retry_after: Duration::from_secs(12),
+        };
+        let message = quota_message("openai", refill);
+        assert!(message.contains("openai"), "{message}");
+        assert!(message.contains("12s"), "{message}");
+
+        // A spent `total` must not tell anybody to wait: no wait would help.
+        let spent = quota_message("openai", crate::quota::Refusal::Exhausted);
+        assert!(spent.contains("quota.total"), "{spent}");
+        assert!(spent.contains("new one"), "{spent}");
+        assert!(!spent.contains("try again in"), "{spent}");
     }
 
     #[test]
