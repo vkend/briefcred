@@ -58,7 +58,7 @@ weakens a guarantee has to say so out loud before it ships.
 
 ## What each phase actually guarantees
 
-**Phase 0 (this task).** A library, no daemon, no privilege boundary. The
+**Phase 0.** A library, no daemon, no privilege boundary. The
 guarantees are hygiene guarantees:
 
 - Master and minted secrets are held in `Zeroizing<String>` and zeroed on drop.
@@ -107,6 +107,72 @@ Regenerating is destructive on purpose. `briefcred ca regenerate` untrusts the
 old certificate first, because the macOS trust store matches on content and
 after the replacement there would be nothing left to match, leaving a stale
 trust entry for a key nobody holds.
+
+**Phase 3: minting, `exec`, and revoke.** This is the first phase where a real
+credential reaches a subprocess, and it is **Model C**: the child can read
+`PGPASSWORD`. Phase 10 moves the same credential to Model A by completing the
+PostgreSQL handshake at the proxy. Until then, what bounds the exposure is that
+the credential is *short* and *narrow*, not that it is hidden.
+
+What the design buys:
+
+- **The credential is new and it expires.** A role minted for one `briefcred
+  exec` is created for that run with the profile's `ttl_secs` and dropped when
+  it ends. A leaked one is useful for minutes, not until somebody rotates a
+  shared password.
+- **The allowlist runs before the mint.** A command a profile forbids never
+  causes a principal to be created, so a rejected `briefcred exec` leaves
+  nothing to clean up and nothing to leak.
+- **The subprocess environment is built, not inherited.** `env_clear()` means a
+  credential that happened to be in the caller's shell does not travel into the
+  child. That is a real reduction: the common accident is not briefcred's
+  credential escaping, it is somebody else's arriving.
+- **Minting is out of process.** Every minter runs as
+  `briefcred-helper-<kind>`, so the code holding a database master password is
+  not in the daemon's address space. A memory-disclosure bug in a backend
+  client library exposes one backend's master rather than every master the
+  daemon has ever held. A helper that stops answering is killed rather than
+  waited on, because it is holding a master.
+- **Revoke has three independent nets.** The persisted queue, the session
+  close, and the reconciler. The last exists specifically for `SIGKILL`, and it
+  is exercised against a real cluster by killing a real daemon mid-run.
+- **The daemon's memory is checked, not asserted.** `just mem-hygiene` proves a
+  master is absent from the daemon's address space after its session is closed,
+  and proves it was present beforehand so the absence means something.
+
+Residual risks, stated plainly:
+
+- **`briefcred get` is exempt from `exec.allow_argv0`.** It spawns nothing, so
+  there is no program for the allowlist to be about, and it hands the credential
+  to a caller who was always free to run whatever they liked with it. Making
+  `get` pick an allowed program would be theatre. The `--force` requirement for
+  a terminal is a hygiene control, not a security boundary, and it does not stop
+  a caller redirecting the value anywhere.
+- **The allowlist is not a sandbox.** `exec.allow_args` is a set of regular
+  expressions over argument strings. It stops an agent asking for `DROP TABLE`
+  when the profile only permits `^SELECT `; it does not stop a permitted program
+  doing something clever with a permitted argument. The real bound on damage is
+  the *grant template*: what the minted role is allowed to do at the backend.
+  Narrow that first.
+- **The hook's rewrite is advisory.** `updatedInput` is a request an agent may
+  ignore, and it is textual, so a pipeline or a `&&` chain only puts its first
+  command under briefcred. `docs/hook.md` says this at length. Nothing should
+  depend on a rewrite having happened.
+- **A reconcile sweep needs the master.** It fetches one per profile credential
+  from the master source, which on macOS may prompt for a locked keychain. A
+  profile whose master has been removed is skipped, and its strays then live
+  until their `VALID UNTIL` makes them useless rather than until they are
+  dropped.
+- **`tokio_postgres::Config` still copies the master into memory briefcred does
+  not zero.** Moving minting into a helper bounds the blast radius of that to
+  one backend and one short-lived process, which is the improvement Phase 3
+  could make; it does not close it. Closing it needs an upstream change or a
+  hand-rolled startup packet.
+- **The `debug-heapscan` feature must never ship.** A same-uid caller who could
+  ask a production daemon whether a digest matches anything in its memory would
+  have a confirmation oracle for guessed secrets. It is behind a cargo feature
+  that only `just mem-hygiene` enables, and the request does not exist in a
+  daemon built without it.
 
 **Phase 3a: master sources, the unlock gate, and sessions.** This is where
 briefcred starts holding the secret that matters. The guarantee it aims at is
@@ -229,6 +295,18 @@ the audit log.
   accounted for. `unlock_denied` records a refused prompt and its reason;
   `profile_load_error` records that the daemon carried on with stale profiles.
   None of these rows carries a master, a key's value, or a profile's contents.
+- **Arguments can be recorded verbatim, but only on request.** `[audit]
+  raw_args = true` in `daemon.toml` adds the arguments themselves alongside
+  their digests. It is off by default and it makes the audit log sensitive:
+  an operator who needs to see the SQL an agent actually ran turns it on
+  knowingly. The digests stay either way, so a log with it on and one with it
+  off remain correlatable.
+- **Reconciliation is auditable.** A stray removed by a sweep gets its own
+  `revoke` row plus a `reconcile` summary row, so a credential cleaned up
+  because a daemon was killed is as findable as one its owner revoked. The
+  summary row is written even when a sweep finds nothing, because "the
+  reconciler is alive and the backend is clean" is itself the thing an operator
+  needs to see.
 - **Not tamper-evident.** A user who can write the log can rewrite it. Signing
   or an append-only system store is deliberately out of scope for now, and this
   line should be revisited before anyone treats the log as compliance evidence.
@@ -245,3 +323,10 @@ the audit log.
   CA issued.
 - Revoke against an eventually consistent backend, such as AWS STS, cannot be
   immediate. The outcome type says so rather than pretending otherwise.
+- A subprocess can copy the credential it was given anywhere before it exits.
+  Revoking afterwards ends the credential's usefulness; it does not undo what
+  was done with it while it was live. This is the whole of what Model C means,
+  and it is why Phase 10 exists.
+- The revoke queue gives up after eight attempts. A backend that is unreachable
+  for longer leaves a principal behind until the reconciler's next sweep, which
+  is bounded by the profile's `ttl_secs` in how long that principal is useful.

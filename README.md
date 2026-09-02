@@ -9,11 +9,13 @@ This is a greenfield build in progress. See `ROADMAP.md` for the plan,
 `ARCHITECTURE.md` for the shape, and `THREAT_MODEL.md` for what each phase does
 and does not guarantee.
 
-**Status: Phase 1.** The workspace, the profile schema, the minter contracts,
-and a working PostgreSQL dynamic-role minter exist as a library, and the daemon
-now runs: a per-user LaunchAgent (or systemd user unit) with a private Unix
-socket, an append-only audit log, and a Prometheus endpoint. No credential work
-goes through it yet; that is Phase 3.
+**Status: Phase 3.** Credentials now flow end to end.
+`briefcred exec --profile=db-ro -- psql -c "SELECT 1"` proves presence with
+Touch ID, mints a short-lived PostgreSQL role through a helper process, runs
+the command with a cleared environment, and revokes the role when it exits. A
+persistent queue retries a revoke that fails, and a reconciler sweeps up
+anything a `SIGKILL` stranded. `briefcred-hook` answers an agent's
+`PreToolUse` so the whole thing can be wired into Claude Code.
 
 ## Requirements
 
@@ -208,6 +210,121 @@ currently being written, and ignores any filename it did not write.
 Every request series is seeded at zero, so a counter that has never fired is
 distinguishable from a scrape that failed.
 
+## Running a command
+
+```sh
+briefcred exec --profile=db-ro -- psql -c "SELECT 1"
+```
+
+That one line does the following, in this order:
+
+1. **Opens a session.** The unlock gate runs first, so a refused prompt leaves
+   no master credential in the daemon's memory at all.
+2. **Checks the command.** `exec.allow_argv0` and `exec.allow_args` are enforced
+   *before* anything is minted, so a command the profile forbids never causes a
+   role to be created. A violation exits **4** and names the offending value.
+3. **Mints.** One helper process per minter kind, spoken to over stdio, so the
+   code that holds a database password is not in the daemon's address space.
+4. **Runs the child** with `env_clear()`, then the passthrough list, then the
+   profile's composed environment.
+5. **Revokes.** `briefcred exec` returns with the child's exit code the moment
+   the child exits; the revoke is queued and happens behind it.
+
+The exit code is the child's, so a script that wraps `briefcred exec` behaves as
+if briefcred were not there. Two codes are briefcred's own: **4** for a command
+the profile refuses, **5** for a refused unlock.
+
+| flag | meaning |
+| --- | --- |
+| `--profile <name>` | Which profile to run under. Required. |
+| `--cred a,b` | Mint only these credentials. Defaults to all of them. |
+| `-- <cmd> [args]` | The command. Everything after `--` belongs to the child. |
+
+### The subprocess environment
+
+The child starts from **nothing**. `env_clear()` runs first, so a credential
+that happens to be in your shell does not travel into a process briefcred is
+meant to be constraining. It then gets, in order:
+
+1. the trust environment (`SSL_CERT_FILE` and the rest) pointing at the local CA;
+2. the passthrough list — `PATH`, `HOME`, `TERM`, `LANG`, `TMPDIR`, plus
+   anything the profile's `env_passthrough` names — copied from your own
+   environment, and only when you actually have it;
+3. the profile's `env` block, with `${minted...}` substituted.
+
+Later steps win, so a profile can override a passed-through variable.
+
+The **daemon** composes that environment and the **client** applies it. The
+daemon is the only side holding the profile, the minted fields, and the CA path
+at once, so the template grammar has one implementation rather than two that can
+drift. The client's half is mechanical: clear, copy the named variables, apply
+what it was given, spawn. The one thing the daemon cannot see is the client's
+own environment, which is why the passthrough list crosses the socket as names
+rather than values.
+
+## Reading one field
+
+```sh
+briefcred get --profile=db-ro --cred=db --field=PGPASSWORD | pbcopy
+```
+
+`get` mints, prints one field, and queues the revoke. It **refuses to write to a
+terminal** unless you pass `--force`: a short-lived credential that has landed in
+a scrollback buffer is a long-lived one. There is no trailing newline, so a file
+redirect gets exactly the value.
+
+`get` is exempt from `exec.allow_argv0`, because it spawns nothing. That is not
+a hole in the allowlist — the allowlist constrains what briefcred is willing to
+run with a credential attached, and `get` hands the credential to you, who could
+always run whatever you liked with it. `THREAT_MODEL.md` says this at length.
+
+## Everything else the CLI does
+
+| command | what it does |
+| --- | --- |
+| `briefcred profiles` | The loaded profiles, their unlock policy, and their credentials. |
+| `briefcred health` | Daemon, profiles, CA trust, and outstanding revokes, with the command that fixes each. |
+| `briefcred audit [--since 24h] [--json]` | Audit rows, read straight off the disk so it works with the daemon stopped. |
+| `briefcred profile bootstrap` | An interactive interview that writes a profile and stores its master. |
+| `briefcred profile show <name>` | One profile, as the daemon parsed it. |
+
+`briefcred profile bootstrap` asks for the master credential **last**, after the
+unlock gate has said yes, and writes it straight to the platform key store. The
+master never crosses the daemon's socket: routing the write through the daemon
+would put a copy of the most valuable secret on the machine into the most
+valuable process on the machine, for a task the daemon has no part in.
+
+## Revoking, and the three nets under it
+
+A minted credential is caught by whichever of these gets to it first.
+
+1. **The queue.** `briefcred exec` reports the child's exit and the daemon
+   enqueues the revoke. The queue is persisted to
+   `state/revoke-queue.jsonl` (mode `0600`, metadata only — no master and no
+   minted secret) *before* it is acknowledged, so a daemon restart resumes it.
+   Failures retry with exponential backoff: 1 s, 2 s, 4 s, up to a one-minute
+   ceiling, eight attempts, then it gives up with a final `failed` audit row.
+2. **The session.** A wrapper that was killed never reports back. Closing the
+   session — by request, by idle eviction, or at shutdown — queues whatever it
+   had minted and nobody accounted for.
+3. **The reconciler.** A `SIGKILL` runs none of the above. Every
+   `reconcile_interval_secs` (300 by default) and once at startup, each helper
+   sweeps its backend for principals that are briefcred's *and* past their
+   expiry, and removes them. The expiry check is what keeps the sweep from
+   racing a live `briefcred exec` elsewhere.
+
+Every attempt from any of the three writes a `revoke` audit row with its
+outcome, so a credential cleaned up by reconciliation is as findable as one its
+owner revoked.
+
+## The agent hook
+
+`briefcred-hook` reads an agent's `PreToolUse` payload on stdin and answers on
+stdout. A rule file routes; the daemon enforces. It can turn an `allow` into a
+`deny`, never the other way round, and it answers `ask` rather than blocking
+when the daemon is not running. See `docs/hook.md` for the rules, the
+`updatedInput` caveats, and how to wire it into Claude Code.
+
 ## Profiles
 
 A profile is the work envelope: what to mint, how the user unlocks it, what may
@@ -236,8 +353,10 @@ credentials:
           - privileges: [SELECT]
             on: ALL TABLES IN SCHEMA public
 exec:
-  allow_argv0: [psql]
+  allow_argv0: [psql]      # matched on the basename, or on a full path
   allow_args: ['^-c$', '^SELECT ']
+env_passthrough:           # on top of PATH, HOME, TERM, LANG, TMPDIR
+  - PGSSLMODE
 trust_env:                 # optional; absent means all six
   - SSL_CERT_FILE
   - REQUESTS_CA_BUNDLE
@@ -246,6 +365,13 @@ env:
   PGPASSWORD: ${minted.db.PGPASSWORD}
   PGHOST: ${minted.db.PGHOST}
 ```
+
+`allow_argv0` matches the **basename** of an absolute path as well as the path
+itself, so a profile that permits `psql` permits `/opt/homebrew/bin/psql`
+without knowing where it is installed. It never matches the other way round: an
+entry that is a path permits only that path, which is how you pin a binary. An
+empty list means "any", for both allowlists, and is worth narrowing before an
+agent uses the profile.
 
 Unknown keys are errors at every level, so a typo cannot silently switch a
 control off. `${minted.<credential>.<field>}` must name a credential the
@@ -350,6 +476,38 @@ tests: `DROP OWNED BY` on its own is not a revoke when the master does not own
 schema `public`, which is the managed-PostgreSQL default. A revoke that cannot
 complete reports `RevokeOutcome::Failed` with the backend's SQLSTATE and
 message; a role that was already gone reports `AlreadyGone`.
+
+## Helper processes
+
+The daemon does not mint. It spawns `briefcred-helper-<kind>` — for
+`kind: postgres-dynamic`, `briefcred-helper-postgres-dynamic` — and talks to it
+over stdio with JSON-RPC 2.0, one object per line, with the methods `mint`,
+`revoke`, `reconcile`, and `shutdown`.
+
+That boundary is the point. The code that opens a database connection, parses a
+backend's replies, and holds a master password runs where the daemon's own
+memory is not: a panic costs one backend, and a memory-disclosure bug exposes
+one master rather than every master. One process per `(profile, kind)`, started
+on first use and stopped when the session closes.
+
+Helpers are looked for next to the daemon's own executable first, then in
+`BRIEFCRED_HELPER_DIR`. That order is deliberate — preferring the environment
+variable would let anything that can set the daemon's environment choose what
+code the daemon runs. The variable exists for `cargo run` and the tests.
+
+## Memory hygiene
+
+The daemon claims a master credential lives for the length of the session that
+needed it and no longer. `just mem-hygiene` checks the claim: it builds a daemon
+with the `debug-heapscan` feature, uses a random 32-byte marker as a master,
+asserts the daemon holds it while a session is open, closes the session, and
+asserts it is gone.
+
+The request takes a SHA-256 digest rather than the marker, so the needle never
+crosses the socket and cannot be found as a copy of itself. The feature is never
+built into a shipping daemon: a same-uid caller who could ask a daemon to search
+its own memory for a digest would have a confirmation oracle for guessed
+secrets.
 
 ## Licence
 

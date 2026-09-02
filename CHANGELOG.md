@@ -8,6 +8,75 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **`briefcred exec`**: run a subprocess with freshly minted, short-lived
+  credentials. Opens a session, enforces `exec.allow_argv0` and
+  `exec.allow_args` *before* minting, mints through a helper process, spawns the
+  child with `env_clear()`, and returns the child's exit code. A policy refusal
+  exits 4 naming the offending value; a refused unlock exits 5.
+- **`briefcred get --profile --cred --field`**: print one field of one minted
+  credential. Refuses a terminal unless `--force`, and writes no trailing
+  newline.
+- **`briefcred profiles`, `briefcred health`, `briefcred audit`**: a profile
+  table, a checklist that names the command fixing each failure, and an audit
+  reader that works with the daemon stopped.
+- **`briefcred profile bootstrap`**: an interactive interview (`dialoguer`) that
+  writes a validated profile and stores its master credential directly in the
+  platform key store. The master never crosses the daemon's socket; presence is
+  proved first with the new `Unlock` request.
+- **Helper processes**: `briefcred-proto::helper`, a JSON-RPC 2.0 protocol over
+  newline-delimited stdio with `mint`, `revoke`, `reconcile`, and `shutdown`,
+  and the `briefcred-helper-postgres` crate whose binary is named for the minter
+  kind it serves (`briefcred-helper-postgres-dynamic`). The daemon looks next to
+  its own executable, then in `BRIEFCRED_HELPER_DIR`, and keeps one process per
+  `(profile, kind)` for the life of the session.
+- **`Minter::reconcile`** and `PostgresDynamicMinter`'s implementation of it:
+  drop every `briefcred_t_%` role whose `VALID UNTIL` has passed. The expiry
+  check is what keeps a sweep from racing a live exec.
+- **Persistent revoke queue** at `state/revoke-queue.jsonl`, mode `0600`,
+  written and fsynced before a revoke is acknowledged and replayed at startup.
+  Exponential backoff of 1 s, 2 s, 4 s to a 60 s ceiling, eight attempts, then
+  a final `failed` audit row. Every attempt writes a `revoke` row.
+- **Reconciler**: sweeps each profile's backend at startup and every
+  `reconcile_interval_secs` (300 by default), writing a `revoke` row per stray
+  and a `reconcile` summary row per sweep.
+- **`briefcred-hook`**: reads a Claude Code `PreToolUse` payload on stdin,
+  matches `hook-rules.yaml`, asks the daemon `HookCheck` (which validates
+  argv0 and args without minting), and answers `allow`, `deny`, or `ask` with an
+  optional `updatedInput` rewrite. Documented in `docs/hook.md`.
+- **`env_passthrough`** on a profile, on top of the always-passed `PATH`,
+  `HOME`, `TERM`, `LANG`, and `TMPDIR`.
+- **`[audit] raw_args`** in `daemon.toml`: record command arguments verbatim
+  alongside their digests. Off by default.
+- **`reconcile_interval_secs`** in `daemon.toml`.
+- **`just mem-hygiene`**: builds a daemon with the `debug-heapscan` feature and
+  asserts a master is gone from its address space once its session is closed.
+  The request carries a SHA-256 digest, never the marker.
+- **`briefcred-e2e::daemon_harness`**: runs the real daemon binary under a
+  temporary `BRIEFCRED_HOME`, with end-to-end tests for a role stranded by
+  `SIGKILL`, a normal exec revoking through the queue, and a session close
+  sweeping up what it minted.
+
+### Changed
+
+- The audit log moved from a `std::sync::Mutex<AuditLog>` held across `fsync` to
+  a dedicated writer task on a blocking thread, fed by a channel. Appends no
+  longer block a request handler on the disk; `fsync`-per-row and the write-error
+  counter are unchanged, and `AuditHandle::flush` is available where a row has to
+  be durable before the next step.
+- `AuditEntry::ExecStart` and `ExecEnd` carry `session_id` and `mint_ids: Vec<_>`
+  rather than a single `mint_id`, because one `briefcred exec` may carry several
+  credentials. `AuditEntry::mint_id()` became `mint_ids()`.
+- `SessionStore::close`, `evict_idle`, and `close_all` return the sessions
+  themselves, so the caller can stop their helper processes and queue any mints
+  no `ExecDone` accounted for.
+- `PostgresDynamicMinter` keeps its master connection open across calls and
+  reopens it when it closes or its configuration changes.
+- `State::new` takes a `StateParts` struct rather than nine positional
+  arguments.
+- `cli::run` returns an exit code, so `briefcred exec` can exit with its
+  child's.
+
+
 - Cargo workspace with `briefcred-core`, `briefcred-proto`, `briefcred-daemon`,
   `briefcred-cli`, `briefcred-hook`, and the test-only `briefcred-e2e`. The
   daemon, CLI, and hook binaries are stubs that report the phase that

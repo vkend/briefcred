@@ -56,13 +56,16 @@ briefcred-proto     wire types for daemon IPC                        (Phase 1)
 briefcred-daemon    the per-user daemon                              (Phase 1)
 briefcred-cli       the `briefcred` binary                           (Phase 1)
 briefcred-hook      the `briefcred-hook` agent shim                  (Phase 6)
-briefcred-e2e       test-only: ephemeral Postgres harness and e2e tests
+briefcred-helper-postgres  the PostgreSQL minting helper              (Phase 3)
+briefcred-e2e       test-only: Postgres and daemon harnesses, e2e tests
 ```
 
-Two more crates appear when minting moves into helper processes:
-`briefcred-helper-postgres` and `briefcred-helper-sts`. Helpers are short-lived
-processes spoken to over stdio JSON-RPC, so a minter crash cannot take the
-daemon with it and a minter never inherits the daemon's memory.
+`briefcred-helper-sts` joins them with the STS minter. A helper's **binary** is
+named for the minter kind it serves rather than for its crate —
+`kind: postgres-dynamic` means `briefcred-helper-postgres-dynamic` — because
+the kind string is all the daemon holds when it goes looking, and a lookup table
+in between would be a third place for the name to drift. One crate can grow a
+second kind and a second binary.
 
 `briefcred-core` depends on nothing else in the workspace. Everything else
 depends on it. That is deliberate: the profile schema and the minter contract
@@ -83,6 +86,7 @@ are the two things every other crate has to agree on.
 | `session_env` | Whether the calling process has a screen. Read by the daemon *and* the CLI. |
 | `keystore` | The `KeyStore` trait, the macOS keychain backend, and the file backend. |
 | `ca` | The root CA, leaf issuance, and the runtime trust environment. |
+| `exec` | The two pure decisions behind `briefcred exec`: is the command allowed, and what environment does it get. |
 
 ## Data flow: one `briefcred exec`
 
@@ -116,6 +120,46 @@ are the two things every other crate has to agree on.
 The CLI returns as soon as the child exits. Revoke runs in the background on a
 retrying queue, and a periodic reconciliation sweep scans `pg_roles` for stale
 `briefcred_t_%` principals so a `SIGKILL` mid-exec still converges.
+
+## Who composes the subprocess environment
+
+The daemon composes it; the client applies it.
+
+The daemon is the only side that holds the profile, the minted fields, and the
+CA path at once, so putting the `${minted.<credential>.<field>}` substitution
+there means one implementation of that grammar rather than two that can
+disagree about it. `Response::Minted` therefore carries a finished `env` map.
+
+The client's half is mechanical and has no judgement in it:
+
+1. `Command::env_clear()`,
+2. copy each name in `passthrough` from its own environment, if it has it,
+3. apply the daemon's `env` on top,
+4. spawn.
+
+The passthrough list crosses the socket as **names**, not values, because the
+client's own environment is the one thing the daemon cannot see. Step 3 is last
+so a profile can override a passed-through variable.
+
+Clearing rather than adding is the security-relevant half. An agent's shell is
+full of things briefcred did not put there, including credentials the user
+already had; starting from empty means the subprocess gets what the profile
+granted it and nothing else.
+
+## The three nets under a minted credential
+
+Each catches a failure the one before it cannot.
+
+| net | catches | cannot catch |
+| --- | --- | --- |
+| The revoke queue | A normal exit, and a daemon restart: entries are fsynced to `state/revoke-queue.jsonl` before being acknowledged. | A `SIGKILL` between the mint and the enqueue. |
+| The session | A wrapper that died without reporting: closing, evicting, or shutting down queues whatever it minted. | A daemon that is killed with the session in memory. |
+| The reconciler | Everything else. Runs at startup and every `reconcile_interval_secs` against each profile's backend. | A backend that is unreachable, until it is not. |
+
+The reconciler identifies a stray as "named `briefcred_t_%` **and** past its
+`VALID UNTIL`". Both halves matter: the prefix is what makes it ours, and the
+expiry is what stops the sweep removing a role a live `briefcred exec` on
+another machine is still using.
 
 ## Why revoke is shaped the way it is
 
@@ -183,6 +227,40 @@ whole layout, including the socket; tests always set it.
     dropping it zeroises every master in it.
 11. Profiles cross the socket as a `ProfileSummary` built by hand, never as the
     daemon's own `Profile`, so a future profile field cannot leak by default.
+12. The allowlist is checked before anything is minted. A command the profile
+    forbids must never cause a principal to be created.
+13. The daemon does not mint. Every minter runs in a helper process, so the
+    code holding a master password is not in the daemon's address space.
+14. The revoke queue is written and fsynced before a revoke is acknowledged.
+    An entry that reached the file is one the reconciler does not have to find.
+15. The revoke queue file holds metadata only: an identifier, a kind, a profile
+    name, and connection settings. Never a master, never a minted secret.
+16. `SecretString` is the only serialisable secret type, it exists only on the
+    daemon-to-helper pipe and the `Minted` reply, and it prints `<redacted>`.
+
+## The helper protocol
+
+JSON-RPC 2.0, one object per line, on the child's stdin and stdout. Four
+methods and no more: `mint`, `revoke`, `reconcile`, `shutdown`. `stderr` is
+inherited so a helper's diagnostics reach the daemon's log without a helper
+being able to corrupt the protocol stream by printing to it.
+
+```
+daemon                          briefcred-helper-postgres-dynamic
+  |-- {"method":"mint",...} ------->|
+  |                                 |-- CREATE ROLE / GRANT ------> backend
+  |<-- {"result":{"fields":...}} ---|
+  |-- {"method":"shutdown"} ------->|   (at session close)
+  |<-- {"result":{"stopping":true}}-|
+```
+
+The master credential has to reach the helper somehow, and the pipe is the only
+channel. `briefcred_proto::SecretString` is the one type in briefcred that is
+deliberately `Serialize`; it holds `Zeroizing<String>`, prints `<redacted>`,
+and appears nowhere but this wire and the `Minted` reply.
+
+A helper that stops answering is killed rather than waited on: it is holding a
+master, and nothing it could still be doing is worth that.
 
 ## The minter registry
 
