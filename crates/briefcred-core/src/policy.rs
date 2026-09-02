@@ -72,7 +72,9 @@ action GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS in [http]
 pub const METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 
 /// Whether a policy decision is enforced or merely recorded.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyMode {
     /// A denial stops the request. The default, and the only safe default.

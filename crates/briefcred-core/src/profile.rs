@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -26,7 +27,7 @@ pub const DEFAULT_UNLOCK_CACHE_SECS: u64 = 300;
 ///
 /// Unknown keys are rejected at every level: a typo in a profile must fail
 /// loudly rather than silently disable a control.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     /// Profile name, as passed to `briefcred exec`.
@@ -84,13 +85,30 @@ pub struct Profile {
     pub proxy: ProxyMode,
 }
 
+/// The profile schema as a JSON Schema document, pretty-printed.
+///
+/// Generated from the same serde types the loader uses, so the reference in
+/// `docs/profile-schema.md` cannot describe a profile the loader would reject
+/// or omit a key it accepts. `briefcred profile schema` prints this, and a
+/// test asserts the committed document is the same text.
+///
+/// The schema is a description, not the validator: `Profile::from_yaml_str`
+/// remains the thing that decides whether a profile loads, because half of
+/// what it checks — that a `kind` resolves to a registered minter, that an
+/// `${minted.…}` template names a credential the profile declares, that the
+/// Cedar source compiles — is not expressible in JSON Schema at all.
+pub fn json_schema() -> String {
+    let schema = schemars::schema_for!(Profile);
+    serde_json::to_string_pretty(&schema).expect("a generated schema serialises")
+}
+
 /// A per-session token bucket: a sustained rate, a burst, and a hard cap.
 ///
 /// Charged one token per HTTP proxy request, per Postgres proxy connection, and
 /// per `briefcred exec` or `briefcred get` that mints. The bucket is created
 /// when the session opens and dies with it, so two concurrent runs of the same
 /// profile get a budget each rather than competing for one.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Quota {
     /// Tokens added per second, sustained. Must be greater than zero.
@@ -110,7 +128,7 @@ pub struct Quota {
 }
 
 /// When `briefcred exec` sets `HTTPS_PROXY` and friends for a profile.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyMode {
     /// Only when the profile declares at least one HTTP credential.
@@ -130,7 +148,7 @@ pub enum ProxyMode {
 }
 
 /// Per-profile unlock policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Unlock {
     /// The presence check to run. Defaults to [`UnlockPolicy::Biometric`].
@@ -165,7 +183,7 @@ fn default_unlock_cache_secs() -> u64 {
 }
 
 /// How the user proves presence.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum UnlockPolicy {
     /// Touch ID / Face ID, falling back to the device passcode.
@@ -178,7 +196,7 @@ pub enum UnlockPolicy {
 }
 
 /// One credential to mint for a profile.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialSpec {
     /// Name used in `${minted.<name>.<field>}` templates. Unique per profile.
@@ -197,7 +215,14 @@ pub struct CredentialSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_key: Option<String>,
     /// Minter-specific configuration, interpreted by the minter for `kind`.
+    ///
+    /// Described to JSON Schema as an arbitrary value, which is the honest
+    /// answer: what is legal in here is decided by the minter named in
+    /// [`CredentialSpec::kind`], and each one validates its own block when the
+    /// profile is loaded. A schema that guessed would be wrong for every
+    /// minter but one.
     #[serde(default)]
+    #[schemars(with = "serde_json::Value")]
     pub config: serde_yaml_ng::Value,
 }
 
@@ -218,7 +243,7 @@ fn default_ttl_secs() -> u64 {
 }
 
 /// Allowlists constraining the subprocess a profile may wrap.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExecPolicy {
     /// Permitted `argv[0]` values, matched literally. Empty means "any".

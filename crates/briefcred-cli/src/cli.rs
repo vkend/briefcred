@@ -142,6 +142,12 @@ pub enum ProfileAction {
     },
     /// Fetch every registry in daemon.toml, verifying as it goes.
     Sync,
+    /// Print the profile schema as a JSON Schema document.
+    ///
+    /// Generated from the types the loader itself uses, so it cannot drift
+    /// from what a profile may contain. `docs/profile-schema.md` is this
+    /// output with prose around it, and a test keeps the two the same.
+    Schema,
 }
 
 /// The `briefcred ca` subcommands.
@@ -328,6 +334,10 @@ the daemon reloads profiles by itself; 'briefcred profiles' will show it"
             signing::verify(&file, &public_key).map(|()| 0)
         }
         ProfileAction::Sync => signing::sync(paths).await,
+        ProfileAction::Schema => {
+            println!("{}", briefcred_core::profile::json_schema());
+            Ok(0)
+        }
     }
 }
 
