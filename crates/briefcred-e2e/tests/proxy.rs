@@ -11,6 +11,11 @@
 //! **real** key attached, that the upstream never sees the token, and that the
 //! policy, the revocation, and the proof checks all hold on the wire.
 
+// Beside this file rather than in `tests/` itself: a `tests/grpc.rs` would be
+// a second test binary, and everything here shares one daemon fixture.
+#[path = "proxy/grpc.rs"]
+mod grpc;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,6 +133,8 @@ struct Seen {
 struct Upstream {
     ca_pem: String,
     port: u16,
+    /// The gRPC server, on a third listener behind the same certificate.
+    grpc: grpc::Server,
     /// The WebSocket server's own port, which is a separate listener.
     ws_port: u16,
     seen: Arc<std::sync::Mutex<Vec<Seen>>>,
@@ -188,6 +195,7 @@ async fn start_upstream() -> Upstream {
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     let (ws_port, ws_seen, ws_accepting) = start_ws_upstream(acceptor.clone()).await;
+    let grpc = grpc::start(&leaf).await;
     let recorded = Arc::clone(&seen);
     let stamped = Arc::clone(&last_event_sent);
     let accepting = tokio::spawn(async move {
@@ -310,6 +318,7 @@ async fn start_upstream() -> Upstream {
     Upstream {
         ca_pem: ca.cert_pem().to_string(),
         port,
+        grpc,
         ws_port,
         seen,
         last_event_sent,
@@ -397,6 +406,8 @@ struct ProxyClient {
     briefcred_ca: String,
     upstream_port: u16,
     ws_port: u16,
+    /// The gRPC server's port, which is a third listener.
+    grpc_port: u16,
 }
 
 impl ProxyClient {
@@ -789,6 +800,7 @@ async fn start_with(profile_yaml: &str) -> Fixture {
         briefcred_ca,
         upstream_port: upstream.port,
         ws_port: upstream.ws_port,
+        grpc_port: upstream.grpc.port,
     };
     Fixture {
         daemon,
@@ -1261,6 +1273,7 @@ async fn an_event_stream_ends_when_its_grant_is_revoked() {
             briefcred_ca: fixture.client.briefcred_ca.clone(),
             upstream_port: fixture.client.upstream_port,
             ws_port: fixture.client.ws_port,
+            grpc_port: fixture.client.grpc_port,
         };
         let token = fixture.token.clone();
         tokio::spawn(async move { client.events("/forever", &bearer(&token)).await })
@@ -1807,13 +1820,19 @@ async fn http2_through_the_proxy(
     )
     .await
     .unwrap();
-    (sender, tokio::spawn(async move { let _ = connection.await; }))
+    (
+        sender,
+        tokio::spawn(async move {
+            let _ = connection.await;
+        }),
+    )
 }
 
 #[tokio::test]
 async fn an_http2_client_reaches_the_upstream_with_the_real_key() {
     let fixture = start("enforce").await;
-    let (mut sender, driver) = http2_through_the_proxy(&fixture.client, fixture.upstream.port).await;
+    let (mut sender, driver) =
+        http2_through_the_proxy(&fixture.client, fixture.upstream.port).await;
 
     // Two streams on the one connection, which is the thing HTTP/1.1 could not
     // have done and the reason the connection row exists at all.
@@ -1881,7 +1900,8 @@ async fn an_http2_client_reaches_the_upstream_with_the_real_key() {
 #[tokio::test]
 async fn an_http2_stream_the_policy_refuses_is_still_a_stream_on_the_connection() {
     let fixture = start("enforce").await;
-    let (mut sender, driver) = http2_through_the_proxy(&fixture.client, fixture.upstream.port).await;
+    let (mut sender, driver) =
+        http2_through_the_proxy(&fixture.client, fixture.upstream.port).await;
 
     let request = hyper::Request::builder()
         .method("GET")
@@ -1945,4 +1965,268 @@ async fn an_http1_client_is_unaffected_and_gets_no_connection_row() {
         !rows.iter().any(|row| row["event"] == "proxy_h2_connection"),
         "no connection row without an HTTP/2 connection"
     );
+}
+
+// --------------------------------------------------------------------- gRPC
+
+/// A profile permitting the test service's methods and nothing else.
+///
+/// `POST` and a path prefix, because that is what a gRPC call is: the method is
+/// always `POST` and the service and method names are the path. Written out
+/// rather than left wide open, so the tests prove a gRPC stream goes through
+/// the same Cedar evaluation every other request does.
+fn grpc_profile() -> String {
+    format!(
+        "\
+name: openai
+unlock:
+  policy: none
+credentials:
+  - name: openai
+    kind: http-bearer
+    ttl_secs: 300
+policy_mode: enforce
+policy: |
+  permit(principal, action == Action::\"POST\", resource)
+  when {{ resource.host == \"{UPSTREAM_HOST}\" &&
+    resource.path like \"/briefcred.test.Echo/*\" }};
+env:
+  OPENAI_API_KEY: ${{minted.openai.TOKEN}}
+"
+    )
+}
+
+#[tokio::test]
+async fn all_four_grpc_call_shapes_work_through_the_proxy() {
+    let fixture = start_with(&grpc_profile()).await;
+    let transport =
+        grpc::through_the_proxy(&fixture.client, fixture.upstream.grpc.port, &fixture.token).await;
+
+    let unary = grpc::call_unary(&transport, "Unary", "one")
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+    assert_eq!(unary.text, "echo: one");
+
+    let server_stream = grpc::call_server_stream(&transport, "s").await.unwrap();
+    assert_eq!(server_stream, ["s 1", "s 2", "s 3", "s 4", "s 5"]);
+
+    let client_stream = grpc::call_client_stream(&transport, &["a", "b", "c"])
+        .await
+        .unwrap();
+    assert_eq!(client_stream.text, "a,b,c");
+
+    let bidi = grpc::call_bidi(&transport, &["x", "y"]).await.unwrap();
+    assert_eq!(bidi, ["echo: x", "echo: y"]);
+
+    // Every call arrived with the real key and never the synthetic token.
+    let seen = fixture.upstream.grpc.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    for authorization in &seen {
+        assert_eq!(
+            authorization.as_deref(),
+            Some(format!("Bearer {REAL_KEY}").as_str()),
+            "the gRPC server must see the real key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_grpc_call_that_fails_carries_its_status_back_in_the_trailers() {
+    let fixture = start_with(&grpc_profile()).await;
+    let transport =
+        grpc::through_the_proxy(&fixture.client, fixture.upstream.grpc.port, &fixture.token).await;
+
+    let refused = grpc::call_unary(&transport, "Failing", "one")
+        .await
+        .expect_err("the method always fails");
+    assert_eq!(refused.code(), grpc::REFUSED, "{refused}");
+    assert_eq!(refused.message(), "the vendor said no");
+}
+
+#[tokio::test]
+async fn the_grpc_status_trailer_arrives_after_the_body_and_not_in_the_headers() {
+    let fixture = start_with(&grpc_profile()).await;
+    let tls = fixture
+        .client
+        .tunnel_with_alpn(fixture.upstream.grpc.port, &[b"h2"])
+        .await
+        .unwrap();
+    let (mut sender, connection) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(tls),
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let ok = grpc::call_raw(&mut sender, &fixture.token, "Unary", "one").await;
+    assert_eq!(ok.status, 200, "{}", fixture.daemon.log());
+    assert_eq!(ok.content_type.as_deref(), Some("application/grpc"));
+    assert!(ok.body_len > 0, "the response carried no message");
+    let trailers = ok
+        .trailers
+        .as_ref()
+        .expect("a trailer frame after the body");
+    assert_eq!(
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("0"),
+        "grpc-status must arrive after the body, not with the headers"
+    );
+    assert!(
+        ok.headers.get("grpc-status").is_none(),
+        "a call that answered must not put its status in the headers"
+    );
+
+    let refused = grpc::call_raw(&mut sender, &fixture.token, "Failing", "one").await;
+    assert_eq!(
+        refused.status, 200,
+        "a gRPC failure is an HTTP success with a status trailer"
+    );
+    assert_eq!(grpc::grpc_status(&refused), Some(grpc::REFUSED as i32));
+    // A unary handler that fails answers Trailers-Only, so the status and the
+    // message are in the single HEADERS frame rather than in a trailer.
+    assert_eq!(
+        refused
+            .headers
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
+        // Percent-encoded, which is how gRPC puts a message in a header.
+        Some("the%20vendor%20said%20no")
+    );
+}
+
+/// How many concurrent calls the multiplexing test makes.
+const CONCURRENT_CALLS: usize = 8;
+
+#[tokio::test]
+async fn concurrent_grpc_calls_share_one_upstream_connection() {
+    let fixture = start_with(&grpc_profile()).await;
+    let transport =
+        grpc::through_the_proxy(&fixture.client, fixture.upstream.grpc.port, &fixture.token).await;
+
+    let calls = (0..CONCURRENT_CALLS).map(|n| {
+        let transport = transport.clone();
+        async move { grpc::call_unary(&transport, "Unary", &n.to_string()).await }
+    });
+    let answers = futures_util::future::join_all(calls).await;
+    for (n, answer) in answers.into_iter().enumerate() {
+        assert_eq!(
+            answer
+                .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()))
+                .text,
+            format!("echo: {n}")
+        );
+    }
+
+    assert_eq!(
+        fixture
+            .upstream
+            .grpc
+            .accepts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "{CONCURRENT_CALLS} concurrent streams must be multiplexed onto one \
+         upstream connection, not dialled one at a time"
+    );
+
+    // And every one of them is still its own row, decided on its own.
+    assert!(proxy_row_written(&fixture.daemon).await);
+    briefcred_e2e::daemon_harness::wait_until(Duration::from_secs(10), || async {
+        fixture
+            .daemon
+            .audit_rows()
+            .iter()
+            .filter(|row| row["event"] == "proxy_request")
+            .count()
+            == CONCURRENT_CALLS
+    })
+    .await;
+    let rows = fixture.daemon.audit_rows();
+    let requests: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"] == "proxy_request")
+        .collect();
+    assert_eq!(requests.len(), CONCURRENT_CALLS, "one row per stream");
+    for request in requests {
+        assert_eq!(request["decision"], "allow");
+        assert_eq!(request["method"], "POST");
+        assert!(request["connection_id"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn a_grpc_method_the_policy_does_not_permit_never_reaches_the_upstream() {
+    let fixture = start_with(&grpc_profile()).await;
+    let transport =
+        grpc::through_the_proxy(&fixture.client, fixture.upstream.grpc.port, &fixture.token).await;
+
+    // A different service, so the path does not match the policy's prefix.
+    let mut grpc_client = tonic::client::Grpc::with_origin(
+        transport.clone(),
+        format!("https://{UPSTREAM_HOST}").parse().unwrap(),
+    );
+    let refused = grpc_client
+        .unary(
+            tonic::Request::new(grpc::Echo {
+                text: "one".to_string(),
+            }),
+            "/briefcred.other.Echo/Unary".parse().unwrap(),
+            tonic_prost::ProstCodec::<grpc::Echo, grpc::Echo>::default(),
+        )
+        .await
+        .expect_err("the policy does not permit this service");
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{refused}");
+    assert!(
+        fixture.upstream.grpc.seen.lock().unwrap().is_empty(),
+        "a denied stream must not reach the gRPC server at all"
+    );
+}
+
+/// How many unary calls each side of the latency comparison makes.
+const LATENCY_CALLS: usize = 200;
+
+#[tokio::test]
+async fn the_proxy_costs_less_than_a_tenth_of_the_direct_latency() {
+    let fixture = start_with(&grpc_profile()).await;
+    let direct = grpc::direct(fixture.upstream.grpc.port, &fixture.upstream.ca_pem).await;
+    let proxied =
+        grpc::through_the_proxy(&fixture.client, fixture.upstream.grpc.port, &fixture.token).await;
+
+    // One call each first, so neither measurement pays for a connection that
+    // the other had already made.
+    grpc::call_unary(&direct, "Unary", "warm").await.unwrap();
+    grpc::call_unary(&proxied, "Unary", "warm")
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+
+    let measure = |transport: &grpc::Transport| {
+        let transport = transport.clone();
+        async move {
+            let started = std::time::Instant::now();
+            for n in 0..LATENCY_CALLS {
+                grpc::call_unary(&transport, "Unary", &n.to_string())
+                    .await
+                    .unwrap();
+            }
+            started.elapsed() / LATENCY_CALLS as u32
+        }
+    };
+    let direct_each = measure(&direct).await;
+    let proxied_each = measure(&proxied).await;
+
+    // A ratio with an absolute allowance on top. On loopback a call is tens of
+    // microseconds, so a debug build's scheduling jitter is a larger share of
+    // it than the proxy is; without the two milliseconds this asserts the
+    // machine's timer noise rather than briefcred's overhead.
+    let budget = direct_each.mul_f64(1.10) + Duration::from_millis(2);
+    assert!(
+        proxied_each <= budget,
+        "proxied {proxied_each:?} per call against direct {direct_each:?}, \
+         budget {budget:?} over {LATENCY_CALLS} calls"
+    );
+    println!("gRPC unary: direct {direct_each:?}, proxied {proxied_each:?}");
 }
