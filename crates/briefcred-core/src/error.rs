@@ -51,6 +51,12 @@ pub enum Error {
     #[error("postgres: {0}")]
     Postgres(String),
 
+    /// An SSH key, certificate, or revocation list could not be handled.
+    ///
+    /// Carries what went wrong with the material, never the material itself.
+    #[error("ssh: {0}")]
+    Ssh(String),
+
     /// TLS could not be configured for an outbound database connection.
     #[error("tls: {0}")]
     Tls(String),

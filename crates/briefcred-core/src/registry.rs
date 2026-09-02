@@ -16,6 +16,27 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::traits::Minter;
 
+/// Where the daemon runs a minter.
+///
+/// The default is [`Hosting::Helper`], and it is the default because it is the
+/// safe answer: a minter that opens a connection with a master credential gets
+/// an address space of its own, so a bug in its parser costs one backend
+/// rather than every master the daemon holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Hosting {
+    /// The daemon spawns `briefcred-helper-<kind>` and speaks to it over
+    /// stdio. The master credential crosses that pipe and never enters the
+    /// daemon's own memory for longer than it takes to write it.
+    Helper,
+    /// The daemon runs the minter in its own process.
+    ///
+    /// Only correct for a minter that talks to no backend, because the master
+    /// is then resident in the daemon. `ssh-cert` is the one that qualifies:
+    /// it signs a certificate and writes two files, and a helper would buy
+    /// nothing but the cost of a process.
+    Daemon,
+}
+
 /// One registered minter kind and the function that builds it.
 ///
 /// Submitted with [`inventory::submit!`]; see `CONTRIBUTING.md`, "Adding a
@@ -23,6 +44,8 @@ use crate::traits::Minter;
 pub struct MinterFactory {
     /// The `kind` string a profile's credential spec selects this minter with.
     pub kind: &'static str,
+    /// Where the daemon runs this minter. Almost always [`Hosting::Helper`].
+    pub hosting: Hosting,
     /// Build a minter from a credential spec's `config` block.
     ///
     /// Must validate the config and return [`Error::MinterConfig`] rather than
@@ -61,6 +84,11 @@ impl Registry {
     /// Whether `kind` is registered.
     pub fn contains(&self, kind: &str) -> bool {
         self.factories.contains_key(kind)
+    }
+
+    /// Where the daemon must run `kind`, or `None` if nothing registered it.
+    pub fn hosting(&self, kind: &str) -> Option<Hosting> {
+        self.factories.get(kind).map(|factory| factory.hosting)
     }
 
     /// Build the minter for `kind` from `config`.

@@ -266,6 +266,7 @@ macro_rules! client_of {
 inventory::submit! {
     crate::registry::MinterFactory {
         kind: KIND,
+        hosting: crate::registry::Hosting::Helper,
         build: |config| {
             PostgresConfig::from_value(config)?;
             Ok(std::sync::Arc::new(PostgresDynamicMinter::new()))

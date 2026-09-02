@@ -35,7 +35,7 @@ pub use ca::CertificateAuthority;
 pub use error::{Error, Result};
 pub use keystore::{KeyStore, KeystoreKind};
 pub use profile::Profile;
-pub use registry::{MinterFactory, Registry};
+pub use registry::{Hosting, MinterFactory, Registry};
 pub use source::SourceKind;
 pub use traits::{MasterSource, Minter};
 pub use types::{
