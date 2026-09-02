@@ -120,6 +120,8 @@ pub struct Metrics {
     proxy_latency: Mutex<Histogram>,
     pgproxy_connections: Mutex<BTreeMap<String, u64>>,
     pgproxy_bytes: Mutex<BTreeMap<&'static str, u64>>,
+    quota_saturation: Mutex<BTreeMap<String, f64>>,
+    quota_rejections: Mutex<BTreeMap<(String, String), u64>>,
 }
 
 /// The direction labels on `briefcred_pgproxy_bytes_total`.
@@ -146,7 +148,42 @@ impl Metrics {
             proxy_latency: Mutex::new(Histogram::default()),
             pgproxy_connections: Mutex::new(BTreeMap::new()),
             pgproxy_bytes: Mutex::new(PGPROXY_DIRECTIONS.iter().map(|name| (*name, 0)).collect()),
+            quota_saturation: Mutex::new(BTreeMap::new()),
+            quota_rejections: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Record how full a profile's quota bucket is *not*, from 0 to 1.
+    ///
+    /// Updated on every charge, so the value is what the most recent session of
+    /// that profile saw. Deliberately not seeded: a series that exists is a
+    /// profile somebody put a `quota:` on, and one that does not is a profile
+    /// running unmetered — which is a distinction worth being able to make from
+    /// a dashboard.
+    ///
+    /// Keyed by profile rather than by session, because a session identifier is
+    /// unbounded cardinality and a per-session gauge would be a metric that
+    /// grows without limit for as long as the daemon runs.
+    pub fn record_quota_saturation(&self, profile: &str, saturation: f64) {
+        self.quota_saturation
+            .lock()
+            .expect("metrics mutex")
+            .insert(profile.to_string(), saturation);
+    }
+
+    /// Count one charge a quota refused, by profile and by surface.
+    ///
+    /// `surface` is `http`, `postgres`, or `exec`. Which one matters: the same
+    /// bucket is spent by all three, so a profile whose rejections are all
+    /// `exec` is one whose burst is too small for how often it is run, and one
+    /// whose rejections are all `http` is an agent in a loop.
+    pub fn record_quota_rejection(&self, profile: &str, surface: &str) {
+        *self
+            .quota_rejections
+            .lock()
+            .expect("metrics mutex")
+            .entry((profile.to_string(), surface.to_string()))
+            .or_insert(0) += 1;
     }
 
     /// Record one connection through the Postgres proxy, by how it ended.
@@ -347,6 +384,28 @@ impl Metrics {
         for (direction, count) in self.pgproxy_bytes.lock().expect("metrics mutex").iter() {
             out.push_str(&format!(
                 "briefcred_pgproxy_bytes_total{{direction=\"{direction}\"}} {count}\n"
+            ));
+        }
+
+        out.push_str(
+            "# HELP briefcred_quota_saturation How full a profile's session quota is, 0 to 1, where 1 is empty.\n",
+        );
+        out.push_str("# TYPE briefcred_quota_saturation gauge\n");
+        for (profile, saturation) in self.quota_saturation.lock().expect("metrics mutex").iter() {
+            out.push_str(&format!(
+                "briefcred_quota_saturation{{profile=\"{profile}\"}} {saturation}\n"
+            ));
+        }
+
+        out.push_str(
+            "# HELP briefcred_quota_rejections_total Charges a quota refused, by profile and surface.\n",
+        );
+        out.push_str("# TYPE briefcred_quota_rejections_total counter\n");
+        for ((profile, surface), count) in
+            self.quota_rejections.lock().expect("metrics mutex").iter()
+        {
+            out.push_str(&format!(
+                "briefcred_quota_rejections_total{{profile=\"{profile}\",surface=\"{surface}\"}} {count}\n"
             ));
         }
         out
