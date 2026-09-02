@@ -116,6 +116,8 @@ pub struct Metrics {
     mint_duration: Mutex<Histogram>,
     revoke_duration: Mutex<Histogram>,
     revoke_failures: Mutex<BTreeMap<String, u64>>,
+    proxy_requests: Mutex<BTreeMap<(String, String), u64>>,
+    proxy_latency: Mutex<Histogram>,
 }
 
 impl Metrics {
@@ -132,7 +134,35 @@ impl Metrics {
             mint_duration: Mutex::new(Histogram::default()),
             revoke_duration: Mutex::new(Histogram::default()),
             revoke_failures: Mutex::new(BTreeMap::new()),
+            proxy_requests: Mutex::new(BTreeMap::new()),
+            proxy_latency: Mutex::new(Histogram::default()),
         }
+    }
+
+    /// Record one request that crossed the HTTP proxy.
+    ///
+    /// `decision` is the policy outcome — `allow`, `deny`, or `would_deny` —
+    /// and `status_class` is the upstream's status rounded to its class
+    /// (`2xx`, `4xx`, …) or `none` where the request never reached an upstream.
+    /// The class rather than the code: a per-code series would let a vendor's
+    /// error taxonomy decide how many series briefcred exports.
+    pub fn record_proxy_request(
+        &self,
+        decision: &str,
+        status: Option<u16>,
+        elapsed: std::time::Duration,
+    ) {
+        let class = status_class(status);
+        *self
+            .proxy_requests
+            .lock()
+            .expect("metrics mutex")
+            .entry((decision.to_string(), class.to_string()))
+            .or_insert(0) += 1;
+        self.proxy_latency
+            .lock()
+            .expect("metrics mutex")
+            .observe(decision, elapsed.as_secs_f64());
     }
 
     /// Record how long one mint took, successful or not.
@@ -232,7 +262,41 @@ impl Metrics {
                 "briefcred_revoke_failures_total{{kind=\"{kind}\"}} {count}\n"
             ));
         }
+
+        out.push_str(
+            "# HELP briefcred_proxy_requests_total Requests through the HTTP proxy, by policy decision and status class.\n",
+        );
+        out.push_str("# TYPE briefcred_proxy_requests_total counter\n");
+        for ((decision, class), count) in self.proxy_requests.lock().expect("metrics mutex").iter()
+        {
+            out.push_str(&format!(
+                "briefcred_proxy_requests_total{{decision=\"{decision}\",status_class=\"{class}\"}} {count}\n"
+            ));
+        }
+
+        self.proxy_latency.lock().expect("metrics mutex").render(
+            "briefcred_proxy_latency_seconds",
+            "Time taken by one proxied request, by policy decision.",
+            &mut out,
+        );
         out
+    }
+}
+
+/// The status class a code belongs to, or `none` where there is no code.
+///
+/// A request denied by policy never reaches an upstream, so it has no status
+/// at all; giving it a class of its own keeps "briefcred refused this" and
+/// "the vendor refused this" from being the same series.
+fn status_class(status: Option<u16>) -> &'static str {
+    match status {
+        Some(code) if (100..200).contains(&code) => "1xx",
+        Some(code) if (200..300).contains(&code) => "2xx",
+        Some(code) if (300..400).contains(&code) => "3xx",
+        Some(code) if (400..500).contains(&code) => "4xx",
+        Some(code) if (500..600).contains(&code) => "5xx",
+        Some(_) => "other",
+        None => "none",
     }
 }
 
@@ -331,6 +395,50 @@ mod tests {
         assert!(text.contains("briefcred_ipc_requests_total{request=\"status\"} 1"));
         assert!(text.contains("briefcred_ipc_requests_total{request=\"shutdown\"} 0"));
         assert!(text.contains("briefcred_audit_write_errors_total 3"));
+    }
+
+    #[test]
+    fn a_proxied_request_appears_with_its_decision_and_status_class() {
+        let metrics = Metrics::new(Arc::new(AtomicU64::new(0)));
+        metrics.record_proxy_request("allow", Some(200), Duration::from_millis(30));
+        metrics.record_proxy_request("allow", Some(201), Duration::from_millis(30));
+        metrics.record_proxy_request("deny", None, Duration::from_millis(1));
+        metrics.record_proxy_request("would_deny", Some(503), Duration::from_millis(1));
+
+        let text = metrics.render();
+        assert!(
+            text.contains(
+                "briefcred_proxy_requests_total{decision=\"allow\",status_class=\"2xx\"} 2"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "briefcred_proxy_requests_total{decision=\"deny\",status_class=\"none\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "briefcred_proxy_requests_total{decision=\"would_deny\",status_class=\"5xx\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("briefcred_proxy_latency_seconds_count{kind=\"allow\"} 2"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn every_status_maps_to_the_class_it_belongs_to() {
+        assert_eq!(status_class(None), "none");
+        assert_eq!(status_class(Some(100)), "1xx");
+        assert_eq!(status_class(Some(204)), "2xx");
+        assert_eq!(status_class(Some(301)), "3xx");
+        assert_eq!(status_class(Some(429)), "4xx");
+        assert_eq!(status_class(Some(503)), "5xx");
+        assert_eq!(status_class(Some(999)), "other");
     }
 
     #[test]

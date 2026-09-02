@@ -95,6 +95,26 @@ pub async fn run() -> Result<()> {
         eprintln!("briefcred-daemon: resuming {outstanding} revoke(s) left by an earlier run");
     }
 
+    // The proxy is bound before the socket, for the same reason the metrics
+    // listener is: a daemon that is answering `exec` but has no proxy to send
+    // the token it just issued through is worse than one that failed to start.
+    let bound_proxy = if config.proxy_enabled {
+        let (listener, addr) = proxy::listener::bind(config.proxy_port)
+            .map_err(|e| Error::io("bind the proxy listener on", paths.root(), e))?;
+        // The key store is opened but not read: see `ProxyIssuer`, which loads
+        // the signing key on the first token rather than at startup, so a
+        // daemon nobody proxies through never prompts for keychain access.
+        let store = config.ca.open_keystore(&paths)?;
+        let issuer = proxy::issuer::ProxyIssuer::open(store, format!("http://{addr}"));
+        let upstream = proxy::tls::client_config(config.upstream_roots.as_deref())?;
+        Some((listener, addr, issuer, upstream))
+    } else {
+        None
+    };
+    let issuer = bound_proxy
+        .as_ref()
+        .map(|(_, _, issuer, _)| Arc::clone(issuer));
+
     let paths = Arc::new(paths);
     let listener = server::bind(paths.sock())?;
     let (shutdown, _) = tokio::sync::watch::channel(false);
@@ -113,6 +133,7 @@ pub async fn run() -> Result<()> {
         revokes: Arc::clone(&revokes),
         raw_args: config.audit.raw_args,
         mcp_query_timeout: config.mcp_query_timeout(),
+        proxy: issuer.clone(),
     }));
 
     // Sweep before the first row is written, so a log left behind by a much
@@ -134,6 +155,14 @@ pub async fn run() -> Result<()> {
         tokio::spawn(metrics::serve(
             metrics_listener,
             Arc::clone(&metrics),
+            state.shutdown_signal(),
+        ));
+    }
+    if let Some((proxy_listener, addr, issuer, upstream)) = bound_proxy {
+        eprintln!("briefcred-daemon: http proxy on http://{addr}");
+        tokio::spawn(proxy::listener::serve(
+            proxy_listener,
+            proxy::listener::Proxy::new(Arc::clone(&state), issuer, upstream),
             state.shutdown_signal(),
         ));
     }
@@ -179,6 +208,7 @@ pub async fn run() -> Result<()> {
         Arc::new(QueueRevoker {
             helpers: Arc::new(helper::MinterSet::new(helper_dirs.clone())),
             masters: Arc::clone(&master_source),
+            proxy: issuer,
         }),
         state.audit_handle(),
         Arc::clone(&metrics),
@@ -244,6 +274,14 @@ pub async fn run() -> Result<()> {
 struct QueueRevoker {
     helpers: Arc<helper::MinterSet>,
     masters: Arc<dyn briefcred_core::MasterSource>,
+    /// The proxy's token authority, when the proxy is running.
+    ///
+    /// Revoking an `http-*` credential is the daemon deciding to stop
+    /// honouring a token it signed, so it happens here rather than at a
+    /// backend. A queue entry for one that outlives a proxy-less restart is
+    /// reported as failed rather than silently dropped — see
+    /// [`crate::exec::revoke_one`].
+    proxy: Option<Arc<proxy::issuer::ProxyIssuer>>,
 }
 
 #[async_trait::async_trait]
@@ -253,7 +291,7 @@ impl revoke::Revoker for QueueRevoker {
             Ok(master) => master,
             Err(err) => return briefcred_core::RevokeOutcome::failed(err.to_string()),
         };
-        crate::exec::revoke_one(&self.helpers, entry, &master).await
+        crate::exec::revoke_one(&self.helpers, entry, &master, self.proxy.as_deref()).await
     }
 
     /// Stop every helper this pass started, so none holds a master while the

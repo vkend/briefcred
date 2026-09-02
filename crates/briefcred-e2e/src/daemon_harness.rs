@@ -44,6 +44,27 @@ pub struct Daemon {
     binaries: PathBuf,
 }
 
+/// Add the port overrides every test needs, unless the test set them itself.
+///
+/// A daemon started by a test must not bind either of the real ports: two test
+/// binaries run concurrently, and one of them would lose the race to whichever
+/// daemon the developer actually has installed.
+fn with_ephemeral_ports(config: &str) -> String {
+    let mut config = config.to_string();
+    for line in ["metrics_port = 0", "proxy_port = 0"] {
+        let key = line.split_whitespace().next().expect("a key");
+        if !config
+            .lines()
+            .any(|existing| existing.trim_start().starts_with(key))
+        {
+            config.push('\n');
+            config.push_str(line);
+        }
+    }
+    config.push('\n');
+    config
+}
+
 impl Daemon {
     /// Lay out a home directory without starting anything.
     ///
@@ -55,7 +76,11 @@ impl Daemon {
         for dir in ["profiles", "secrets", "audit", "state", "ca", "logs"] {
             std::fs::create_dir_all(home.path().join(dir)).expect("home layout");
         }
-        std::fs::write(home.path().join("daemon.toml"), daemon_toml).expect("daemon.toml");
+        std::fs::write(
+            home.path().join("daemon.toml"),
+            with_ephemeral_ports(daemon_toml),
+        )
+        .expect("daemon.toml");
         Daemon {
             home,
             child: None,

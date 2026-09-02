@@ -73,7 +73,11 @@ fn status_without_a_daemon_says_how_to_start_one_and_exits_three() {
 #[test]
 fn status_against_a_running_daemon_reports_its_health() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("daemon.toml"), "metrics_port = 0\n").unwrap();
+    std::fs::write(
+        temp.path().join("daemon.toml"),
+        "metrics_port = 0\nproxy_port = 0\n",
+    )
+    .unwrap();
     let _daemon = start_daemon(temp.path());
 
     let output = briefcred(temp.path(), &["daemon", "status"]);

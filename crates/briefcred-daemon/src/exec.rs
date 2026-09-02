@@ -33,7 +33,32 @@ use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
 use crate::helper::MinterSet;
+use crate::proxy::issuer::ProxyIssuer;
 use crate::revoke::PendingRevoke;
+
+/// The session context an HTTP credential is minted against.
+///
+/// Only the proxy kinds need it, and only they can use it: a synthetic token
+/// names the session it was issued to, and no minter that runs behind the
+/// [`briefcred_core::Minter`] contract has any way to know what that is.
+#[derive(Clone, Copy)]
+pub struct ProxyGrant<'a> {
+    /// The daemon's token authority.
+    pub issuer: &'a ProxyIssuer,
+    /// The session the tokens are issued to.
+    pub session_id: &'a str,
+    /// The client's per-session public key, when it offered one.
+    pub session_pubkey: Option<&'a [u8; 32]>,
+}
+
+impl std::fmt::Debug for ProxyGrant<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyGrant")
+            .field("session_id", &self.session_id)
+            .field("bound_to_a_session_key", &self.session_pubkey.is_some())
+            .finish()
+    }
+}
 
 /// What one `Exec` produced.
 pub struct Minted {
@@ -71,6 +96,16 @@ pub enum ExecError {
     /// The environment could not be composed.
     #[error(transparent)]
     Env(#[from] briefcred_core::exec::EnvError),
+
+    /// An HTTP credential was reached on a path that has no session to bind to.
+    ///
+    /// Every real caller passes a [`ProxyGrant`]; this is what a future one
+    /// that forgot sees, instead of a token nobody can present.
+    #[error("credential `{credential}` is served by the HTTP proxy, which this request has no session for")]
+    NoProxyGrant {
+        /// The credential that could not be issued.
+        credential: String,
+    },
 
     /// The session has no master filed under a credential's `source_key`.
     ///
@@ -131,8 +166,9 @@ pub async fn mint(
     pid: u32,
     raw_args: bool,
     metrics: &crate::metrics::Metrics,
+    proxy: Option<ProxyGrant<'_>>,
 ) -> Result<Minted, ExecError> {
-    let mut minted = mint_only(profile, specs, masters, helpers, trust, metrics).await?;
+    let mut minted = mint_only(profile, specs, masters, helpers, trust, metrics, proxy).await?;
     minted.rows.push(AuditEntry::ExecStart {
         ts: OffsetDateTime::now_utc(),
         session_id: session_id.to_string(),
@@ -160,11 +196,13 @@ pub async fn mint_only(
     helpers: &MinterSet,
     trust: &BTreeMap<String, String>,
     metrics: &crate::metrics::Metrics,
+    proxy: Option<ProxyGrant<'_>>,
 ) -> Result<Minted, ExecError> {
     let mut rows: Vec<AuditEntry> = Vec::new();
     let mut summaries: Vec<MintSummary> = Vec::new();
     let mut fields: MintedFields = MintedFields::new();
     let mut pending: Vec<PendingRevoke> = Vec::new();
+    let registry = briefcred_core::Registry::discover();
 
     for spec in specs {
         let master = masters
@@ -177,7 +215,22 @@ pub async fn mint_only(
         // succeeded or not: a backend that takes thirty seconds to refuse is
         // exactly what the histogram has to show.
         let started = std::time::Instant::now();
-        let outcome = mint_one(profile, spec, master, helpers).await;
+        // An HTTP credential is not minted at a backend at all: the daemon
+        // signs a token for it and keeps the real key in the session. It is
+        // still timed and audited exactly like the others, because from the
+        // profile's point of view it is one more credential this run produced.
+        let outcome = if registry.is_proxy(&spec.kind) {
+            match proxy {
+                Some(grant) => issue_http(profile, spec, grant),
+                None => {
+                    return Err(ExecError::NoProxyGrant {
+                        credential: spec.name.clone(),
+                    })
+                }
+            }
+        } else {
+            mint_one(profile, spec, master, helpers).await
+        };
         metrics.record_mint(&spec.kind, started.elapsed());
 
         match outcome {
@@ -220,6 +273,85 @@ pub async fn mint_only(
     })
 }
 
+/// What one credential's mint produced: its summary, its field values, and the
+/// entry that will take it away again.
+type MintOutcome = (
+    MintSummary,
+    BTreeMap<String, Zeroizing<String>>,
+    PendingRevoke,
+);
+
+/// Issue one HTTP credential's synthetic token.
+///
+/// The same shape as [`mint_one`] so the loop above does not care which it
+/// called, but nothing here talks to a backend: the "principal" is a signed
+/// statement, and the real key stays in the session's master map where the
+/// proxy will look it up when a request arrives carrying this token.
+fn issue_http(
+    profile: &Profile,
+    spec: &CredentialSpec,
+    grant: ProxyGrant<'_>,
+) -> Result<MintOutcome, String> {
+    // Parsed rather than assumed: reaching here means the registry said this
+    // kind is the proxy's, and a config that does not resolve to a kind is a
+    // profile that should not have loaded.
+    briefcred_core::minters::http::HttpKind::parse(&spec.kind, &spec.config)
+        .ok_or_else(|| format!("`{}` is not an HTTP credential kind", spec.kind))?
+        .map_err(|e| e.to_string())?;
+
+    let config = to_json(&spec.config)?;
+    let mint_id = MintId::generate();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let issued = grant
+        .issuer
+        .issue(
+            grant.session_id,
+            grant.session_pubkey,
+            &spec.name,
+            spec.ttl_secs,
+            now,
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut values: BTreeMap<String, Zeroizing<String>> = BTreeMap::new();
+    values.insert(
+        briefcred_core::minters::http::TOKEN_FIELD.to_string(),
+        issued.token.clone(),
+    );
+    values.insert(
+        briefcred_core::minters::http::PROXY_URL_FIELD.to_string(),
+        Zeroizing::new(grant.issuer.proxy_url().to_string()),
+    );
+
+    Ok((
+        MintSummary {
+            credential: spec.name.clone(),
+            mint_id: mint_id.as_str().to_string(),
+            fields: values
+                .iter()
+                .map(|(name, value)| (name.clone(), SecretString::from(value.clone())))
+                .collect(),
+        },
+        values,
+        PendingRevoke {
+            mint_id,
+            kind: spec.kind.clone(),
+            profile: profile.name.clone(),
+            credential: spec.name.clone(),
+            source_key: spec.source_key().to_string(),
+            config,
+            // The session, so the revoke knows which grant to retire. Not a
+            // secret — session ids are already in every audit row — but it
+            // rides in the field a minter's opaque state uses, which is the
+            // one the queue already redacts and never logs.
+            revoke_token: grant.session_id.to_string(),
+            expires_at_unix_ms: issued.expires_at.saturating_mul(1_000),
+            attempts: 0,
+            not_before_unix_ms: 0,
+        },
+    ))
+}
+
 /// Mint one credential through its helper.
 ///
 /// The failure type is a plain string because every caller treats it the same
@@ -229,14 +361,7 @@ async fn mint_one(
     spec: &CredentialSpec,
     master: &Zeroizing<String>,
     helpers: &MinterSet,
-) -> Result<
-    (
-        MintSummary,
-        BTreeMap<String, Zeroizing<String>>,
-        PendingRevoke,
-    ),
-    String,
-> {
+) -> Result<MintOutcome, String> {
     let config = to_json(&spec.config)?;
     let mint_id = MintId::generate();
 
@@ -322,12 +447,34 @@ async fn mint_one(
     ))
 }
 
-/// Ask a helper to revoke one entry.
+/// Retire one entry: through its helper, or through the proxy's issuer.
+///
+/// `issuer` is consulted only for the proxy's own kinds. Revoking one of those
+/// is not a call to a backend — there is nothing out there to remove — it is
+/// the daemon deciding to stop honouring a token it signed, which is why it
+/// cannot fail and why the outcome is always `revoked`.
 pub async fn revoke_one(
     helpers: &MinterSet,
     entry: &PendingRevoke,
     master: &Zeroizing<String>,
+    issuer: Option<&ProxyIssuer>,
 ) -> RevokeOutcome {
+    if briefcred_core::Registry::discover().is_proxy(&entry.kind) {
+        let Some(issuer) = issuer else {
+            return RevokeOutcome::failed(format!(
+                "`{}` is served by the HTTP proxy, which is not running",
+                entry.kind
+            ));
+        };
+        // `revoke_token` is the session the grant was issued to; see
+        // `issue_http`.
+        issuer.revoke(
+            &entry.revoke_token,
+            &entry.credential,
+            entry.expires_at_unix_ms / 1_000,
+        );
+        return RevokeOutcome::Revoked;
+    }
     // The queue persists a credential's config as JSON; a minter reads YAML,
     // and an in-daemon one is built from it. Every JSON document is a YAML
     // document, so a config that does not survive this was never valid.

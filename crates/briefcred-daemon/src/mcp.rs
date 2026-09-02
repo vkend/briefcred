@@ -593,6 +593,11 @@ impl McpServer {
             helpers.as_ref(),
             &trust,
             self.inner.state.metrics(),
+            // No proxy grant: an MCP tool call runs inside the daemon and
+            // spawns nothing, so there is no subprocess to hand a synthetic
+            // token to. A profile mixing `http-*` credentials with an MCP tool
+            // is told so rather than silently given a token it cannot use.
+            None,
         )
         .await
         .map_err(|e| internal(e.to_string()))?;

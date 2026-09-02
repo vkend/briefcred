@@ -20,6 +20,27 @@ struct Daemon {
     home: tempfile::TempDir,
 }
 
+/// Add the port overrides every test needs, unless the test set them itself.
+///
+/// A daemon started by a test must not bind either of the real ports: two test
+/// binaries run concurrently, and one of them would lose the race to whichever
+/// daemon the developer actually has installed.
+fn with_ephemeral_ports(config: &str) -> String {
+    let mut config = config.to_string();
+    for line in ["metrics_port = 0", "proxy_port = 0"] {
+        let key = line.split_whitespace().next().expect("a key");
+        if !config
+            .lines()
+            .any(|existing| existing.trim_start().starts_with(key))
+        {
+            config.push('\n');
+            config.push_str(line);
+        }
+    }
+    config.push('\n');
+    config
+}
+
 impl Daemon {
     fn start(config: &str) -> Daemon {
         Daemon::start_with(config, |_| {})
@@ -38,7 +59,11 @@ impl Daemon {
     /// minted private key lands somewhere the test can watch and clean up.
     fn start_with_env(config: &str, env: &[(&str, &Path)], populate: impl FnOnce(&Path)) -> Daemon {
         let home = tempfile::tempdir().unwrap();
-        std::fs::write(home.path().join("daemon.toml"), config).unwrap();
+        std::fs::write(
+            home.path().join("daemon.toml"),
+            with_ephemeral_ports(config),
+        )
+        .unwrap();
         populate(home.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_briefcred-daemon"));
         command.env("BRIEFCRED_HOME", home.path());
@@ -751,7 +776,7 @@ async fn a_headless_daemon_refuses_a_guarded_profile_and_reads_no_master() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join("daemon.toml"),
-        "metrics_enabled = false\nmaster_source = \"file\"\n",
+        with_ephemeral_ports("metrics_enabled = false\nmaster_source = \"file\"\n"),
     )
     .unwrap();
     write_profile(home.path(), "guarded.yaml", GUARDED_PROFILE);

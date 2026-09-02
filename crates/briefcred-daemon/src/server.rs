@@ -70,6 +70,7 @@ pub struct State {
     revokes: Arc<RevokeQueue>,
     raw_args: bool,
     mcp_query_timeout: Duration,
+    proxy: Option<Arc<crate::proxy::issuer::ProxyIssuer>>,
 }
 
 /// Everything [`State::new`] needs, as a struct.
@@ -106,6 +107,8 @@ pub struct StateParts {
     pub raw_args: bool,
     /// How long a `briefcred_db_query` statement may run.
     pub mcp_query_timeout: Duration,
+    /// The HTTP proxy's token authority, when the proxy is enabled.
+    pub proxy: Option<Arc<crate::proxy::issuer::ProxyIssuer>>,
 }
 
 impl State {
@@ -128,7 +131,13 @@ impl State {
             revokes: parts.revokes,
             raw_args: parts.raw_args,
             mcp_query_timeout: parts.mcp_query_timeout,
+            proxy: parts.proxy,
         }
+    }
+
+    /// The HTTP proxy's token authority, when the proxy is enabled.
+    pub fn proxy(&self) -> Option<&Arc<crate::proxy::issuer::ProxyIssuer>> {
+        self.proxy.as_ref()
     }
 
     /// The open sessions.
@@ -566,7 +575,28 @@ async fn handle_exec(request: Request, state: Arc<State>) -> Response {
             message: SessionError::NoSuchSession(session_id).to_string(),
         };
     };
-    let trust = briefcred_core::ca::trust_env(&state.paths, &profile);
+    let mut trust = briefcred_core::ca::trust_env(&state.paths, &profile);
+    // The proxy variables ride in alongside the trust environment because they
+    // are the same kind of thing: neither is a credential, both point the
+    // subprocess at briefcred, and the profile's own `env` block is applied
+    // afterwards so it can override either.
+    if let Some(issuer) = state.proxy() {
+        if profile.wants_proxy() {
+            trust.extend(crate::proxy::proxy_env(issuer.proxy_url()));
+        }
+    }
+
+    let session_pubkey = state
+        .sessions
+        .with_session(&session_id, |s| s.pubkey)
+        .await
+        .ok()
+        .flatten();
+    let grant = state.proxy().map(|issuer| crate::exec::ProxyGrant {
+        issuer,
+        session_id: &session_id,
+        session_pubkey: session_pubkey.as_ref(),
+    });
 
     let minted = crate::exec::mint(
         &profile,
@@ -580,6 +610,7 @@ async fn handle_exec(request: Request, state: Arc<State>) -> Response {
         pid,
         state.raw_args,
         state.metrics(),
+        grant,
     )
     .await;
 
@@ -1034,6 +1065,7 @@ mod tests {
             ),
             raw_args: false,
             mcp_query_timeout: Duration::from_secs(30),
+            proxy: None,
         }));
         (home, state, prompts)
     }
