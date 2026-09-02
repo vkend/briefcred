@@ -177,7 +177,9 @@ impl ScramClient {
         // Checked before anything is derived from it: the failure is about the
         // password's shape, and reporting it here rather than as a wrong
         // password is the difference between a fixable message and a mystery.
-        if !password.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        // Printable ASCII *including the space*: SASLprep is the identity over
+        // all of it, and a space is ordinary in a generated passphrase.
+        if !password.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
             return Err(ScramError::PasswordNotAscii);
         }
         Ok(ScramClient {
@@ -514,14 +516,18 @@ mod tests {
         // SASLprep would normalise these; briefcred does not implement it, and
         // hashing them raw would produce a wrong-password error the operator
         // could never act on.
-        for password in ["pass wörd", "pass word", "pen\tcil"] {
+        for password in ["pass wörd", "pen\tcil", "pencil\n", "pen\u{7f}cil"] {
             assert_eq!(
                 ScramClient::new(password).unwrap_err(),
                 ScramError::PasswordNotAscii,
                 "{password}"
             );
         }
-        assert!(ScramClient::new("p3nc!l~").is_ok());
+        // A space is printable ASCII and SASLprep leaves it alone, so a
+        // generated passphrase must not be refused for having one.
+        for password in ["p3nc!l~", "correct horse battery staple", " ", "a b"] {
+            assert!(ScramClient::new(password).is_ok(), "{password}");
+        }
     }
 
     #[test]
