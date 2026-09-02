@@ -57,6 +57,12 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **End-to-end coverage of the two shipped binaries.** `briefcred exec` is run
+  as a process against a real daemon and the child's actual environment is
+  asserted, along with the audit rows the run left; `briefcred-hook` is fed a
+  `PreToolUse` payload on stdin and its exact JSON is asserted for allow, deny,
+  ask, rewrite, and a compound line.
+
 - **TLS on the Postgres proxy's upstream connection.** The daemon now sends
   PostgreSQL's `SSLRequest` before the startup packet and refuses the
   connection if the server will not encrypt it, so the master password no

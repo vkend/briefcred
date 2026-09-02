@@ -892,6 +892,7 @@ version = "0.1.0"
 dependencies = [
  "briefcred-cli",
  "briefcred-core",
+ "briefcred-hook",
  "briefcred-proto",
  "futures-util",
  "getrandom 0.3.4",

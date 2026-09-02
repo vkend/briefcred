@@ -30,6 +30,7 @@ debug-heapscan = ["briefcred-proto/debug-heapscan"]
 
 [dev-dependencies]
 briefcred-cli = { path = "../briefcred-cli", version = "0.1.0" }
+briefcred-hook = { path = "../briefcred-hook", version = "0.1.0" }
 futures-util.workspace = true
 hex.workspace = true
 http-body-util.workspace = true
