@@ -8,6 +8,50 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **The `aws-sts` minter** (`briefcred-helper-sts`, binary
+  `briefcred-helper-aws-sts`): one `sts:AssumeRole` session per mint, with
+  `RoleSessionName` set to the mint id so every CloudTrail event resolves to a
+  briefcred audit row. Returns `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_SESSION_TOKEN`, and `AWS_REGION`. `source: static` reads the master as
+  `AKIA...:secret` and builds the client from that alone — no shared config
+  file, no environment, no instance metadata; `source: ambient` asks for the
+  SDK's default provider chain and has to be named explicitly. A session policy
+  over 2,048 plaintext characters is refused when the profile is loaded, before
+  anything is signed or sent. Revoke attaches one rolling inline policy per
+  role, `briefcred-revoke-older-sessions`, denying everything to sessions
+  issued before that instant, and reports `eventually_consistent` with a
+  five-second estimate. **This denies every session of the role, not only
+  briefcred's**; give briefcred a role nothing else uses. Tested against replayed
+  HTTP with the real signer, serialiser, and parser; a live test runs only under
+  `BRIEFCRED_AWS_LIVE=1`.
+- **The `ssh-cert` minter**: generates an ed25519 key pair, signs a user
+  certificate with the profile's CA, and writes both to a `0700` directory
+  under `$TMPDIR` with the key at `0600`. Returns `SSH_IDENTITY_FILE`,
+  `SSH_CERT_FILE`, and a ready-made `GIT_SSH_COMMAND`. Principals are required,
+  extensions default to `permit-pty`, and critical options such as
+  `source-address` are supported. Revoke deletes the key directory and appends
+  the serial to an OpenSSH key revocation list at `<home>/state/ssh-krl`, whose
+  format is checked against the real `ssh-keygen` in the test suite. The
+  reconciler sweeps key directories left by a killed daemon once their
+  certificate has expired. See `docs/ssh-krl.md` for what a revoke does and does
+  not achieve.
+- **Model Context Protocol tools**: `briefcred mcp` bridges an MCP client's
+  stdio to a server hosted inside the daemon, over a new `Request::Mcp` upgrade
+  that hands the socket over after one acknowledgement. Three tools —
+  `briefcred_list_profiles`, `briefcred_db_query { profile, sql, max_rows }`,
+  and `briefcred_exec { profile, argv }` — and **none of them returns a
+  credential**: the mint is created, used, and revoked inside the daemon. One
+  connection binds to one profile and mints once; closing it revokes. `exec`
+  enforces the profile's allowlists before minting and caps each output stream
+  at 1 MiB; `db_query` returns at most `max_rows` rows, 100 by default. Every
+  call writes an `mcp_call` audit row carrying an `mcp_call_id`, never the SQL
+  or the command line.
+- **`examples/profiles/kubectl-bastion.yaml`**: a worked profile reaching a
+  private Kubernetes cluster through an SSH bastion on a ten-minute
+  certificate, checked by a test that loads and validates every example.
+- **`briefcred_core::MinterAdapter`**: one implementation of "run a `Minter`
+  behind the helper protocol", shared by every helper binary and by the daemon.
+
 - **`briefcred exec`**: run a subprocess with freshly minted, short-lived
   credentials. Opens a session, enforces `exec.allow_argv0` and
   `exec.allow_args` *before* minting, mints through a helper process, spawns the
@@ -62,6 +106,21 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Changed
 
+- **`MinterFactory` splits `build` into `validate` and `construct`.** Every
+  binary that reads profiles must be able to reject a bad one, but only the
+  binary that mints needs the minter, so a minter whose implementation drags in
+  a vendor SDK registers its schema in `briefcred-core` with `construct: None`
+  and lives in its own crate. `aws-sts` is the first. `Registry::build` on such
+  a kind names the binary that mints it.
+- **`MinterFactory` gains `hosting`.** `Hosting::Helper` is the default and
+  means the daemon spawns `briefcred-helper-<kind>`; `Hosting::Daemon` means the
+  daemon runs the minter itself, and is correct only for a minter that talks to
+  no backend. `ssh-cert` is the only one, and the cost — the CA private key
+  resident in the daemon — is recorded in `THREAT_MODEL.md`.
+- The daemon's `HelperSet` is now `MinterSet` and holds `MintChannel`s, which a
+  helper process and an in-daemon minter both implement, so `exec` and
+  `reconcile` never branch on where a kind runs.
+- `briefcred-core` now depends on `briefcred-proto`, for `MinterAdapter` alone.
 - `briefcred get` no longer revokes the credential it just printed. `ExecDone`
   gained `hold_until_expiry`; `get` sets it, and the daemon schedules the first
   revoke attempt for the mint's own expiry, so the value is usable for its

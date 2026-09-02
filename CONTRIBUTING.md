@@ -69,10 +69,12 @@ Next to the implementation, in the same file:
 inventory::submit! {
     crate::registry::MinterFactory {
         kind: KIND,
-        build: |config| {
+        hosting: crate::registry::Hosting::Helper,
+        validate: |config| {
             MyConfig::from_value(config)?;
-            Ok(std::sync::Arc::new(MyMinter::new()))
+            Ok(())
         },
+        construct: Some(|| std::sync::Arc::new(MyMinter::new())),
     }
 }
 ```
@@ -80,22 +82,65 @@ inventory::submit! {
 `Registry::discover()` collects every submission the binary was linked with, so
 that is the whole registration.
 
-### The contract `build` must honour
+### The contract `validate` must honour
 
-- **Validate eagerly.** `build` receives the credential's `config` and is called
-  from `Profile::validate`, which the daemon runs when it loads the directory.
-  Parse the config and return `Error::MinterConfig` on anything wrong. A minter
-  that defers validation to the first mint turns a typo into a failure half an
-  hour later, in a different context, with a worse message.
+- **Validate eagerly.** `validate` receives the credential's `config` and is
+  called from `Profile::validate`, which the daemon runs when it loads the
+  directory. Parse the config and return `Error::MinterConfig` on anything
+  wrong. A minter that defers validation to the first mint turns a typo into a
+  failure half an hour later, in a different context, with a worse message.
+- **Check everything a backend would reject up front.** `aws-sts` refuses a
+  session policy over 2,048 characters here, because AWS refuses it after the
+  request has been signed with a message that names a percentage rather than
+  the limit.
 - **Never panic.** An invalid config is an `Err`, not an `unwrap`. A panic here
   takes down a profile reload.
-- **Do no I/O.** `build` runs on the profile-load path and must not connect to
-  anything. Reachability is a mint-time concern.
-- **Hold no secrets.** The master arrives in `MintCtx`, per mint. A minter that
-  captured one at build time would keep it resident for the daemon's whole life,
-  which is exactly what the session model exists to prevent.
-- **Be cheap and repeatable.** `build` is called once per credential on every
+- **Do no I/O.** `validate` runs on the profile-load path and must not connect
+  to anything. Reachability is a mint-time concern.
+- **Be cheap and repeatable.** It is called once per credential on every
   reload.
+
+### The contract `construct` must honour
+
+- **Hold no secrets.** The master arrives in `MintCtx`, per mint. A minter that
+  captured one at construction would keep it resident for the daemon's whole
+  life, which is exactly what the session model exists to prevent.
+- **Do no I/O**, for the same reason `validate` does none: it runs wherever a
+  minter is first needed, including on a profile-load path.
+
+### Choosing `hosting`
+
+`Hosting::Helper` unless you can argue otherwise, and the argument is narrow.
+A helper means the daemon spawns `briefcred-helper-<kind>` and the master
+credential crosses a pipe into an address space the daemon does not share, so a
+bug in your backend client library costs one backend rather than every master
+the daemon holds.
+
+`Hosting::Daemon` is correct only when the minter **talks to no backend at
+all**, because the master is then resident in the daemon for the length of a
+mint. `ssh-cert` qualifies: it signs a certificate and writes two files. If
+your minter opens a socket, it is a helper.
+
+Both shapes answer the same `MintChannel` trait, so nothing above the registry
+branches on which you chose, and changing your mind later is a one-line edit to
+this registration.
+
+### When the implementation lives outside `briefcred-core`
+
+A minter that drags in a large vendor SDK does not belong in `briefcred-core`,
+because the CLI and the hook would pay for it to use none of it. Split it:
+
+- The **schema** — the `KIND` constant, the config struct, its validation, and
+  the `inventory::submit!` — goes in `briefcred-core/src/minters/`, with
+  `construct: None`. Every binary that reads profiles can then reject a bad one.
+- The **minter** goes in `crates/briefcred-helper-<crate>/`, and its binary
+  constructs it directly. Wrap it in `briefcred_core::MinterAdapter` and hand
+  that to `briefcred_proto::helper::serve_stdio`; do not write the protocol
+  conversion again.
+
+`aws-sts` is the worked example. `Registry::build` on a kind with no
+constructor reports which binary mints it, so the split cannot produce a
+confusing failure.
 
 ### What `mint` and `revoke` owe the caller
 
@@ -129,7 +174,8 @@ that is the whole registration.
 
 ### 5. Document it
 
-- A `## The <backend> minter` section in `README.md` with a worked profile.
+- A `## The <backend> minter` section in `README.md` with a worked profile, and
+  a row in the minter matrix above it.
 - A `CHANGELOG.md` entry under `## Unreleased`.
 - The residual risks in `THREAT_MODEL.md` if your backend adds any.
 
@@ -142,6 +188,13 @@ that is the whole registration.
 The table is asserted in a test to cover `Request::NAMES` exactly, in both
 directions, so forgetting either half fails the build rather than producing a
 request nothing answers.
+
+A request that takes the **connection** over rather than being answered once
+goes in `Request::UPGRADE_NAMES` instead of the dispatch table, and is handled
+in `serve_connection` before dispatch. `Request::Mcp` is the only one, and it
+exists because MCP is not request/response. The table's test excludes upgrade
+names in both directions, so an upgrade cannot quietly acquire a handler that
+could never run.
 
 Responses that carry data from the daemon's own types get a wire type of their
 own, the way `ProfileSummary` does. Serialising an internal type across the

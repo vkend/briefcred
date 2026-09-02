@@ -57,19 +57,24 @@ briefcred-daemon    the per-user daemon                              (Phase 1)
 briefcred-cli       the `briefcred` binary                           (Phase 1)
 briefcred-hook      the `briefcred-hook` agent shim                  (Phase 6)
 briefcred-helper-postgres  the PostgreSQL minting helper              (Phase 3)
+briefcred-helper-sts       the AWS STS minting helper                 (Phase 7)
 briefcred-e2e       test-only: Postgres and daemon harnesses, e2e tests
 ```
 
-`briefcred-helper-sts` joins them with the STS minter. A helper's **binary** is
+A helper's **binary** is
 named for the minter kind it serves rather than for its crate —
 `kind: postgres-dynamic` means `briefcred-helper-postgres-dynamic` — because
 the kind string is all the daemon holds when it goes looking, and a lookup table
 in between would be a third place for the name to drift. One crate can grow a
 second kind and a second binary.
 
-`briefcred-core` depends on nothing else in the workspace. Everything else
-depends on it. That is deliberate: the profile schema and the minter contract
-are the two things every other crate has to agree on.
+`briefcred-core` depends only on `briefcred-proto`, and does so for one module:
+`helper_adapter`, which runs a `Minter` behind the daemon-to-helper protocol.
+Three places need that conversion — each helper binary, and the daemon for the
+one kind it hosts itself — and a second copy of it would be a second chance to
+turn a refused revoke into a protocol error. Everything else depends on
+`briefcred-core`, because the profile schema and the minter contract are the
+two things every crate has to agree on.
 
 ## Module map inside `briefcred-core`
 
@@ -80,7 +85,8 @@ are the two things every other crate has to agree on.
 | `types` | `MintId`, `MintCtx`, `RevokeCtx`, `MintedCredential`, `RevokeOutcome`. |
 | `traits` | `MasterSource` and `Minter`. |
 | `audit` | `AuditEntry` and argument hashing. |
-| `minters` | Concrete minters, each registering itself with the registry. |
+| `minters` | Concrete minters, each registering itself with the registry. `aws_sts` registers only a schema; its minter is in `briefcred-helper-sts`. |
+| `helper_adapter` | One `Minter` behind the helper protocol, shared by every helper and by the daemon. |
 | `registry` | `MinterFactory` and the `inventory`-collected `Registry` that resolves a profile's `kind`. |
 | `source` | The `MasterSource` backends: keychain, file, and environment. |
 | `session_env` | Whether the calling process has a screen. Read by the daemon *and* the CLI. |
@@ -259,6 +265,11 @@ channel. `briefcred_proto::SecretString` is the one type in briefcred that is
 deliberately `Serialize`; it holds `Zeroizing<String>`, prints `<redacted>`,
 and appears nowhere but this wire and the `Minted` reply.
 
+A minter registered as `Hosting::Daemon` answers the same four methods from
+inside the daemon, through `MinterAdapter`. Nothing above the `MintChannel`
+trait knows the difference, so moving a minter into a helper — or out of one —
+is a change to its own registration and to nothing else.
+
 A helper that stops answering is killed rather than waited on: it is holding a
 master, and nothing it could still be doing is worth that. Replies are capped at
 the same 16 MiB the client socket enforces, so both of the daemon's inputs are
@@ -278,16 +289,67 @@ implementation:
 
 ```rust
 inventory::submit! {
-    MinterFactory { kind: KIND, build: |config| { /* validate, construct */ } }
+    MinterFactory {
+        kind: KIND,
+        hosting: Hosting::Helper,
+        validate: |config| { /* parse and check */ },
+        construct: Some(|| Arc::new(MyMinter::new())),
+    }
 }
 ```
 
 `Registry::discover()` collects whatever the binary was linked with, and
 `Profile::validate(&Registry)` resolves every credential's `kind` and calls its
-`build` with that credential's `config`. Both failures therefore happen when
+`validate` with that credential's `config`. Both failures therefore happen when
 the profile is loaded, while the user is still looking at the file, rather than
 at the first mint. An unknown kind names every kind that *is* registered, which
-is the only thing that makes the message actionable. See `CONTRIBUTING.md`.
+is the only thing that makes the message actionable.
+
+`validate` and `construct` are separate for two reasons, each with a minter
+that needs it.
+
+**Every binary that reads a profile must be able to reject a bad one, but only
+the binary that mints needs the minter.** `aws-sts` drags in the AWS SDK, which
+the daemon, the CLI, and the hook would otherwise pay for to use none of it. So
+`briefcred-core` registers `aws-sts` with a `validate` and `construct: None`,
+and `briefcred-helper-aws-sts` constructs the minter directly. A daemon asked
+to build one says which binary mints it rather than pretending it cannot.
+
+**`hosting` says whether the daemon spawns a helper or runs the minter
+itself.** `Hosting::Helper` is the default and the safe answer;
+`Hosting::Daemon` is correct only for a minter that talks to no backend, since
+the master is then resident in the daemon. `ssh-cert` is the only one. Both
+shapes answer the same `MintChannel` trait in the daemon, so `exec` and
+`reconcile` never branch on which they have. See `CONTRIBUTING.md`.
+
+## The MCP upgrade
+
+Everything on the daemon's socket is one framed request and one framed reply,
+answered from a dispatch table. `Request::Mcp` is the exception, and it is the
+exception because MCP is not request/response: a server sends notifications
+nothing asked for, and a client sends notifications that get no reply.
+
+```
+briefcred mcp                           daemon
+  |-- frame: {"request":"mcp"} ----------->|
+  |<-- frame: {"response":"mcp_ready"} ----|
+  |=== newline-delimited JSON-RPC =========|   (until either end closes)
+```
+
+After the acknowledgement the daemon stops framing and hands the stream to the
+MCP server. `serve_connection` intercepts an upgrade before the dispatch table,
+which is why `dispatch_table()` covers `Request::NAMES` *minus*
+`Request::UPGRADE_NAMES` and a test asserts exactly that: a handler for `mcp`
+could never run, so having one would be a lie about the protocol.
+
+The CLI's half is a byte pump with no understanding of MCP at all. Parsing the
+JSON-RPC there would be a second framing implementation that has to agree with
+the daemon's, and wrapping each message in a request/response pair would mean
+inventing replies for notifications that have none.
+
+The socket is still mode `0600` in a `0700` directory and the peer's uid is
+still checked before the upgrade request is read, so the boundary is unchanged.
+What changes is capability, which `THREAT_MODEL.md` states.
 
 ## Sessions, and where the dangerous state lives
 

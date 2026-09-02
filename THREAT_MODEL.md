@@ -336,3 +336,118 @@ the audit log.
 - The revoke queue gives up after eight attempts. A backend that is unreachable
   for longer leaves a principal behind until the reconciler's next sweep, which
   is bounded by the profile's `ttl_secs` in how long that principal is useful.
+
+
+## The three additions in Phase 7, and what each one costs
+
+### AWS STS: revoke is blunt and late
+
+STS sessions cannot be withdrawn. AWS provides no call that ends a set of
+temporary credentials early, and the technique the console's "Revoke sessions"
+button uses — the one briefcred uses — is to attach an inline policy to the
+**role** denying everything to any session issued before a chosen instant.
+
+Two consequences, and neither can be engineered away:
+
+- **It is collective.** Revoking one briefcred mint denies every session of
+  that role issued before now, including sessions belonging to other people and
+  other tools. The mitigation is operational, not technical: give briefcred a
+  role nothing else assumes. `README.md` says so where an operator will read it
+  before configuring one.
+- **It is late.** IAM is eventually consistent and AWS publishes no bound. The
+  outcome is `eventually_consistent` with a five-second estimate, and the audit
+  row records the estimate, so "the credential may have kept working for five
+  seconds" is written down rather than assumed. A session used by a service
+  that cached its credentials may keep working longer than that.
+
+If the master lacks `iam:PutRolePolicy` on the role, revoke reports `failed`
+and the session simply runs to its `duration_secs`. That is why
+`duration_secs` should be the shortest the work tolerates: it is the only
+bound that does not depend on a second permission.
+
+### SSH certificates: revocation depends on your servers
+
+A signed certificate cannot be recalled. briefcred's revoke does the half it
+owns — it deletes the private key from the machine, immediately — and records
+the certificate's serial in an OpenSSH key revocation list at
+`<home>/state/ssh-krl`. The second half only exists on servers an operator has
+pointed at that file with `RevokedKeys`, and briefcred cannot do that for them:
+it runs on a laptop and has no credentials for the fleet.
+
+So:
+
+- A certificate copied off the machine before the revoke works on every server
+  that has not received the updated KRL, until its `valid_before`. **The TTL is
+  the control; the KRL is the backstop.**
+- `RevokedKeys` is checked at authentication. A session already established is
+  unaffected by a revoke, however promptly the KRL is distributed.
+- The KRL is written with a wildcard CA, so a serial revokes a certificate from
+  any authority. Serials are random 64-bit values, so this over-revokes with
+  negligible probability, and it errs towards refusing.
+- `docs/ssh-krl.md` is the operator-facing version of all of this, including
+  what an acceptable distribution lag looks like.
+
+The `ssh-cert` minter also runs **inside the daemon** rather than in a helper,
+because it opens no connection and a helper would buy only the cost of a
+process. The cost is real and is stated here rather than buried: the CA private
+key is resident in the daemon's address space for the length of a mint, where a
+PostgreSQL master never is. A memory-disclosure bug in the daemon therefore
+exposes the CA key of any profile that minted during its life, and a CA key is
+strictly more valuable than any credential it signs — it mints more of them.
+Mitigations are the same as for every master: the session bounds how long it is
+held, `just mem-hygiene` checks that it really goes, and the daemon is a small
+program that parses nothing hostile.
+
+Minted keys live in `$TMPDIR/briefcred-<mint id>/`, mode `0700`, key file
+`0600`. A daemon killed mid-`exec` leaves one behind holding a usable key; the
+reconciler sweeps directories whose certificate has expired, so the window is
+bounded by `ttl_secs` rather than being unbounded, but it is not zero.
+
+### MCP: the widest grant briefcred makes
+
+`briefcred mcp` lets a model direct briefcred. That is a genuine expansion of
+what the daemon will do at somebody else's request, and it should be adopted
+deliberately.
+
+What it does **not** do is hand out credentials. `briefcred_db_query` and
+`briefcred_exec` are verbs: the credential is minted in the daemon, used there,
+and revoked there, and there is no value for an agent to put in a transcript, a
+context window, or a model provider's logs. Against the specific risk that
+motivates briefcred — a credential outliving the task and spreading — the MCP
+path is *stronger* than handing an agent a connection string, which is what
+these tools replace.
+
+What it does expand:
+
+- **`briefcred_exec` runs commands chosen by a model.** The only thing standing
+  between a prompt injection and an arbitrary command is the profile's
+  `exec.allow_argv0` and `exec.allow_args`. On a profile reachable over MCP,
+  those are not optional. An empty `allow_argv0` means "any program", which is
+  the wrong answer here even though it is a reasonable default elsewhere.
+- **`briefcred_db_query` runs SQL chosen by a model**, as the minted role. The
+  role's grants are the only bound: a `role_template` granting `ALL` on
+  everything means an agent can drop a table. Grant `SELECT`.
+- **The unlock gate runs once per connection, not per call.** An agent that has
+  been let in stays in for the life of the connection. That is the same bargain
+  `unlock.cache_secs` already makes, made once and held for as long as the MCP
+  client stays connected.
+- **Output reaches the model.** Query rows and command output are returned by
+  design, so a profile whose database contains secrets is a profile that can
+  read them out to a model. briefcred caps the volume (1 MiB per stream, 100
+  rows by default); it does not and cannot judge the content.
+
+What is bounded:
+
+- One connection binds to one profile and mints once. A tool call naming a
+  second profile is refused.
+- Closing the connection closes the session: the mints go on the revoke queue
+  and the helper processes stop, whether the client exited cleanly or was
+  killed.
+- The socket is unchanged — mode `0600` in a `0700` directory, peer uid checked
+  before the upgrade request is read. Only a process running as the same user
+  can reach the MCP server, which is the same boundary `briefcred exec` has.
+- Every call writes an `mcp_call` audit row with an `mcp_call_id`, the tool, the
+  profile, the mints, and the outcome. The SQL and the command line are **not**
+  recorded: they are exactly the free-form text the audit rules forbid, and a
+  `briefcred_exec` writes the same `argv[0]`-plus-digests `exec_start` row every
+  other exec does.

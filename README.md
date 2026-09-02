@@ -307,6 +307,7 @@ always run whatever you liked with it. `THREAT_MODEL.md` says this at length.
 | `briefcred audit [--since 24h] [--json]` | Audit rows, read straight off the disk so it works with the daemon stopped. |
 | `briefcred profile bootstrap` | An interactive interview that writes a profile and stores its master. |
 | `briefcred profile show <name>` | One profile, as the daemon parsed it. |
+| `briefcred mcp` | Serve the Model Context Protocol tools on stdin and stdout, for an agent. |
 
 `briefcred profile bootstrap` asks for the master credential **last**, after the
 unlock gate has said yes, and writes it straight to the platform key store. The
@@ -482,6 +483,20 @@ the socket at `$XDG_RUNTIME_DIR/briefcred/sock`.
 `BRIEFCRED_HOME` relocates the entire layout, socket included. Tests always set
 it, so they never touch real user directories.
 
+## Minters and where they run
+
+| `kind` | What it mints | Master (`source_key`) | Runs in |
+| --- | --- | --- | --- |
+| `postgres-dynamic` | A `LOGIN` role with a random password and a `VALID UNTIL` | The master role's password | `briefcred-helper-postgres-dynamic` |
+| `aws-sts` | An `sts:AssumeRole` session | `AKIA...:secret`, or the ambient chain | `briefcred-helper-aws-sts` |
+| `ssh-cert` | An OpenSSH user certificate and the key it belongs to | The CA private key, OpenSSH PEM | The daemon itself |
+
+The third column is not decoration. A minter that opens a network connection
+with a master credential gets a process of its own, so a bug in its parser
+costs one backend rather than every master the daemon holds. `ssh-cert` talks
+to nothing — it signs a certificate and writes two files — so a helper would
+buy only the cost of a process. `THREAT_MODEL.md` records what that costs.
+
 ## The PostgreSQL minter
 
 `briefcred_core::minters::PostgresDynamicMinter` mints a `LOGIN` role named
@@ -496,6 +511,141 @@ tests: `DROP OWNED BY` on its own is not a revoke when the master does not own
 schema `public`, which is the managed-PostgreSQL default. A revoke that cannot
 complete reports `RevokeOutcome::Failed` with the backend's SQLSTATE and
 message; a role that was already gone reports `AlreadyGone`.
+
+## The AWS STS minter
+
+Assumes a role and returns the session as `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, and `AWS_REGION`. The
+`RoleSessionName` is the mint id, so every CloudTrail event the session
+produces carries `briefcred_t_...` and resolves to a briefcred audit row rather
+than to a shared human.
+
+```yaml
+credentials:
+  - name: aws
+    kind: aws-sts
+    ttl_secs: 900
+    source_key: aws-briefcred
+    config:
+      role_arn: arn:aws:iam::123456789012:role/briefcred-dev
+      region: eu-west-1
+      duration_secs: 900
+      # Optional: an inline policy that can only take permissions away.
+      session_policy: |
+        {"Version":"2012-10-17","Statement":[
+          {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::reports/*"}]}
+```
+
+`source: static` (the default) reads the master as `AKIA...:secret`, split on
+the first colon, and builds the client from that and nothing else — no shared
+config file, no environment, no instance metadata. `source: ambient` asks for
+the SDK's default provider chain instead, which is weaker on purpose: whatever
+the chain finds is not in the key store and is not bounded by the session.
+
+A session policy over **2,048 plaintext characters** is refused when the
+profile is loaded rather than by AWS after the request has been signed, because
+AWS's own complaint names a percentage of a compressed budget rather than the
+limit you exceeded.
+
+> **Revoke is blunt, and it is blunt in a way you have to design around.**
+> STS sessions cannot be withdrawn. briefcred does what the console's "Revoke
+> sessions" button does: it attaches one rolling inline policy to the *role*,
+> named `briefcred-revoke-older-sessions`, denying everything to any session
+> issued before that moment. Revoking one briefcred mint therefore denies
+> **every** session of that role issued before now, including other people's.
+> Give briefcred a role nothing else uses. The outcome is reported as
+> `eventually_consistent` with a five-second estimate, because IAM is.
+
+Both `sts:AssumeRole` on the role and `iam:PutRolePolicy` on it are needed by
+the master credential; without the second, revoke reports `failed` and the
+session simply expires on its own.
+
+## The SSH certificate minter
+
+Generates a fresh ed25519 key pair, signs a user certificate for it with the
+profile's CA, and writes both into a `0700` directory under `$TMPDIR` with the
+key at `0600`. It returns `SSH_IDENTITY_FILE`, `SSH_CERT_FILE`, and a
+ready-made `GIT_SSH_COMMAND`.
+
+```yaml
+credentials:
+  - name: bastion
+    kind: ssh-cert
+    ttl_secs: 600
+    source_key: ssh-ca
+    config:
+      principals: [deploy]
+      extensions: [permit-pty, permit-port-forwarding]
+      critical_options:
+        source-address: "203.0.113.0/24"
+```
+
+The master is the CA private key in OpenSSH format **with no passphrase** —
+briefcred has no passphrase to give it, and the key is protected by the
+platform key store instead. Extensions default to `permit-pty` alone; a
+certificate needs `permit-port-forwarding` to open a tunnel, and asking for it
+explicitly is the point. `examples/profiles/kubectl-bastion.yaml` is a worked
+example of `kubectl` reaching a private cluster through a bastion this way.
+
+Revoke deletes the key directory and appends the certificate's serial to
+`<home>/state/ssh-krl`, an OpenSSH key revocation list. Deleting the key is
+immediate and is the half briefcred owns; the KRL only matters on servers you
+have pointed at it with `RevokedKeys`. **`docs/ssh-krl.md` is required reading
+before relying on this** — it explains what a revoke does and does not achieve,
+and why a short `ttl_secs` is doing most of the work.
+
+A daemon killed mid-`exec` leaves a key directory behind, so the reconciler
+sweeps `$TMPDIR/briefcred-*` for mints whose certificate has passed its
+`valid_before`. A directory whose certificate cannot be read is left alone.
+
+## Model Context Protocol tools
+
+`briefcred mcp` exposes briefcred to an agent as an MCP server. Point your
+client at it:
+
+```json
+{ "mcpServers": { "briefcred": { "command": "briefcred", "args": ["mcp"] } } }
+```
+
+The command itself does nothing but copy bytes: the server is the daemon, which
+is where the profiles, the session, the unlock gate and the helper processes
+already are. `briefcred mcp` connects to the socket, upgrades the connection,
+and pumps stdin and stdout through it.
+
+Three tools, and the shape of them is the whole idea:
+
+| Tool | What it takes | What it gives back |
+| --- | --- | --- |
+| `briefcred_list_profiles` | nothing | Profile names, credential kinds, TTLs, allowed commands |
+| `briefcred_db_query` | `profile`, `sql`, `max_rows` | Rows as JSON |
+| `briefcred_exec` | `profile`, `argv` | `stdout`, `stderr`, `exit_code` |
+
+**No tool returns a credential.** An agent handed a connection string has that
+string in a transcript, a context window, and a model provider's
+infrastructure, and briefcred's revoke is racing all of them. So the tools are
+verbs: the credential is minted in the daemon, used in the daemon, and revoked
+by the daemon, and there is never a value for the agent to leak.
+
+One MCP connection opens one session and mints once. A tool call naming a
+second profile is refused rather than opening a second session. When the
+connection closes — cleanly, or because the client was killed — the session
+closes with it and everything it minted goes on the revoke queue.
+
+`briefcred_exec` enforces `exec.allow_argv0` and `exec.allow_args` before
+anything is minted, exactly as `briefcred exec` does, and captures at most 1
+MiB of each stream, saying so when it truncates. `briefcred_db_query` runs one
+statement as the minted role and returns at most `max_rows` rows (100 by
+default, 10,000 at most). A column type briefcred cannot represent comes back
+as a note telling you to cast it to text.
+
+Every call writes an `mcp_call` audit row carrying an `mcp_call_id`, the tool,
+the profile, the mints it used, and the outcome — never the SQL or the command
+line, which are exactly the free-form text an audit row must not hold. A
+`briefcred_exec` also writes the same `exec_start` and `exec_end` rows a
+`briefcred exec` does.
+
+An MCP profile is the widest grant briefcred makes. `exec.allow_argv0` is not
+optional on one; see `THREAT_MODEL.md`.
 
 ## Helper processes
 
