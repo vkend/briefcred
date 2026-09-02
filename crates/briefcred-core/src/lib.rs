@@ -23,6 +23,7 @@ pub mod error;
 pub mod exec;
 pub mod helper_adapter;
 pub mod keystore;
+pub mod minisign;
 pub mod minters;
 pub mod paths;
 pub mod policy;

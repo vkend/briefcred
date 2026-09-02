@@ -83,6 +83,23 @@ pub enum Error {
     #[error("master source: {0}")]
     Master(String),
 
+    /// A signature, or the key material for one, could not be handled.
+    ///
+    /// Covers a malformed key file, a malformed `.minisig`, and a signature
+    /// that does not verify. Carries what is wrong with the material, never
+    /// the material: a signing key's bytes must not reach a log.
+    #[error("signature: {0}")]
+    Signature(String),
+
+    /// A profile registry could not be fetched or was not usable.
+    #[error("registry `{name}`: {message}")]
+    Registry {
+        /// The registry's name in `daemon.toml`.
+        name: String,
+        /// What went wrong.
+        message: String,
+    },
+
     /// The master source has nothing filed under this key.
     ///
     /// Separate from [`Error::Master`] because it is the one failure the user
