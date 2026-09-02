@@ -676,6 +676,15 @@ async fn handle_close_session(request: Request, state: Arc<State>) -> Response {
 /// was killed leaves mints behind, and a helper that outlives its session is a
 /// process still holding a master.
 pub async fn retire(state: &Arc<State>, session: Session, reason: &str) {
+    // Every upstream connection the proxy was holding for this session, whether
+    // or not it minted anything: a session that has ended will never send on
+    // one again, and a connection nothing will use is a socket held open at a
+    // vendor. The orphaned mints below revoke their own grants, which covers
+    // the same connections a second time; this covers the sessions that had
+    // nothing to revoke.
+    if let Some(issuer) = state.proxy() {
+        issuer.close_session(&session.id);
+    }
     let orphaned: Vec<_> = session.mints.values().cloned().collect();
     if !orphaned.is_empty() {
         eprintln!(

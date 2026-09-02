@@ -173,7 +173,8 @@ const PGPROXY_DIRECTIONS: [&str; 2] = ["client_to_server", "server_to_client"];
 /// Seeded at zero for the same reason the directions above are: "no WebSocket
 /// has ever been opened through this proxy" and "the series is missing" are
 /// different facts, and only one of them is worth waking somebody for.
-const PROXY_STREAM_KINDS: [&str; 2] = [
+const PROXY_STREAM_KINDS: [&str; 3] = [
+    crate::proxy::stream::KIND_H2,
     crate::proxy::stream::KIND_SSE,
     crate::proxy::stream::KIND_WS,
 ];

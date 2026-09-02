@@ -52,6 +52,18 @@ pub struct ProxyIssuer {
     signer: Mutex<Option<Arc<TokenSigner>>>,
     revocations: RevocationSet,
     proxy_url: String,
+    /// The HTTP proxy's cache of multiplexed upstream connections.
+    ///
+    /// Held here, and set once when the proxy is built, because this is the one
+    /// place in the daemon that learns a grant has stopped being one. A cached
+    /// upstream connection belongs to a `(session, credential)` pair, so the
+    /// moment that pair is revoked the connection has to go with it — and
+    /// making the revoke path ask the proxy for it would be a cycle between the
+    /// two.
+    ///
+    /// Absent when no proxy is running, which is every daemon whose profiles
+    /// declare no `http-*` credential.
+    upstreams: std::sync::OnceLock<Arc<crate::proxy::http2::Upstreams>>,
 }
 
 impl std::fmt::Debug for ProxyIssuer {
@@ -72,6 +84,7 @@ impl ProxyIssuer {
             signer: Mutex::new(None),
             revocations: RevocationSet::new(),
             proxy_url: proxy_url.into(),
+            upstreams: std::sync::OnceLock::new(),
         })
     }
 
@@ -126,9 +139,36 @@ impl ProxyIssuer {
         Ok(IssuedToken { token, expires_at })
     }
 
+    /// Attach the proxy's upstream connection cache, once, when it is built.
+    ///
+    /// Ignored if one is already attached: the proxy is built once per daemon,
+    /// and a second cache would be one nothing ever evicted from.
+    pub fn attach_upstreams(&self, upstreams: Arc<crate::proxy::http2::Upstreams>) {
+        let _ = self.upstreams.set(upstreams);
+    }
+
     /// Stop honouring `credential` for `sid`, up to `expires_at`.
+    ///
+    /// The cached upstream connection for that pair goes at the same moment.
+    /// Not for correctness on the next request — every request re-authorises
+    /// its token, so a revoked grant is refused whichever connection it arrives
+    /// on — but because a connection held open for a grant that no longer
+    /// exists is a socket to a vendor that nothing will ever use again.
     pub fn revoke(&self, sid: &str, credential: &str, expires_at: i64) {
         self.revocations.revoke(sid, credential, expires_at);
+        if let Some(upstreams) = self.upstreams.get() {
+            upstreams.close_grant(sid, credential);
+        }
+    }
+
+    /// Forget every upstream connection a session was holding.
+    ///
+    /// A session can end without a revoke — an idle timeout, or a client that
+    /// closed its handle — and its connections have to go then too.
+    pub fn close_session(&self, sid: &str) {
+        if let Some(upstreams) = self.upstreams.get() {
+            upstreams.close_session(sid);
+        }
     }
 
     /// Check a token and return its claims, or say why it is not acceptable.

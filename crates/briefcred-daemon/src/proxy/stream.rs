@@ -82,6 +82,14 @@ pub const KIND_SSE: &str = "sse";
 /// The `kind` label on a WebSocket row and its metric series.
 pub const KIND_WS: &str = "ws";
 
+/// The `kind` label on a long-lived HTTP/2 response and its metric series.
+///
+/// What a gRPC call is, and what any HTTP/2 response of unstated length is. One
+/// label rather than a `grpc` and a `h2-stream`, because the proxy cannot tell
+/// them apart without reading the body, and reading the body is the one thing
+/// it will not do.
+pub const KIND_H2: &str = "h2-stream";
+
 /// The longest field name [`EventCounter`] needs to recognise, `data:`.
 const DATA_FIELD: &[u8] = b"data:";
 
@@ -426,16 +434,55 @@ pub fn is_event_stream(headers: &hyper::header::HeaderMap) -> bool {
         })
 }
 
-/// An event-stream body: forwarded untouched, counted on the way past.
+/// What a live body counts as its frames go past.
+///
+/// Two shapes, because two kinds of stream reach [`LiveBody`] and only one of
+/// them has framing this proxy is willing to read.
+#[derive(Debug)]
+pub enum Framing {
+    /// Server-sent events: blocks that a blank line dispatched.
+    Events(EventCounter),
+    /// Anything else. Nothing is parsed and nothing is counted.
+    ///
+    /// A gRPC message is length-prefixed *inside* a `DATA` frame, so counting
+    /// messages would mean reading the call's own framing — one step from
+    /// reading its content, and a step this proxy does not take. The row's
+    /// `events_or_frames` is `0` and its byte counts are the whole story.
+    Opaque,
+}
+
+impl Framing {
+    fn push(&mut self, bytes: &[u8]) {
+        match self {
+            Framing::Events(counter) => counter.push(bytes),
+            Framing::Opaque => {}
+        }
+    }
+
+    fn events(&self) -> u64 {
+        match self {
+            Framing::Events(counter) => counter.events(),
+            Framing::Opaque => 0,
+        }
+    }
+}
+
+/// A long-lived response body: forwarded untouched, watched while it is open.
 ///
 /// Wrapping rather than collecting is the whole point of the type. Every frame
 /// the upstream produces is handed on in the same poll it arrived in, so a
 /// keep-alive comment reaches the client when it is sent rather than when the
-/// stream ends, and an event stream that runs for an hour costs one line
-/// scanner's worth of memory rather than an hour of events.
-pub struct EventStream<B> {
+/// stream ends, and a stream that runs for an hour costs one line scanner's
+/// worth of memory rather than an hour of events. A gRPC call's trailer frame
+/// passes through it the same way, unread.
+///
+/// The other half of the type is the watch. A body that is open is a grant
+/// still being spent, so expiry, revocation, or the session closing has to end
+/// it — otherwise a `briefcred exec` that finished would leave a bidirectional
+/// gRPC call delivering for as long as the client held it.
+pub struct LiveBody<B> {
     inner: B,
-    counter: EventCounter,
+    counter: Framing,
     /// Bytes of request body that went upstream, shared with the request body.
     bytes_up: Arc<AtomicU64>,
     /// Bytes of response body, shared with the `ProxyRequest` row's counter.
@@ -450,23 +497,29 @@ pub struct EventStream<B> {
     row: Option<StreamRow>,
 }
 
-impl<B> EventStream<B> {
+impl<B> LiveBody<B> {
     /// Wrap `inner`, watching `live` for as long as the stream is open.
     pub fn new(
         inner: B,
+        counter: Framing,
         row: StreamRow,
         bytes_up: Arc<AtomicU64>,
         bytes_down: Arc<AtomicU64>,
         watch: WatchHandle,
-    ) -> EventStream<B> {
-        EventStream {
+    ) -> LiveBody<B> {
+        LiveBody {
             inner,
-            counter: EventCounter::new(),
+            counter,
             bytes_up,
             bytes_down,
             stale: Some(watch),
             row: Some(row),
         }
+    }
+
+    /// What kind of stream this is, for the daemon's log.
+    fn kind(&self) -> &'static str {
+        self.row.as_ref().map_or(KIND_H2, |row| row.kind)
     }
 
     /// Write the row, if it has not been written already.
@@ -481,7 +534,7 @@ impl<B> EventStream<B> {
     }
 }
 
-impl<B> Body for EventStream<B>
+impl<B> Body for LiveBody<B>
 where
     B: Body<Data = Bytes> + Unpin,
 {
@@ -503,7 +556,10 @@ where
         if let Some(stale) = this.stale.as_mut() {
             match Pin::new(&mut stale.stale).poll(cx) {
                 Poll::Ready(Ok(reason)) => {
-                    eprintln!("briefcred-daemon: proxy closed a live event stream: {reason}");
+                    eprintln!(
+                        "briefcred-daemon: proxy closed a live {} stream: {reason}",
+                        this.kind()
+                    );
                     this.finish();
                     return Poll::Ready(None);
                 }
@@ -546,7 +602,7 @@ where
 }
 
 /// A client that walked away mid-stream still gets its row.
-impl<B> Drop for EventStream<B> {
+impl<B> Drop for LiveBody<B> {
     fn drop(&mut self) {
         self.finish();
     }

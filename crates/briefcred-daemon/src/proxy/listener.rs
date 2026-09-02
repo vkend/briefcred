@@ -164,7 +164,7 @@ pub struct Proxy {
     upstream_http1: Arc<rustls::ClientConfig>,
     /// One multiplexed upstream connection per session, credential, and
     /// destination, for the streams that negotiated HTTP/2.
-    upstreams: http2::Upstreams,
+    upstreams: Arc<http2::Upstreams>,
     policies: PolicyCache,
     ca: std::sync::Mutex<Option<Arc<CertificateAuthority>>>,
 }
@@ -186,12 +186,16 @@ impl Proxy {
         issuer: Arc<ProxyIssuer>,
         upstream: Arc<rustls::ClientConfig>,
     ) -> Arc<Proxy> {
+        // The issuer keeps a handle on the cache, because a revoke is the one
+        // event that has to reach it and the issuer is where a revoke lands.
+        let upstreams = Arc::new(http2::Upstreams::default());
+        issuer.attach_upstreams(Arc::clone(&upstreams));
         Arc::new(Proxy {
             state,
             issuer,
             upstream_http1: crate::proxy::tls::without_http2(&upstream),
             upstream,
-            upstreams: http2::Upstreams::default(),
+            upstreams,
             policies: PolicyCache::new(),
             ca: std::sync::Mutex::new(None),
         })
@@ -718,7 +722,25 @@ async fn forward(
     }
 
     let (mut parts, body) = response.into_parts();
-    let event_stream = stream::is_event_stream(&parts.headers);
+    // Which of the response bodies has to be watched while it is open, and what
+    // its row will call it.
+    //
+    // An event stream, by its content type, as it always has been. And on an
+    // HTTP/2 connection, **any** body whose length the upstream did not state:
+    // that is every gRPC call and every other streamed HTTP/2 response, and it
+    // is the only rule available, because HTTP/2 gives a proxy no way to know
+    // in advance whether a body will take a millisecond or an hour. Guessing
+    // "short" is the guess that leaves a revoked grant delivering.
+    let live_body = if stream::is_event_stream(&parts.headers) {
+        Some((
+            stream::KIND_SSE,
+            stream::Framing::Events(stream::EventCounter::new()),
+        ))
+    } else if connection.is_some() && parts.headers.get(hyper::header::CONTENT_LENGTH).is_none() {
+        Some((stream::KIND_H2, stream::Framing::Opaque))
+    } else {
+        None
+    };
     let resp_bytes = Arc::new(AtomicU64::new(0));
     let done = {
         let proxy = Arc::clone(&proxy);
@@ -763,11 +785,11 @@ async fn forward(
     };
     let counted = Counting::new(body, Arc::clone(&resp_bytes), Some(Box::new(done)));
 
-    // 8b. An ordinary response ends here. An event stream is the same streamed
-    // body with a scanner over it and a row of its own when it closes.
-    if !event_stream {
+    // 8b. A response of known length ends here. A long-lived one is the same
+    // streamed body with a watch over it and a row of its own when it closes.
+    let Some((kind, framing)) = live_body else {
         return Response::from_parts(parts, counted.boxed());
-    }
+    };
 
     // Whatever the upstream said the length was, it is not the length of what
     // the client is about to be sent: this body ends when the upstream stops,
@@ -777,7 +799,7 @@ async fn forward(
     let row = stream::StreamRow {
         state: Arc::clone(&proxy.state),
         mint_id: session.mint_id.clone(),
-        kind: stream::KIND_SSE,
+        kind,
         host,
         path,
         started: OffsetDateTime::now_utc(),
@@ -787,7 +809,7 @@ async fn forward(
     let watch = stream::watch(Arc::clone(&proxy.state), Arc::clone(&proxy.issuer), live);
     Response::from_parts(
         parts,
-        stream::EventStream::new(counted, row, req_bytes, resp_bytes, watch).boxed(),
+        stream::LiveBody::new(counted, framing, row, req_bytes, resp_bytes, watch).boxed(),
     )
 }
 
@@ -984,20 +1006,31 @@ async fn send_upstream(
 
     let dialled = proxy
         .upstreams
-        .connect(key, || dial(proxy, scheme, host, port))
+        .connect(key, || handshake_upstream(proxy, scheme, host, port))
         .await?;
     match dialled {
         http2::Dialled::Http2(mut sender) => {
-            // Connection-specific headers an HTTP/1.1 client may have sent are
-            // forbidden on an HTTP/2 stream, and an upstream that sees one
-            // resets the stream rather than answering it.
-            http2::strip_connection_specific(request.headers_mut());
             // HTTP/2 carries the destination in `:scheme` and `:authority`,
             // which hyper takes from the URI. Origin-form is an HTTP/1.1
             // spelling and leaves it with nothing to put there.
+            //
+            // The connection-specific headers an HTTP/1.1 client may have sent
+            // are hyper's to remove, and it does: it strips the four RFC 9110
+            // names, expands the `Connection:` list and removes what that names
+            // too, and keeps `te: trailers`. Doing it here as well would be the
+            // wrong order — removing `Connection` first would leave the headers
+            // it listed behind for the upstream to see.
             *request.uri_mut() = absolute_form(scheme, host, port, request.uri());
             http2::send_on(&mut sender, request).await
         }
+        // An upstream that does not offer `h2` cannot carry a gRPC call: gRPC
+        // is HTTP/2 by definition, and its trailers have no HTTP/1.1 spelling
+        // this proxy would relay. Refused with a reason rather than downgraded,
+        // because a downgrade produces a response the client cannot parse and
+        // an error that names neither cause.
+        http2::Dialled::Http1(_) if is_grpc(request.headers()) => Err(Error::Proxy(format!(
+            "`{host}` does not support HTTP/2 (required for gRPC)"
+        ))),
         http2::Dialled::Http1(mut sender) => sender
             .send_request(request)
             .await
@@ -1005,8 +1038,32 @@ async fn send_upstream(
     }
 }
 
+/// Whether a message is gRPC, from its `Content-Type`.
+///
+/// The media type prefix, because gRPC spells its subtypes with a `+`
+/// (`application/grpc+proto`) and a `-` (`application/grpc-web`), and every one
+/// of them needs trailers. Case-insensitive, because a `Content-Type` is.
+fn is_grpc(headers: &hyper::header::HeaderMap) -> bool {
+    headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let media = value.split(';').next().unwrap_or("").trim();
+            media.len() >= GRPC_MEDIA.len()
+                && media[..GRPC_MEDIA.len()].eq_ignore_ascii_case(GRPC_MEDIA)
+        })
+}
+
+/// The media type every gRPC content type starts with.
+const GRPC_MEDIA: &str = "application/grpc";
+
 /// Open one upstream connection and complete whichever handshake ALPN chose.
-async fn dial(proxy: &Proxy, scheme: &str, host: &str, port: u16) -> Result<http2::Dialled> {
+async fn handshake_upstream(
+    proxy: &Proxy,
+    scheme: &str,
+    host: &str,
+    port: u16,
+) -> Result<http2::Dialled> {
     let io = connect_upstream(proxy, scheme, host, port, false).await?;
     if io.http2 {
         let (sender, connection) =
@@ -1047,6 +1104,40 @@ enum UpstreamStream {
 /// `upgrades` picks the trust configuration that offers only `http/1.1`, so a
 /// WebSocket handshake cannot end up on a connection that negotiated HTTP/2.
 async fn connect_upstream(
+    proxy: &Proxy,
+    scheme: &str,
+    host: &str,
+    port: u16,
+    upgrades: bool,
+) -> Result<Connected> {
+    // The whole dial, TCP and TLS together, under one deadline. A host that
+    // accepts and then never finishes a handshake stalls exactly as long as one
+    // that never accepts at all, and both have to end: an HTTP/2 dial holds its
+    // key's slot while it runs, so an unbounded one would hold that grant's
+    // requests for as long as the client kept making them.
+    tokio::time::timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        dial_upstream(proxy, scheme, host, port, upgrades),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(Error::Proxy(format!(
+            "`{host}:{port}` did not answer within {} seconds",
+            UPSTREAM_CONNECT_TIMEOUT.as_secs()
+        )))
+    })
+}
+
+/// How long an upstream has to accept a connection and finish a handshake.
+///
+/// Ten seconds, which is long next to a working upstream and short next to a
+/// user waiting. There is no configuration knob because there is no second
+/// right answer: this is a bound on a hang, not a tuning parameter, and a
+/// vendor that needs longer than ten seconds to say hello is one whose request
+/// has already failed.
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn dial_upstream(
     proxy: &Proxy,
     scheme: &str,
     host: &str,
