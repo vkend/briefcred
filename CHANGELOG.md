@@ -43,9 +43,10 @@ All notable changes to briefcred are recorded here. The format follows
   credential**: the mint is created, used, and revoked inside the daemon. One
   connection binds to one profile and mints once; closing it revokes. `exec`
   enforces the profile's allowlists before minting and caps each output stream
-  at 1 MiB; `db_query` returns at most `max_rows` rows, 100 by default. Every
-  call writes an `mcp_call` audit row carrying an `mcp_call_id`, never the SQL
-  or the command line.
+  at 1 MiB; `db_query` streams and stops at `max_rows` (100 by default) and runs
+  under a `statement_timeout` of `mcp_query_timeout_secs` (30 by default).
+  Every call writes an `mcp_call` audit row carrying an `mcp_call_id`, never
+  the SQL or the command line.
 - **`examples/profiles/kubectl-bastion.yaml`**: a worked profile reaching a
   private Kubernetes cluster through an SSH bastion on a ten-minute
   certificate, checked by a test that loads and validates every example.

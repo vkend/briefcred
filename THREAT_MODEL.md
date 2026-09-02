@@ -450,4 +450,15 @@ What is bounded:
   profile, the mints, and the outcome. The SQL and the command line are **not**
   recorded: they are exactly the free-form text the audit rules forbid, and a
   `briefcred_exec` writes the same `argv[0]`-plus-digests `exec_start` row every
-  other exec does.
+  other exec does. A *failure* message is the subtle case, because a database's
+  complaint quotes the statement and a refused command names the argument that
+  was refused. Those go to the caller and not to the log: the row records the
+  SQLSTATE, or that the exec policy refused `argv[0]`.
+- One connection mints once, and the check and the mint happen under one lock,
+  so two tool calls arriving together cannot each open a session and leave one
+  of them with a live credential nothing closes.
+- Resource use is bounded at both ends of every tool. `max_rows` stops the
+  fetch rather than trimming a collected result set; `mcp_query_timeout_secs`
+  is enforced by the database as `statement_timeout`; and a command's output is
+  read through a cap that kills the child rather than buffering what it sends.
+  None of this makes a hostile prompt safe — it makes an expensive one bounded.

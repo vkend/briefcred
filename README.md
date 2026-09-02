@@ -638,11 +638,20 @@ statement as the minted role and returns at most `max_rows` rows (100 by
 default, 10,000 at most). A column type briefcred cannot represent comes back
 as a note telling you to cast it to text.
 
+A statement is bounded at both ends. `max_rows` stops the *fetch*, not just
+what is returned, so a `SELECT *` on a large table costs one page rather than
+the table; and `mcp_query_timeout_secs` in `daemon.toml` (30 seconds by
+default) is set as the connection's `statement_timeout`, so a runaway query is
+cancelled by the server rather than waited out by the daemon. A command that
+writes without stopping is killed at the output cap rather than buffered.
+
 Every call writes an `mcp_call` audit row carrying an `mcp_call_id`, the tool,
 the profile, the mints it used, and the outcome — never the SQL or the command
-line, which are exactly the free-form text an audit row must not hold. A
-`briefcred_exec` also writes the same `exec_start` and `exec_end` rows a
-`briefcred exec` does.
+line, which are exactly the free-form text an audit row must not hold. Where a
+failure quotes the caller's input back, the two are deliberately different
+strings: a rejected statement tells the caller `42P01: relation "salaries" does
+not exist` and tells the audit log only `42P01`. A `briefcred_exec` also writes
+the same `exec_start` and `exec_end` rows a `briefcred exec` does.
 
 An MCP profile is the widest grant briefcred makes. `exec.allow_argv0` is not
 optional on one; see `THREAT_MODEL.md`.
