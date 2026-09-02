@@ -7,8 +7,22 @@ license.workspace = true
 repository.workspace = true
 description = "The briefcred agent hook shim."
 
+[lib]
+name = "briefcred_hook"
+path = "src/lib.rs"
+
 [[bin]]
 name = "briefcred-hook"
 path = "src/main.rs"
 
 [dependencies]
+briefcred-core.workspace = true
+briefcred-proto.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt"] }
+
+[dev-dependencies]
+tempfile.workspace = true

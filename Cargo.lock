@@ -301,6 +301,16 @@ dependencies = [
 [[package]]
 name = "briefcred-hook"
 version = "0.1.0"
+dependencies = [
+ "briefcred-core",
+ "briefcred-proto",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "briefcred-proto"

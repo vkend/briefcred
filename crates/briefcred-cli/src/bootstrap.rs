@@ -217,7 +217,7 @@ fn ask_config(kind: &str) -> Result<Vec<(String, String)>> {
     let sslmodes = ["require", "prefer", "disable"];
     let sslmode = sslmodes[Select::new()
         .with_prompt("TLS")
-        .items(&sslmodes)
+        .items(sslmodes)
         .default(0)
         .interact()
         .map_err(prompt_failed)?];

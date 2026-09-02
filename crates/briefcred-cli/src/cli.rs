@@ -303,10 +303,7 @@ fn print_profiles(reply: &Response) {
         println!("no profiles; run 'briefcred profile bootstrap' to write one");
         return;
     }
-    println!(
-        "{:<20}{:<12}{:<8}{}",
-        "PROFILE", "UNLOCK", "CACHE", "CREDENTIALS"
-    );
+    println!("{:<20}{:<12}{:<8}CREDENTIALS", "PROFILE", "UNLOCK", "CACHE");
     for profile in profiles {
         let credentials = if profile.credentials.is_empty() {
             "-".to_string()
