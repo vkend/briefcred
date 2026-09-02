@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a failing test, because a CI failure is the one place
+  # nobody can re-run it locally with `RUST_BACKTRACE=1` and see for themselves.
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.os }}
+      # Both platforms, because half of briefcred is `cfg(target_os)`: the
+      # keychain, the biometric gate, and the socket-activation paths are all
+      # written twice, and only one of the two is ever exercised locally.
+      - run: cargo clippy --all-targets -- -D warnings
+
+  supply-chain:
+    name: cargo deny + cargo vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-vet
+      - run: cargo deny check
+      # `--locked` keeps this offline. `supply-chain/config.toml` imports no
+      # third-party audit sets, so the check is that the exemption list still
+      # covers the lockfile — which is exactly the thing a new dependency
+      # changes.
+      - run: cargo vet check --locked
+
+  test:
+    name: test (${{ matrix.os }}, PostgreSQL ${{ matrix.pg }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            pg: '16'
+          # The PG18 half of the matrix Phase 0 specified and nothing has run
+          # since. The minter emits SQL that PostgreSQL has changed under twice
+          # — `CREATE ROLE … VALID UNTIL`, and what `DROP OWNED BY` reaches —
+          # so "it works on the developer's PG14" is not evidence about 18.
+          - os: ubuntu-latest
+            pg: '18'
+          - os: macos-latest
+            pg: '16'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}-${{ matrix.pg }}
+
+      # The e2e harness starts its own throwaway cluster with `initdb` and
+      # `pg_ctl` on a free loopback port, so what CI has to provide is the
+      # PostgreSQL *server* binaries, not a running server. A service container
+      # would be the wrong shape: the harness would ignore it, `find_pg_bin`
+      # would find no `postgres` binary, and every Postgres test would skip
+      # while the job stayed green.
+      - name: Install PostgreSQL ${{ matrix.pg }} (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "postgresql-${{ matrix.pg }}"
+          echo "BRIEFCRED_PG_BIN=/usr/lib/postgresql/${{ matrix.pg }}/bin" >> "$GITHUB_ENV"
+
+      - name: Install PostgreSQL ${{ matrix.pg }} (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install "postgresql@${{ matrix.pg }}"
+          echo "BRIEFCRED_PG_BIN=$(brew --prefix)/opt/postgresql@${{ matrix.pg }}/bin" >> "$GITHUB_ENV"
+
+      # A cluster cannot be initialised by root, and the harness refuses to
+      # run one as a user it cannot write a data directory for. Failing here,
+      # loudly, beats every Postgres test skipping quietly.
+      - name: Check the server binaries are where the harness will look
+        run: |
+          test -x "$BRIEFCRED_PG_BIN/initdb"
+          test -x "$BRIEFCRED_PG_BIN/pg_ctl"
+          test -x "$BRIEFCRED_PG_BIN/postgres"
+          "$BRIEFCRED_PG_BIN/postgres" --version
+
+      # Before the tests, not as part of them. `cargo test` does not build a
+      # package's binaries unless a test target asks for them, so on a clean
+      # checkout the daemon and every `briefcred-helper-*` are simply absent
+      # and the end-to-end tests fail for a reason that looks nothing like the
+      # cause. The harness now refuses to start when one is missing; building
+      # first is what stops it having to.
+      - run: cargo build --workspace
+      - run: cargo test --workspace
