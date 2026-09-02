@@ -19,6 +19,7 @@ pub mod inproc;
 pub mod mcp;
 pub mod metrics;
 pub mod profiles;
+pub mod proxy;
 pub mod reconcile;
 pub mod revoke;
 pub mod server;

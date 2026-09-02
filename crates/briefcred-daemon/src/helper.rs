@@ -390,6 +390,21 @@ impl MinterSet {
                 config,
                 &self.registry,
             )?),
+            // The proxy's own kinds never get here: `crate::exec` handles them
+            // before it reaches for a channel. Reaching this arm means a new
+            // caller forgot to, and a helper binary that does not exist is a
+            // far more confusing way to find that out than being told.
+            Some(Hosting::Proxy) => {
+                return Err(HelperFailure::Refused {
+                    kind: kind.to_string(),
+                    source: HelperError {
+                        code: CODE_BACKEND,
+                        message: format!(
+                            "`{kind}` is served by the daemon's HTTP proxy, not by a minter"
+                        ),
+                    },
+                })
+            }
             Some(Hosting::Helper) | None => Arc::new(Helper::start(kind, &self.dirs)?),
         };
         channels.insert(kind.to_string(), Arc::clone(&channel));
