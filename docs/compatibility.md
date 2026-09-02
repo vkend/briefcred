@@ -130,9 +130,10 @@ configured, because refusing exactly this is what pinning is for. A Rust client
 built with `webpki-roots` compiled in rather than `rustls-native-certs` behaves
 the same way: it has no trust store to add a root to.
 
-There is no workaround, and there should not be one. Such a client is a Model B
-or Model C credential's problem: give it a minted credential it can hold
+There is no workaround, and there should not be one. Such a client wants a
+Model B credential instead: give it a minted credential it can hold
 (`postgres-dynamic`, `aws-sts`) rather than a synthetic token it can never use.
+briefcred ships no Model C, so that is the whole of the alternative.
 
 ### psql does not go through the HTTP proxy
 

@@ -528,8 +528,8 @@ Implements ROADMAP Phase 9.
 ROADMAP "Cross-cutting".
 
 - `deny.toml` + `cargo deny check` and `cargo vet` init in `just check`.
-- `.github/workflows/ci.yml` (fmt, clippy, test on macOS + ubuntu with a
-  Postgres service on ubuntu) and `release.yml` (tag → build universal
+- `.github/workflows/ci.yml` (fmt, clippy, test on macOS + ubuntu) and
+  `release.yml` (tag → build universal
   macOS binaries, sign + notarise when `APPLE_*` secrets exist, else
   unsigned tarball; SHA-256 sums; GitHub release).
 - `release/Formula/briefcred.rb` Homebrew formula (installs `briefcred`,
@@ -541,5 +541,14 @@ ROADMAP "Cross-cutting".
   DPoP status); `docs/profile-schema.md` generated from the serde types
   (write a `briefcred profile schema` command emitting JSON Schema via
   `schemars` and check the doc in a test).
+  The Postgres half of that matrix is *server binaries*, not a service
+  container. `pg_harness` brings up its own throwaway cluster with `initdb`
+  and `pg_ctl`, and `find_pg_bin` requires `initdb`, `pg_ctl` **and** the
+  `postgres` server in one directory — so a `postgres:16` service container
+  with `BRIEFCRED_PG_BIN` pointing at client tools would fail that check,
+  every Postgres test would skip, and the job would stay green having tested
+  nothing. CI installs the PGDG `postgresql-<version>` packages on Linux and
+  the Homebrew formula on macOS, and points `BRIEFCRED_PG_BIN` at those.
+
 - Refresh `ARCHITECTURE.md`, `THREAT_MODEL.md`, `README.md`,
   `CONTRIBUTING.md` to match the final crate map and features.

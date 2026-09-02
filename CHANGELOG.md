@@ -9,11 +9,13 @@ All notable changes to briefcred are recorded here. The format follows
 ### Added
 
 - **A supply-chain gate in `just check`.** `deny.toml` allows permissive
-  licences only, refuses any source but crates.io, and treats an open advisory
-  as an error. `cargo vet check --locked` runs offline against
-  `supply-chain/`, which imports no third-party audit sets: the whole graph
-  sits in `exemptions`, so adding a dependency produces a diff somebody has to
-  look at. Install both with `cargo install cargo-deny cargo-vet --locked`.
+  licences only, refuses any source but crates.io, treats an open advisory as
+  an error, and sets `unmaintained = "all"` so a transitive unmaintained crate
+  is reported and not only a direct one. `cargo vet check --locked --frozen`
+  runs offline against `supply-chain/`, which imports no third-party audit
+  sets: the whole graph sits in `exemptions`, so adding a dependency produces a
+  diff somebody has to look at. Install both with
+  `cargo install cargo-deny cargo-vet --locked`.
 - **Continuous integration.** `.github/workflows/ci.yml` runs `rustfmt`,
   `clippy` on macOS and Linux, the two supply-chain gates, and the test suite
   against PostgreSQL 16 and 18 on Linux and 16 on macOS. The PG18 half is the
@@ -26,6 +28,14 @@ All notable changes to briefcred are recorded here. The format follows
   no Apple credentials it publishes an unsigned tarball and says so in the
   release notes, so a release is not something only one person can cut. The
   steps are plain scripts under `release/scripts/`.
+- **The release workflow stamps the Homebrew formula.** The formula in the tree
+  carries a placeholder checksum, because the checksum of a release that has
+  not been built yet does not exist. `release/scripts/stamp-formula.sh` rewrites
+  its `url` and `sha256` from the tarball just built and the workflow uploads
+  the result as a release asset named `briefcred.rb`. Copying that into the tap
+  is manual and deliberately so: the tap is a separate repository created out
+  of band, and the release workflow holds no token for it. A test asserts the
+  stamp changes exactly those two lines and leaves every other byte alone.
 - **A Homebrew formula**, `release/Formula/briefcred.rb`. It installs all five
   binaries — a formula that shipped only `briefcred` and `briefcred-daemon`
   would produce a broker that starts and cannot mint — and carries a `service`
@@ -492,6 +502,16 @@ All notable changes to briefcred are recorded here. The format follows
 - **`serde_yaml` replaced with `serde_yaml_ng`** across every crate. The
   original was deprecated and unmaintained; the fork is a continuation of the
   same code with the same API, so no behaviour changed.
+
+  What this does *not* change is the parser underneath. `serde_yaml_ng`
+  still depends on `unsafe-libyaml`, the same transliterated-C YAML parser
+  `serde_yaml` used, which is archived alongside it. No advisory fires today:
+  the one RUSTSEC entry against it, RUSTSEC-2023-0075, is an unsoundness fixed
+  in 0.2.10 and the graph has 0.2.11, and there is no unmaintained advisory for
+  it — `cargo deny` is configured with `unmaintained = "all"`, so a transitive
+  one would be reported. Recorded here because "the unmaintained dependency was
+  removed" would be the wrong summary: the deprecated *wrapper* was replaced
+  and the parser it wraps is unchanged.
 - **`rustls-pemfile` removed**, also unmaintained, in favour of the `pem`
   module of `rustls-pki-types`, which was already a dependency.
 - **The AWS SDK clients no longer pull the legacy TLS stack.** Their default
