@@ -177,6 +177,7 @@ pub async fn run() -> Result<()> {
             masters: Arc::clone(&master_source),
         }),
         state.audit_handle(),
+        Arc::clone(&metrics),
         state.shutdown_signal(),
     ));
     tokio::spawn(reconcile::reconcile_loop(
@@ -249,6 +250,12 @@ impl revoke::Revoker for QueueRevoker {
             Err(err) => return briefcred_core::RevokeOutcome::failed(err.to_string()),
         };
         crate::exec::revoke_one(&self.helpers, entry, &master).await
+    }
+
+    /// Stop every helper this pass started, so none holds a master while the
+    /// queue waits for its next one.
+    async fn end_of_pass(&self) {
+        self.helpers.stop_all().await;
     }
 }
 

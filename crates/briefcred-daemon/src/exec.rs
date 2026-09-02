@@ -130,6 +130,7 @@ pub async fn mint(
     args: &[String],
     pid: u32,
     raw_args: bool,
+    metrics: &crate::metrics::Metrics,
 ) -> Result<Minted, ExecError> {
     let mut rows: Vec<AuditEntry> = Vec::new();
     let mut summaries: Vec<MintSummary> = Vec::new();
@@ -143,7 +144,14 @@ pub async fn mint(
                 source_key: spec.source_key().to_string(),
             })?;
 
-        match mint_one(profile, spec, master, helpers).await {
+        // Timed around the whole helper round trip, and recorded whether it
+        // succeeded or not: a backend that takes thirty seconds to refuse is
+        // exactly what the histogram has to show.
+        let started = std::time::Instant::now();
+        let outcome = mint_one(profile, spec, master, helpers).await;
+        metrics.record_mint(&spec.kind, started.elapsed());
+
+        match outcome {
             Ok((summary, minted_fields, entry)) => {
                 rows.push(AuditEntry::Mint {
                     ts: OffsetDateTime::now_utc(),
@@ -252,6 +260,16 @@ async fn mint_one(
         ));
     }
 
+    // Parsed here rather than carried as a string, so a helper that reports a
+    // malformed expiry degrades to "revoke at once" rather than to a panic or
+    // to a credential nobody ever schedules.
+    let expires_at = OffsetDateTime::parse(
+        &minted.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map(|at| (at.unix_timestamp_nanos() / 1_000_000) as i64)
+    .unwrap_or_default();
+
     let field_values: BTreeMap<String, Zeroizing<String>> = minted
         .fields
         .iter()
@@ -273,6 +291,7 @@ async fn mint_one(
             source_key: spec.source_key().to_string(),
             config,
             revoke_token: minted.revoke_token,
+            expires_at_unix_ms: expires_at,
             attempts: 0,
             // Due at once: the common case is a healthy backend, and making
             // every exec's revoke wait would leave a window where the

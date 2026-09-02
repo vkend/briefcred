@@ -260,7 +260,16 @@ deliberately `Serialize`; it holds `Zeroizing<String>`, prints `<redacted>`,
 and appears nowhere but this wire and the `Minted` reply.
 
 A helper that stops answering is killed rather than waited on: it is holding a
-master, and nothing it could still be doing is worth that.
+master, and nothing it could still be doing is worth that. Replies are capped at
+the same 16 MiB the client socket enforces, so both of the daemon's inputs are
+bounded by one number.
+
+Helper lifetime follows what owns the set. A **session's** helpers live as long
+as the session, because a burst of `briefcred exec` calls against one profile
+should pay one process start. The **reconciler's** and the **revoke queue's** are
+stopped at the end of every pass: both are idle almost all of the daemon's life,
+and a helper kept between passes is a master credential resident in a process
+with nothing to do.
 
 ## The minter registry
 

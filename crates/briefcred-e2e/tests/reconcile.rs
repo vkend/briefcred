@@ -238,6 +238,7 @@ async fn a_normal_exec_revokes_through_the_queue_without_the_reconciler() {
             mint_ids: vec![role.clone()],
             exit_code: Some(0),
             duration_ms: 5,
+            hold_until_expiry: false,
         })
         .await
         .expect("exec done");
@@ -249,6 +250,211 @@ async fn a_normal_exec_revokes_through_the_queue_without_the_reconciler() {
     assert!(
         revoked,
         "the queue must revoke the role without the reconciler\n{}",
+        daemon.log()
+    );
+
+    daemon.shutdown().await;
+    assert_eq!(cluster.leaked_role_count().await, 0);
+}
+
+/// Scrape the daemon's Prometheus endpoint.
+async fn scrape(daemon: &Daemon) -> String {
+    let Response::Status { metrics_addr, .. } =
+        daemon.request(Request::Status).await.expect("status")
+    else {
+        panic!("expected a status\n{}", daemon.log());
+    };
+    let addr = metrics_addr.expect("metrics are enabled for this daemon");
+    let mut stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .expect("connect to the metrics endpoint");
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("send the scrape");
+    let mut body = String::new();
+    stream
+        .read_to_string(&mut body)
+        .await
+        .expect("read the scrape");
+    body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_real_mint_and_revoke_appear_in_the_metrics_scrape() {
+    let Some(cluster) = cluster_or_skip("mint and revoke metrics").await else {
+        return;
+    };
+
+    // Port 0 so the OS picks one and this cannot collide with a real daemon.
+    let mut daemon = Daemon::prepare(
+        "master_source = \"file\"\nmetrics_enabled = true\nmetrics_port = 0\nreconcile_interval_secs = 3600\n",
+    );
+    daemon.write_profile("db-ro", &profile_yaml(&cluster));
+    daemon.write_master("db", &cluster.limited_password());
+    if let Err(why) = daemon.start().await {
+        panic!("{why}");
+    }
+
+    // Before any work, the histograms have no series: they are per kind, and
+    // no kind has been used yet.
+    let before = scrape(&daemon).await;
+    assert!(
+        before.contains("# TYPE briefcred_mint_duration_seconds histogram"),
+        "the series must be declared even before it has observations:\n{before}"
+    );
+    assert!(
+        !before.contains("briefcred_mint_duration_seconds_count{kind="),
+        "nothing has been minted yet:\n{before}"
+    );
+
+    let mut client = daemon.connect().await.expect("connect");
+    let Response::SessionOpened { session_id, .. } = client
+        .send(Request::OpenSession {
+            profile: "db-ro".into(),
+            client_headless: true,
+        })
+        .await
+        .expect("open session")
+    else {
+        panic!("expected a session\n{}", daemon.log());
+    };
+    let Response::Minted { mints, .. } = client
+        .send(Request::Exec {
+            session_id: session_id.clone(),
+            credentials: None,
+            argv0: "true".into(),
+            args: Vec::new(),
+            pid: std::process::id(),
+        })
+        .await
+        .expect("exec")
+    else {
+        panic!("expected a mint\n{}", daemon.log());
+    };
+    let role = mints[0].mint_id.clone();
+
+    client
+        .send(Request::ExecDone {
+            session_id,
+            mint_ids: vec![role.clone()],
+            exit_code: Some(0),
+            duration_ms: 5,
+            hold_until_expiry: false,
+        })
+        .await
+        .expect("exec done");
+
+    let revoked = wait_until(Duration::from_secs(20), || async {
+        !role_exists(&cluster, &role).await
+    })
+    .await;
+    assert!(revoked, "{}", daemon.log());
+
+    let after = scrape(&daemon).await;
+    assert!(
+        after.contains("briefcred_mint_duration_seconds_count{kind=\"postgres-dynamic\"} 1"),
+        "one real mint must be counted:\n{after}"
+    );
+    assert!(
+        after.contains("briefcred_revoke_duration_seconds_count{kind=\"postgres-dynamic\"} 1"),
+        "one real revoke must be counted:\n{after}"
+    );
+    assert!(
+        after.contains(
+            "briefcred_mint_duration_seconds_bucket{kind=\"postgres-dynamic\",le=\"+Inf\"} 1"
+        ),
+        "{after}"
+    );
+    // It succeeded, so the failure counter stays at nothing for this kind.
+    assert!(
+        !after.contains("briefcred_revoke_failures_total{kind=\"postgres-dynamic\"}"),
+        "a successful revoke is not a failure:\n{after}"
+    );
+
+    daemon.shutdown().await;
+    assert_eq!(cluster.leaked_role_count().await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_get_style_exec_done_leaves_the_credential_usable_for_its_ttl() {
+    let Some(cluster) = cluster_or_skip("get holds until expiry").await else {
+        return;
+    };
+
+    // The profile's `ttl_secs` is 1, so "held until expiry" is a second away
+    // rather than the fifteen minutes a real profile would use.
+    let mut daemon = Daemon::prepare(
+        "master_source = \"file\"\nmetrics_enabled = false\nreconcile_interval_secs = 3600\n",
+    );
+    daemon.write_profile("db-ro", &profile_yaml(&cluster));
+    daemon.write_master("db", &cluster.limited_password());
+    if let Err(why) = daemon.start().await {
+        panic!("{why}");
+    }
+
+    let mut client = daemon.connect().await.expect("connect");
+    let Response::SessionOpened { session_id, .. } = client
+        .send(Request::OpenSession {
+            profile: "db-ro".into(),
+            client_headless: true,
+        })
+        .await
+        .expect("open session")
+    else {
+        panic!("expected a session\n{}", daemon.log());
+    };
+    let Response::Minted { mints, env, .. } = client
+        .send(Request::Exec {
+            session_id: session_id.clone(),
+            credentials: None,
+            argv0: briefcred_core::exec::GET_PSEUDO_ARGV0.into(),
+            args: Vec::new(),
+            pid: std::process::id(),
+        })
+        .await
+        .expect("exec")
+    else {
+        panic!("expected a mint\n{}", daemon.log());
+    };
+    let role = mints[0].mint_id.clone();
+    let password = env["PGPASSWORD"].expose().to_string();
+
+    // What `briefcred get` sends.
+    client
+        .send(Request::ExecDone {
+            session_id,
+            mint_ids: vec![role.clone()],
+            exit_code: Some(0),
+            duration_ms: 0,
+            hold_until_expiry: true,
+        })
+        .await
+        .expect("exec done");
+
+    // The point of the flag: the caller is about to use the value it was just
+    // handed, so it has to still work after `get` has returned.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        role_exists(&cluster, &role).await,
+        "a held credential must not be revoked out from under its caller\n{}",
+        daemon.log()
+    );
+    cluster
+        .connect_as(&role, &password)
+        .await
+        .expect("and it must still be usable");
+
+    // And it is still queued, scheduled rather than forgotten: once the TTL
+    // passes, the queue takes it.
+    let revoked = wait_until(Duration::from_secs(30), || async {
+        !role_exists(&cluster, &role).await
+    })
+    .await;
+    assert!(
+        revoked,
+        "a held credential must still be revoked once it expires\n{}",
         daemon.log()
     );
 

@@ -94,6 +94,15 @@ pub struct PendingRevoke {
     pub config: serde_json::Value,
     /// The minter's own opaque state, so the revoke is symmetric to the mint.
     pub revoke_token: String,
+    /// When the backend stops honouring the credential, in Unix milliseconds.
+    ///
+    /// Recorded so a revoke can be *deferred* to it: `briefcred get` hands the
+    /// value to a caller who is about to use it, and revoking on the spot would
+    /// hand out a credential that was dead on arrival. Zero when the mint did
+    /// not report a usable expiry, which schedules the revoke immediately —
+    /// the safe direction.
+    #[serde(default)]
+    pub expires_at_unix_ms: i64,
     /// How many attempts have been made so far.
     #[serde(default)]
     pub attempts: u32,
@@ -119,6 +128,14 @@ impl PendingRevoke {
         now_unix_ms >= self.not_before_unix_ms
     }
 
+    /// Hold the first revoke attempt until the credential expires on its own.
+    ///
+    /// Never brings an attempt *forward*: an entry already scheduled later than
+    /// the expiry — one that has failed and backed off — keeps its schedule.
+    pub fn hold_until_expiry(&mut self) {
+        self.not_before_unix_ms = self.not_before_unix_ms.max(self.expires_at_unix_ms);
+    }
+
     /// Record an attempt and schedule the next one.
     fn defer(&mut self, now_unix_ms: i64) {
         self.not_before_unix_ms =
@@ -140,6 +157,16 @@ fn now_unix_ms() -> i64 {
 pub trait Revoker: Send + Sync + std::fmt::Debug {
     /// Attempt one revoke.
     async fn revoke(&self, entry: &PendingRevoke) -> RevokeOutcome;
+
+    /// Release whatever the pass needed, now that it is over.
+    ///
+    /// The queue's back end holds a helper process per minter kind, and a
+    /// helper holds an open master connection to a backend. Between passes
+    /// there is nothing for it to do, and the queue is usually empty for hours
+    /// at a time — so a helper kept alive across passes is a master credential
+    /// resident in a process for no reason at all. The default does nothing,
+    /// for a back end that has nothing to release.
+    async fn end_of_pass(&self) {}
 }
 
 /// The queue itself: the pending set, and the file that mirrors it.
@@ -249,13 +276,20 @@ impl RevokeQueue {
         &self,
         revoker: &dyn Revoker,
         audit: &crate::audit::AuditHandle,
+        metrics: &crate::metrics::Metrics,
     ) -> Result<Vec<PendingRevoke>> {
         let now = now_unix_ms();
         let due = self.take_due(now).await?;
         let mut retry = Vec::new();
         for mut entry in due {
             entry.attempts += 1;
+            let started = std::time::Instant::now();
             let outcome = revoker.revoke(&entry).await;
+            metrics.record_revoke(
+                &entry.kind,
+                started.elapsed(),
+                matches!(outcome, RevokeOutcome::Failed { .. }),
+            );
             audit.append(&AuditEntry::revoke(
                 entry.mint_id.clone(),
                 entry.kind.clone(),
@@ -352,16 +386,20 @@ pub async fn drain_loop(
     queue: Arc<RevokeQueue>,
     revoker: Arc<dyn Revoker>,
     audit: crate::audit::AuditHandle,
+    metrics: Arc<crate::metrics::Metrics>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        let retry = match queue.run_pass(revoker.as_ref(), &audit).await {
+        let retry = match queue.run_pass(revoker.as_ref(), &audit, &metrics).await {
             Ok(retry) => retry,
             Err(err) => {
                 eprintln!("briefcred-daemon: revoke queue: {err}");
                 Vec::new()
             }
         };
+        // Before the sleep, not after: the whole point is that nothing holds a
+        // master while the queue is idle, and the queue is idle most of the time.
+        revoker.end_of_pass().await;
 
         // Sleep until the earliest thing on the queue is due, so one stubborn
         // entry does not hold up one that has only just arrived.
@@ -390,6 +428,7 @@ mod tests {
             source_key: "db".into(),
             config: serde_json::json!({ "host": "127.0.0.1", "dbname": "app" }),
             revoke_token: "{\"grants\":[]}".into(),
+            expires_at_unix_ms: 0,
             attempts: 0,
             not_before_unix_ms: 0,
         }
@@ -429,6 +468,10 @@ mod tests {
 
     fn audit(dir: &Path) -> crate::audit::AuditHandle {
         crate::audit::spawn(crate::audit::AuditLog::open(&dir.join("audit"), 90).unwrap())
+    }
+
+    fn metrics() -> crate::metrics::Metrics {
+        crate::metrics::Metrics::new(Arc::new(std::sync::atomic::AtomicU64::new(0)))
     }
 
     #[test]
@@ -507,7 +550,10 @@ mod tests {
         queue.enqueue(vec![one(), two()]).await.unwrap();
 
         let revoker = AlwaysWorks::default();
-        let retry = queue.run_pass(&revoker, &audit(dir.path())).await.unwrap();
+        let retry = queue
+            .run_pass(&revoker, &audit(dir.path()), &metrics())
+            .await
+            .unwrap();
 
         assert!(retry.is_empty());
         assert!(queue.is_empty().await);
@@ -523,7 +569,7 @@ mod tests {
         queue.enqueue(vec![one()]).await.unwrap();
 
         let retry = queue
-            .run_pass(&AlwaysFails::default(), &audit(dir.path()))
+            .run_pass(&AlwaysFails::default(), &audit(dir.path()), &metrics())
             .await
             .unwrap();
         assert_eq!(retry.len(), 1);
@@ -532,6 +578,35 @@ mod tests {
         // And the count is on the disk, so a restart does not reset the budget.
         let restarted = RevokeQueue::open(&path).unwrap();
         assert_eq!(restarted.entries().await[0].attempts, 1);
+    }
+
+    #[test]
+    fn holding_until_expiry_schedules_the_first_attempt_at_the_expiry() {
+        let mut entry = one();
+        entry.expires_at_unix_ms = 1_800_000_000_000;
+        entry.hold_until_expiry();
+        assert_eq!(entry.not_before_unix_ms, 1_800_000_000_000);
+        assert!(!entry.is_due(1_799_999_999_999));
+        assert!(entry.is_due(1_800_000_000_000));
+    }
+
+    #[test]
+    fn holding_never_brings_an_attempt_forward() {
+        // An entry that has already failed and backed off past its expiry must
+        // keep its own schedule rather than be dragged back to the expiry.
+        let mut entry = one();
+        entry.expires_at_unix_ms = 1_000;
+        entry.not_before_unix_ms = 9_000;
+        entry.hold_until_expiry();
+        assert_eq!(entry.not_before_unix_ms, 9_000);
+    }
+
+    #[test]
+    fn a_mint_with_no_usable_expiry_is_revoked_at_once() {
+        let mut entry = one();
+        entry.expires_at_unix_ms = 0;
+        entry.hold_until_expiry();
+        assert!(entry.is_due(now_unix_ms()), "the safe direction is `now`");
     }
 
     #[tokio::test]
@@ -544,11 +619,11 @@ mod tests {
         let audit = audit(dir.path());
         // The first attempt is immediate and fails, which schedules the second
         // a second out.
-        queue.run_pass(&revoker, &audit).await.unwrap();
+        queue.run_pass(&revoker, &audit, &metrics()).await.unwrap();
         assert_eq!(revoker.0.load(Ordering::SeqCst), 1);
 
         // A pass now must not attempt it again: it is not due.
-        queue.run_pass(&revoker, &audit).await.unwrap();
+        queue.run_pass(&revoker, &audit, &metrics()).await.unwrap();
         assert_eq!(
             revoker.0.load(Ordering::SeqCst),
             1,
@@ -573,7 +648,10 @@ mod tests {
         queue.enqueue(vec![two()]).await.unwrap();
 
         let revoker = AlwaysWorks::default();
-        queue.run_pass(&revoker, &audit(dir.path())).await.unwrap();
+        queue
+            .run_pass(&revoker, &audit(dir.path()), &metrics())
+            .await
+            .unwrap();
 
         assert_eq!(
             revoker.0.load(Ordering::SeqCst),
@@ -599,7 +677,7 @@ mod tests {
             for entry in queue.pending.lock().await.iter_mut() {
                 entry.not_before_unix_ms = 0;
             }
-            queue.run_pass(&revoker, &audit).await.unwrap();
+            queue.run_pass(&revoker, &audit, &metrics()).await.unwrap();
         }
 
         assert_eq!(revoker.0.load(Ordering::SeqCst), MAX_ATTEMPTS as usize);
@@ -617,7 +695,7 @@ mod tests {
 
         let audit = audit(dir.path());
         queue
-            .run_pass(&AlwaysFails::default(), &audit)
+            .run_pass(&AlwaysFails::default(), &audit, &metrics())
             .await
             .unwrap();
         // The second attempt is driven directly rather than by waiting out the
@@ -626,7 +704,7 @@ mod tests {
             entry.not_before_unix_ms = 0;
         }
         queue
-            .run_pass(&AlwaysFails::default(), &audit)
+            .run_pass(&AlwaysFails::default(), &audit, &metrics())
             .await
             .unwrap();
         audit.flush().await;
@@ -665,7 +743,7 @@ mod tests {
         let queue = RevokeQueue::open(dir.path().join(QUEUE_FILE)).unwrap();
         queue.enqueue(vec![one()]).await.unwrap();
         assert!(queue
-            .run_pass(&Gone, &audit(dir.path()))
+            .run_pass(&Gone, &audit(dir.path()), &metrics())
             .await
             .unwrap()
             .is_empty());
@@ -691,6 +769,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_pass_releases_whatever_it_held() {
+        /// Counts `end_of_pass`, which is where a helper process holding a
+        /// master would be stopped.
+        #[derive(Debug, Default)]
+        struct Counts {
+            revokes: AtomicUsize,
+            releases: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Revoker for Counts {
+            async fn revoke(&self, _entry: &PendingRevoke) -> RevokeOutcome {
+                self.revokes.fetch_add(1, Ordering::SeqCst);
+                RevokeOutcome::Revoked
+            }
+            async fn end_of_pass(&self) {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Arc::new(RevokeQueue::open(dir.path().join(QUEUE_FILE)).unwrap());
+        queue.enqueue(vec![one()]).await.unwrap();
+
+        let revoker = Arc::new(Counts::default());
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(drain_loop(
+            Arc::clone(&queue),
+            Arc::clone(&revoker) as Arc<dyn Revoker>,
+            audit(dir.path()),
+            Arc::new(metrics()),
+            shutdown.subscribe(),
+        ));
+
+        // Wait for the queue to drain, which means a pass has completed.
+        for _ in 0..100 {
+            if queue.is_empty().await && revoker.releases.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the drain loop must stop")
+            .unwrap();
+
+        assert_eq!(revoker.revokes.load(Ordering::SeqCst), 1);
+        assert!(
+            revoker.releases.load(Ordering::SeqCst) >= 1,
+            "a pass must release what it held rather than keep it for the idle window"
+        );
+    }
+
+    #[tokio::test]
     async fn the_drain_loop_stops_when_shutdown_is_requested() {
         let dir = tempfile::tempdir().unwrap();
         let queue = Arc::new(RevokeQueue::open(dir.path().join(QUEUE_FILE)).unwrap());
@@ -699,6 +832,7 @@ mod tests {
             queue,
             Arc::new(AlwaysWorks::default()),
             audit(dir.path()),
+            Arc::new(metrics()),
             shutdown.subscribe(),
         ));
 

@@ -206,6 +206,14 @@ currently being written, and ignores any filename it did not write.
 | `briefcred_uptime_seconds` | gauge | Seconds since the daemon started |
 | `briefcred_ipc_requests_total{request}` | counter | IPC requests by kind |
 | `briefcred_audit_write_errors_total` | counter | Audit rows that failed to write |
+| `briefcred_mint_duration_seconds{kind}` | histogram | Time to mint one credential, by minter kind |
+| `briefcred_revoke_duration_seconds{kind}` | histogram | Time for one revoke attempt, by minter kind |
+| `briefcred_revoke_failures_total{kind}` | counter | Revoke attempts that failed, by minter kind |
+
+The two histograms time failures as well as successes: a backend that takes
+thirty seconds to refuse is exactly what they exist to show. A rising
+`briefcred_revoke_failures_total` is the series to alert on — a revoke that
+keeps failing is a credential that is still live.
 
 Every request series is seeded at zero, so a counter that has never fired is
 distinguishable from a scrape that failed.
@@ -272,6 +280,16 @@ briefcred get --profile=db-ro --cred=db --field=PGPASSWORD | pbcopy
 terminal** unless you pass `--force`: a short-lived credential that has landed in
 a scrollback buffer is a long-lived one. There is no trailing newline, so a file
 redirect gets exactly the value.
+
+**A value from `get` stays valid for the credential's `ttl_secs`, not for the
+length of the command.** `briefcred exec` revokes as soon as its child exits,
+because the child is finished with the credential. `get` cannot: it hands the
+value to you, and revoking on return would print something that was dead on
+arrival. So the revoke is queued and scheduled for the credential's own expiry.
+Two things follow. Set `ttl_secs` on a profile you use with `get` to the
+shortest window the work needs, because that is how long the value lives. And a
+`get` value is not revoked early by anything short of `briefcred daemon stop` —
+if you need a credential gone now, use `exec`.
 
 `get` is exempt from `exec.allow_argv0`, because it spawns nothing. That is not
 a hole in the allowlist — the allowlist constrains what briefcred is willing to

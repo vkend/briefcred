@@ -142,6 +142,12 @@ What the design buys:
 
 Residual risks, stated plainly:
 
+- **A `get` value lives for the credential's whole TTL.** `briefcred exec`
+  revokes when its child exits; `get` cannot, because it hands the value to a
+  caller who is about to use it, and revoking on return would print a dead
+  credential. The revoke is scheduled for the mint's own expiry instead, so
+  `ttl_secs` is the exposure window for anything fetched with `get`. Set it to
+  the shortest window the work needs.
 - **`briefcred get` is exempt from `exec.allow_argv0`.** It spawns nothing, so
   there is no program for the allowlist to be about, and it hands the credential
   to a caller who was always free to run whatever they liked with it. Making

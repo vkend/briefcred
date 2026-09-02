@@ -51,12 +51,34 @@ All notable changes to briefcred are recorded here. The format follows
 - **`just mem-hygiene`**: builds a daemon with the `debug-heapscan` feature and
   asserts a master is gone from its address space once its session is closed.
   The request carries a SHA-256 digest, never the marker.
+- `briefcred_mint_duration_seconds{kind}` and
+  `briefcred_revoke_duration_seconds{kind}` histograms, and
+  `briefcred_revoke_failures_total{kind}`, wired from the exec mint path and the
+  revoke queue.
 - **`briefcred-e2e::daemon_harness`**: runs the real daemon binary under a
   temporary `BRIEFCRED_HOME`, with end-to-end tests for a role stranded by
   `SIGKILL`, a normal exec revoking through the queue, and a session close
   sweeping up what it minted.
 
 ### Changed
+
+- `briefcred get` no longer revokes the credential it just printed. `ExecDone`
+  gained `hold_until_expiry`; `get` sets it, and the daemon schedules the first
+  revoke attempt for the mint's own expiry, so the value is usable for its
+  `ttl_secs` and is still cleaned up promptly afterwards rather than left to the
+  reconciler.
+- The reconciler's and the revoke queue's helper processes are stopped at the
+  end of every pass. Both sets are idle almost all of the time, and a helper
+  kept between passes is a master credential resident in a process with nothing
+  to do.
+- Replies on the helper pipe are capped at `MAX_FRAME_BYTES`, the same 16 MiB
+  ceiling the client socket enforces, so a helper that never emits a newline
+  cannot make the daemon allocate without bound.
+- `briefcred profile bootstrap` writes the profile first, waits for the daemon
+  to load it, and only then runs the unlock gate and asks for the master. The
+  gate previously treated "no such profile" as success, which made it a no-op on
+  the first bootstrap of any profile. Any failure after the write removes the
+  file again.
 
 - The audit log moved from a `std::sync::Mutex<AuditLog>` held across `fsync` to
   a dedicated writer task on a blocking thread, fed by a channel. Appends no
@@ -263,6 +285,24 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Changed
 
+- `briefcred get` no longer revokes the credential it just printed. `ExecDone`
+  gained `hold_until_expiry`; `get` sets it, and the daemon schedules the first
+  revoke attempt for the mint's own expiry, so the value is usable for its
+  `ttl_secs` and is still cleaned up promptly afterwards rather than left to the
+  reconciler.
+- The reconciler's and the revoke queue's helper processes are stopped at the
+  end of every pass. Both sets are idle almost all of the time, and a helper
+  kept between passes is a master credential resident in a process with nothing
+  to do.
+- Replies on the helper pipe are capped at `MAX_FRAME_BYTES`, the same 16 MiB
+  ceiling the client socket enforces, so a helper that never emits a newline
+  cannot make the daemon allocate without bound.
+- `briefcred profile bootstrap` writes the profile first, waits for the daemon
+  to load it, and only then runs the unlock gate and asks for the master. The
+  gate previously treated "no such profile" as success, which made it a no-op on
+  the first bootstrap of any profile. Any failure after the write removes the
+  file again.
+
 - The daemon's dispatch table now maps a request name to an async handler
   taking the deserialised `Request` and `Arc<State>`, rather than a synchronous
   `fn(&State) -> Response`. Requests carry payloads now, and opening a session
@@ -285,6 +325,24 @@ All notable changes to briefcred are recorded here. The format follows
   and nothing at all against a hostile same-uid caller.
 
 ### Changed
+
+- `briefcred get` no longer revokes the credential it just printed. `ExecDone`
+  gained `hold_until_expiry`; `get` sets it, and the daemon schedules the first
+  revoke attempt for the mint's own expiry, so the value is usable for its
+  `ttl_secs` and is still cleaned up promptly afterwards rather than left to the
+  reconciler.
+- The reconciler's and the revoke queue's helper processes are stopped at the
+  end of every pass. Both sets are idle almost all of the time, and a helper
+  kept between passes is a master credential resident in a process with nothing
+  to do.
+- Replies on the helper pipe are capped at `MAX_FRAME_BYTES`, the same 16 MiB
+  ceiling the client socket enforces, so a helper that never emits a newline
+  cannot make the daemon allocate without bound.
+- `briefcred profile bootstrap` writes the profile first, waits for the daemon
+  to load it, and only then runs the unlock gate and asks for the master. The
+  gate previously treated "no such profile" as success, which made it a no-op on
+  the first bootstrap of any profile. Any failure after the write removes the
+  file again.
 
 - `briefcred-core` uses `deny(unsafe_code)` rather than `forbid`, for the one
   `extern "C"` call into the Security framework in `session_env`. Every other

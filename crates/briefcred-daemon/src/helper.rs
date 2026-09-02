@@ -34,7 +34,8 @@ use briefcred_proto::helper::{
     encode_line, HelperError, HelperParams, HelperRequest, HelperResponse, HelperResult,
     ShutdownParams, CODE_BACKEND,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use briefcred_proto::MAX_FRAME_BYTES;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
@@ -207,15 +208,7 @@ impl Helper {
         let exchange = async {
             io.stdin.write_all(line.as_bytes()).await?;
             io.stdin.flush().await?;
-            let mut reply = String::new();
-            let read = io.stdout.read_line(&mut reply).await?;
-            if read == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "the helper closed its stdout",
-                ));
-            }
-            Ok(reply)
+            read_reply(&mut io.stdout).await
         };
 
         let reply = match tokio::time::timeout(CALL_TIMEOUT, exchange).await {
@@ -284,6 +277,41 @@ impl Helper {
     }
 }
 
+/// Read one reply line, refusing one that is too long to be a real answer.
+///
+/// `read_line` on its own is unbounded: a helper that writes without ever
+/// emitting a newline — a runaway loop, a corrupted stream, a compromised
+/// binary — would have the daemon grow a `String` until it was killed for it.
+/// The ceiling is [`MAX_FRAME_BYTES`], the same 16 MiB the client socket
+/// enforces, so both of the daemon's inputs are bounded by the same number.
+///
+/// Reading through a `take` means the cap is applied while the bytes arrive
+/// rather than after, so an oversize line cannot be allocated even once. Being
+/// over the ceiling is unrecoverable for this connection — the rest of the line
+/// is still in the pipe and would be read as the next reply — so the caller
+/// discards the helper, which is what the `Pipe` failure already causes.
+async fn read_reply(stdout: &mut BufReader<ChildStdout>) -> std::io::Result<String> {
+    let mut reply = String::new();
+    // One byte over the ceiling, so a line that is exactly at it still reads.
+    let read = (&mut *stdout)
+        .take(MAX_FRAME_BYTES as u64 + 1)
+        .read_line(&mut reply)
+        .await?;
+    if read == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the helper closed its stdout",
+        ));
+    }
+    if read > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("reply of over {MAX_FRAME_BYTES} bytes; refusing to read it"),
+        ));
+    }
+    Ok(reply)
+}
+
 /// Every helper a session has started, keyed by minter kind.
 ///
 /// Owned by the session, so closing the session closes the helpers, and the
@@ -327,11 +355,17 @@ impl HelperSet {
         self.helpers.lock().await.keys().cloned().collect()
     }
 
-    /// Stop every helper, in parallel.
+    /// Stop and forget every helper.
+    ///
+    /// The take and the clear are one locked step. Taking the map out and then
+    /// locking again to clear it leaves a window in which another task can
+    /// `get` a kind, find the entry still present, and hand back a helper this
+    /// call is about to stop — so the caller would be talking to a dead process
+    /// and, worse, a `get` racing the clear could insert a fresh helper that
+    /// the clear then dropped on the floor, orphaning it with a master in it.
     pub async fn stop_all(&self) {
-        let helpers: Vec<Arc<Helper>> = self.helpers.lock().await.values().cloned().collect();
-        self.helpers.lock().await.clear();
-        for helper in helpers {
+        let taken = std::mem::take(&mut *self.helpers.lock().await);
+        for (_, helper) in taken {
             helper.stop().await;
         }
     }
@@ -459,6 +493,58 @@ done"#,
             .unwrap_err();
         assert!(matches!(err, HelperFailure::Refused { .. }), "{err}");
         assert!(err.to_string().contains("28P01"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_over_the_frame_ceiling_is_refused_rather_than_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        // 17 MiB of `x` on one line, with no newline in sight until the end:
+        // exactly what a runaway helper looks like from the daemon's side.
+        let dirs = script_helper(
+            dir.path(),
+            "flood",
+            r#"while read -r line; do
+  awk 'BEGIN { while (i++ < 17408) printf "%1024s", "" }' | tr ' ' 'x'
+  printf '
+'
+done"#,
+        );
+
+        let helper = Helper::start("flood", &dirs).unwrap();
+        let err = helper
+            .call(HelperParams::Shutdown(ShutdownParams {}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HelperFailure::Pipe { .. }), "{err}");
+        assert!(
+            err.to_string().contains("refusing to read it"),
+            "the failure must say why: {err}"
+        );
+        helper.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_reply_just_under_the_ceiling_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        // A valid response padded with a long — but legal — message field.
+        let dirs = script_helper(
+            dir.path(),
+            "chatty",
+            r#"while read -r line; do
+  pad=$(awk 'BEGIN { while (i++ < 64) printf "%1024s", "" }' | tr ' ' 'y')
+  printf '{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"%s"}}
+' "$pad"
+done"#,
+        );
+
+        let helper = Helper::start("chatty", &dirs).unwrap();
+        let err = helper
+            .call(HelperParams::Shutdown(ShutdownParams {}))
+            .await
+            .unwrap_err();
+        // Refused, not a pipe failure: the line was read and parsed fine.
+        assert!(matches!(err, HelperFailure::Refused { .. }), "{err}");
+        helper.stop().await;
     }
 
     #[tokio::test]

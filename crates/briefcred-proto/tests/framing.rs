@@ -70,6 +70,7 @@ async fn every_request_and_response_round_trips() {
             mint_ids: vec!["briefcred_t_0123456789ab".into()],
             exit_code: Some(0),
             duration_ms: 42,
+            hold_until_expiry: false,
         },
         Request::HookCheck {
             profile: "analytics".into(),
@@ -266,6 +267,7 @@ fn the_name_list_covers_every_request_variant_exactly_once() {
             mint_ids: vec![],
             exit_code: Some(0),
             duration_ms: 1,
+            hold_until_expiry: true,
         },
         Request::HookCheck {
             profile: "x".into(),

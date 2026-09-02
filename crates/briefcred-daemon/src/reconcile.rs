@@ -146,6 +146,12 @@ pub async fn reconcile_loop(
             _ = crate::server::shutdown_requested(&mut shutdown) => return,
             _ = ticker.tick() => {
                 sweep(&profiles, &helpers, masters.as_ref(), &audit).await;
+                // Every sweep starts its own helpers and stops them again. A
+                // sweep runs every few minutes and takes milliseconds, so a
+                // helper kept between them would be a master credential
+                // resident in a process that is doing nothing, for almost all
+                // of the daemon's life.
+                helpers.stop_all().await;
             }
         }
     }

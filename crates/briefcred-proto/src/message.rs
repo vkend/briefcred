@@ -107,6 +107,20 @@ pub enum Request {
         exit_code: Option<i32>,
         /// How long the child ran.
         duration_ms: u64,
+        /// Leave the credentials usable until they expire on their own.
+        ///
+        /// `briefcred exec` sets this false: the child has exited, so the
+        /// credential is finished with and the sooner it is gone the better.
+        ///
+        /// `briefcred get` sets it true, because the value it just printed is
+        /// about to be used by whatever the caller pipes it into. Revoking at
+        /// once would hand out a credential that is dead before it can be
+        /// used. The daemon still queues the revoke — it just schedules the
+        /// first attempt for the mint's own expiry, so the credential is
+        /// cleaned up promptly after it stops being useful rather than left
+        /// for the reconciler to find.
+        #[serde(default)]
+        hold_until_expiry: bool,
     },
     /// Ask whether a command *would* be permitted, minting nothing.
     ///

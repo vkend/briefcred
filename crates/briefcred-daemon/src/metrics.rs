@@ -1,9 +1,12 @@
 //! The Prometheus text endpoint, on loopback only.
 //!
-//! Three series, all of them operational: how long the daemon has been up,
-//! how many IPC requests it has handled by kind, and how many audit rows it
-//! failed to write. Nothing here is derived from credential material, and the
-//! listener is bound to `127.0.0.1` so it is not reachable off the machine.
+//! Six series, all of them operational: how long the daemon has been up, how
+//! many IPC requests it has handled by kind, how many audit rows it failed to
+//! write, how long mints and revokes take by minter kind, and how many revokes
+//! have failed. Nothing here is derived from credential material — a histogram
+//! records how long a mint took and which kind served it, never what was
+//! minted — and the listener is bound to `127.0.0.1` so it is not reachable
+//! off the machine.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -21,12 +24,98 @@ use hyper_util::rt::TokioIo;
 /// The content type Prometheus expects from a text-format exposition.
 const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// The daemon's counters and gauges.
+/// The upper bounds of the latency histogram buckets, in seconds.
+///
+/// Chosen for what these operations actually cost: a mint against a loopback
+/// database is single-digit milliseconds, one against a remote database over
+/// TLS is tens to hundreds, and anything past a few seconds is a problem
+/// somebody wants to see rather than a number to average away. The `+Inf`
+/// bucket is implied and emitted from the total count.
+pub const LATENCY_BUCKETS: [f64; 9] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
+
+/// One latency histogram, keyed by minter kind.
+///
+/// Hand-rolled rather than pulled from a metrics crate: three series is not
+/// enough to justify a dependency that would also want to own the registry,
+/// the exposition format, and the process's global state.
+#[derive(Debug, Default)]
+struct Histogram {
+    /// Per kind: one cumulative counter per bucket, plus count and sum.
+    by_kind: BTreeMap<String, Series>,
+}
+
+#[derive(Debug)]
+struct Series {
+    /// Non-cumulative observation counts, one per bound in [`LATENCY_BUCKETS`].
+    buckets: [u64; LATENCY_BUCKETS.len()],
+    /// Observations above the last bound.
+    overflow: u64,
+    /// Total observations.
+    count: u64,
+    /// Total observed seconds.
+    sum: f64,
+}
+
+impl Default for Series {
+    fn default() -> Series {
+        Series {
+            buckets: [0; LATENCY_BUCKETS.len()],
+            overflow: 0,
+            count: 0,
+            sum: 0.0,
+        }
+    }
+}
+
+impl Histogram {
+    fn observe(&mut self, kind: &str, seconds: f64) {
+        let series = self.by_kind.entry(kind.to_string()).or_default();
+        match LATENCY_BUCKETS.iter().position(|bound| seconds <= *bound) {
+            Some(index) => series.buckets[index] += 1,
+            None => series.overflow += 1,
+        }
+        series.count += 1;
+        series.sum += seconds;
+    }
+
+    /// Render as Prometheus histogram series.
+    ///
+    /// `le` buckets are cumulative, which is the part of the format that is
+    /// easy to get wrong: each bucket counts everything at or below its bound,
+    /// not just what fell in it.
+    fn render(&self, name: &str, help: &str, out: &mut String) {
+        out.push_str(&format!("# HELP {name} {help}\n"));
+        out.push_str(&format!("# TYPE {name} histogram\n"));
+        for (kind, series) in &self.by_kind {
+            let mut cumulative = 0u64;
+            for (index, bound) in LATENCY_BUCKETS.iter().enumerate() {
+                cumulative += series.buckets[index];
+                out.push_str(&format!(
+                    "{name}_bucket{{kind=\"{kind}\",le=\"{bound}\"}} {cumulative}\n"
+                ));
+            }
+            out.push_str(&format!(
+                "{name}_bucket{{kind=\"{kind}\",le=\"+Inf\"}} {}\n",
+                series.count
+            ));
+            out.push_str(&format!("{name}_sum{{kind=\"{kind}\"}} {}\n", series.sum));
+            out.push_str(&format!(
+                "{name}_count{{kind=\"{kind}\"}} {}\n",
+                series.count
+            ));
+        }
+    }
+}
+
+/// The daemon's counters, gauges, and histograms.
 #[derive(Debug)]
 pub struct Metrics {
     started: Instant,
     requests: Mutex<BTreeMap<&'static str, u64>>,
     audit_write_errors: Arc<AtomicU64>,
+    mint_duration: Mutex<Histogram>,
+    revoke_duration: Mutex<Histogram>,
+    revoke_failures: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Metrics {
@@ -40,6 +129,40 @@ impl Metrics {
             started: Instant::now(),
             requests: Mutex::new(requests),
             audit_write_errors,
+            mint_duration: Mutex::new(Histogram::default()),
+            revoke_duration: Mutex::new(Histogram::default()),
+            revoke_failures: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Record how long one mint took, successful or not.
+    ///
+    /// Failures are timed too: a backend that takes thirty seconds to refuse is
+    /// exactly the thing an operator needs the histogram to show them.
+    pub fn record_mint(&self, kind: &str, elapsed: std::time::Duration) {
+        self.mint_duration
+            .lock()
+            .expect("metrics mutex")
+            .observe(kind, elapsed.as_secs_f64());
+    }
+
+    /// Record how long one revoke attempt took, and whether it failed.
+    ///
+    /// `failed` counts the attempt against `briefcred_revoke_failures_total`,
+    /// which is the series an alert is built on: a revoke that keeps failing is
+    /// a credential that is still live.
+    pub fn record_revoke(&self, kind: &str, elapsed: std::time::Duration, failed: bool) {
+        self.revoke_duration
+            .lock()
+            .expect("metrics mutex")
+            .observe(kind, elapsed.as_secs_f64());
+        if failed {
+            *self
+                .revoke_failures
+                .lock()
+                .expect("metrics mutex")
+                .entry(kind.to_string())
+                .or_insert(0) += 1;
         }
     }
 
@@ -88,6 +211,27 @@ impl Metrics {
             "briefcred_audit_write_errors_total {}\n",
             self.audit_write_errors.load(Ordering::Relaxed)
         ));
+
+        self.mint_duration.lock().expect("metrics mutex").render(
+            "briefcred_mint_duration_seconds",
+            "Time taken to mint one credential, by minter kind.",
+            &mut out,
+        );
+        self.revoke_duration.lock().expect("metrics mutex").render(
+            "briefcred_revoke_duration_seconds",
+            "Time taken by one revoke attempt, by minter kind.",
+            &mut out,
+        );
+
+        out.push_str(
+            "# HELP briefcred_revoke_failures_total Revoke attempts that failed, by minter kind.\n",
+        );
+        out.push_str("# TYPE briefcred_revoke_failures_total counter\n");
+        for (kind, count) in self.revoke_failures.lock().expect("metrics mutex").iter() {
+            out.push_str(&format!(
+                "briefcred_revoke_failures_total{{kind=\"{kind}\"}} {count}\n"
+            ));
+        }
         out
     }
 }
@@ -158,6 +302,7 @@ pub fn bind(port: u16) -> std::io::Result<(tokio::net::TcpListener, SocketAddr)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn every_request_series_is_present_from_the_first_scrape() {
@@ -189,13 +334,116 @@ mod tests {
     }
 
     #[test]
+    fn a_mint_appears_in_the_scrape_with_its_kind_and_its_bucket() {
+        let metrics = Metrics::new(Arc::new(AtomicU64::new(0)));
+        metrics.record_mint("postgres-dynamic", Duration::from_millis(30));
+
+        let text = metrics.render();
+        // 30 ms lands in the 0.05 bucket, and every bucket at or above it.
+        assert!(
+            text.contains(
+                "briefcred_mint_duration_seconds_bucket{kind=\"postgres-dynamic\",le=\"0.05\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "briefcred_mint_duration_seconds_bucket{kind=\"postgres-dynamic\",le=\"0.025\"} 0"
+            ),
+            "a 30 ms mint must not be counted in the 25 ms bucket:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "briefcred_mint_duration_seconds_bucket{kind=\"postgres-dynamic\",le=\"+Inf\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("briefcred_mint_duration_seconds_count{kind=\"postgres-dynamic\"} 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn buckets_are_cumulative_the_way_prometheus_reads_them() {
+        let metrics = Metrics::new(Arc::new(AtomicU64::new(0)));
+        for millis in [1, 30, 300] {
+            metrics.record_mint("postgres-dynamic", Duration::from_millis(millis));
+        }
+        let text = metrics.render();
+        // Each `le` counts everything at or below its bound, not just its own
+        // slice. Getting this wrong is the classic histogram bug.
+        for (bound, expected) in [("0.005", 1), ("0.05", 2), ("0.5", 3), ("+Inf", 3)] {
+            assert!(
+                text.contains(&format!(
+                    "briefcred_mint_duration_seconds_bucket{{kind=\"postgres-dynamic\",le=\"{bound}\"}} {expected}"
+                )),
+                "le={bound} should be {expected}:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("briefcred_mint_duration_seconds_count{kind=\"postgres-dynamic\"} 3"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_revoke_is_timed_and_only_a_failure_is_counted_as_one() {
+        let metrics = Metrics::new(Arc::new(AtomicU64::new(0)));
+        metrics.record_revoke("postgres-dynamic", Duration::from_millis(8), false);
+        metrics.record_revoke("postgres-dynamic", Duration::from_millis(8), true);
+
+        let text = metrics.render();
+        assert!(
+            text.contains("briefcred_revoke_duration_seconds_count{kind=\"postgres-dynamic\"} 2"),
+            "both attempts are timed:\n{text}"
+        );
+        assert!(
+            text.contains("briefcred_revoke_failures_total{kind=\"postgres-dynamic\"} 1"),
+            "only the failed one is counted as a failure:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_observation_past_the_last_bound_lands_only_in_the_infinity_bucket() {
+        let metrics = Metrics::new(Arc::new(AtomicU64::new(0)));
+        metrics.record_revoke("aws-sts", Duration::from_secs(30), true);
+        let text = metrics.render();
+        assert!(
+            text.contains("briefcred_revoke_duration_seconds_bucket{kind=\"aws-sts\",le=\"5\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "briefcred_revoke_duration_seconds_bucket{kind=\"aws-sts\",le=\"+Inf\"} 1"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn kinds_do_not_bleed_into_one_another() {
+        let metrics = Metrics::new(Arc::new(AtomicU64::new(0)));
+        metrics.record_mint("postgres-dynamic", Duration::from_millis(5));
+        metrics.record_mint("aws-sts", Duration::from_millis(5));
+        let text = metrics.render();
+        assert!(text.contains("briefcred_mint_duration_seconds_count{kind=\"postgres-dynamic\"} 1"));
+        assert!(text.contains("briefcred_mint_duration_seconds_count{kind=\"aws-sts\"} 1"));
+    }
+
+    #[test]
     fn every_series_carries_a_help_and_a_type_line() {
         let metrics = Metrics::new(Arc::new(AtomicU64::new(0)));
+        metrics.record_mint("postgres-dynamic", Duration::from_millis(1));
+        metrics.record_revoke("postgres-dynamic", Duration::from_millis(1), true);
         let text = metrics.render();
         for series in [
             "briefcred_uptime_seconds",
             "briefcred_ipc_requests_total",
             "briefcred_audit_write_errors_total",
+            "briefcred_mint_duration_seconds",
+            "briefcred_revoke_duration_seconds",
+            "briefcred_revoke_failures_total",
         ] {
             assert!(text.contains(&format!("# HELP {series} ")), "{series}");
             assert!(text.contains(&format!("# TYPE {series} ")), "{series}");

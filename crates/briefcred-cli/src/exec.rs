@@ -119,6 +119,8 @@ async fn run_in_session(
             mint_ids: mints.iter().map(|m| m.mint_id.clone()).collect(),
             exit_code: status,
             duration_ms,
+            // The child has exited; the credential is finished with.
+            hold_until_expiry: false,
         })
         .await;
 
@@ -128,6 +130,37 @@ async fn run_in_session(
     Ok(status.map_or(128, |code| u8::try_from(code).unwrap_or(1)))
 }
 
+/// Build the child's command, environment and all.
+///
+/// Separated from spawning so the environment it constructs can be inspected
+/// by running a real child that prints it, rather than by trusting a comment.
+/// `caller_env` is where passthrough values come from; production passes the
+/// process's own.
+fn build_command(
+    argv0: &str,
+    args: &[String],
+    env: &BTreeMap<String, briefcred_proto::SecretString>,
+    passthrough: &[String],
+    caller_env: &dyn Fn(&str) -> Option<OsString>,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(argv0);
+    command.args(args);
+    // Everything the child gets is named below. Nothing is inherited.
+    command.env_clear();
+    // Copied only where the caller actually has the variable: naming a
+    // variable in `env_passthrough` says "pass it if it exists", never "set it".
+    for name in passthrough {
+        if let Some(value) = caller_env(name) {
+            command.env(name, value);
+        }
+    }
+    // Last, so a profile can deliberately override a passed-through variable.
+    for (name, value) in env {
+        command.env(name, OsString::from(value.expose()));
+    }
+    command
+}
+
 /// Start the child with a cleared environment and wait for it.
 async fn spawn(
     argv0: &str,
@@ -135,17 +168,9 @@ async fn spawn(
     env: &BTreeMap<String, briefcred_proto::SecretString>,
     passthrough: &[String],
 ) -> Result<Option<i32>> {
-    let mut command = tokio::process::Command::new(argv0);
-    command.args(args);
-    command.env_clear();
-    for name in passthrough {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    for (name, value) in env {
-        command.env(name, OsString::from(value.expose()));
-    }
+    let mut command = build_command(argv0, args, env, passthrough, &|name| {
+        std::env::var_os(name)
+    });
     // The child owns the terminal: `briefcred exec -- psql` has to be as usable
     // as `psql`, which means an interactive prompt and a working pager.
     command
@@ -247,14 +272,18 @@ async fn fetch_field(
         .expose()
         .to_string();
 
-    // The credential is handed over and then immediately queued for revoke:
-    // `get` is for piping a value into one command, not for holding one.
+    // Queued for revoke at the credential's own expiry, not now: see
+    // `hold_until_expiry` on `Request::ExecDone`. `get` is for piping a value
+    // into one command within its TTL, not for holding one indefinitely.
     let _ = connection
         .send(Request::ExecDone {
             session_id: session_id.to_string(),
             mint_ids: mints.iter().map(|m| m.mint_id.clone()).collect(),
             exit_code: Some(0),
             duration_ms: 0,
+            // The value was just printed for the caller to use. Revoking now
+            // would hand out a credential that is dead on arrival.
+            hold_until_expiry: true,
         })
         .await;
 
@@ -279,6 +308,126 @@ pub fn parse_credentials(raw: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use briefcred_proto::SecretString;
+    use std::collections::BTreeSet;
+
+    fn secret_env(pairs: &[(&str, &str)]) -> BTreeMap<String, SecretString> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), SecretString::new(*v)))
+            .collect()
+    }
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    /// Run `/usr/bin/env` through the real command builder and read back the
+    /// environment the child actually received.
+    ///
+    /// This is the only way to test `env_clear`: the interesting property is
+    /// what the *operating system* handed the child, not what the builder
+    /// intended, and every intermediate abstraction is a chance to be wrong
+    /// about that.
+    async fn child_env(
+        env: &BTreeMap<String, SecretString>,
+        passthrough: &[String],
+        caller: &[(&str, &str)],
+    ) -> BTreeMap<String, String> {
+        let caller: BTreeMap<String, OsString> = caller
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), OsString::from(*v)))
+            .collect();
+        let mut command = build_command("/usr/bin/env", &[], env, passthrough, &|name| {
+            caller.get(name).cloned()
+        });
+        let output = command.output().await.expect("/usr/bin/env runs");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout)
+            .expect("env output is utf-8")
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_child_gets_the_composed_environment_and_nothing_else() {
+        let seen = child_env(
+            &secret_env(&[("PGUSER", "briefcred_t_0123456789ab"), ("PGPASSWORD", "pw")]),
+            &[],
+            &[("SECRET_FROM_THE_SHELL", "do-not-pass-this-on")],
+        )
+        .await;
+
+        assert_eq!(
+            seen.get("PGUSER").map(String::as_str),
+            Some("briefcred_t_0123456789ab")
+        );
+        assert_eq!(seen.get("PGPASSWORD").map(String::as_str), Some("pw"));
+        assert_eq!(
+            seen.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["PGUSER".to_string(), "PGPASSWORD".to_string()]),
+            "the child's environment is exactly what was composed: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credential_in_the_callers_shell_does_not_reach_the_child() {
+        // The accident this guards against is not briefcred's credential
+        // escaping — it is somebody else's arriving.
+        let seen = child_env(
+            &secret_env(&[("PGUSER", "u")]),
+            &names(&["PATH", "HOME"]),
+            &[
+                ("AWS_SECRET_ACCESS_KEY", "leaked"),
+                ("PATH", "/usr/bin:/bin"),
+            ],
+        )
+        .await;
+
+        assert!(!seen.contains_key("AWS_SECRET_ACCESS_KEY"), "{seen:?}");
+        assert!(!seen.values().any(|v| v == "leaked"), "{seen:?}");
+        assert_eq!(seen.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
+    }
+
+    #[tokio::test]
+    async fn passthrough_copies_only_the_named_variables_the_caller_actually_has() {
+        let seen = child_env(
+            &BTreeMap::new(),
+            &names(&["PATH", "HOME", "TERM", "NEVER_SET_BY_THE_CALLER"]),
+            &[("PATH", "/usr/bin"), ("HOME", "/Users/test")],
+        )
+        .await;
+
+        assert_eq!(seen.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(seen.get("HOME").map(String::as_str), Some("/Users/test"));
+        // Named but absent from the caller: passed through as nothing, never
+        // as an empty string, which some programs treat very differently.
+        assert!(!seen.contains_key("TERM"), "{seen:?}");
+        assert!(!seen.contains_key("NEVER_SET_BY_THE_CALLER"), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn the_profile_environment_wins_over_a_passed_through_variable() {
+        // A profile that deliberately points a runtime somewhere must not be
+        // silently overridden by whatever the caller's shell happened to have.
+        let seen = child_env(
+            &secret_env(&[("PGHOST", "db.internal")]),
+            &names(&["PGHOST", "PATH"]),
+            &[("PGHOST", "localhost"), ("PATH", "/usr/bin")],
+        )
+        .await;
+
+        assert_eq!(seen.get("PGHOST").map(String::as_str), Some("db.internal"));
+        assert_eq!(seen.get("PATH").map(String::as_str), Some("/usr/bin"));
+    }
+
+    #[tokio::test]
+    async fn a_child_with_no_environment_at_all_still_runs() {
+        let seen = child_env(&BTreeMap::new(), &[], &[]).await;
+        assert!(seen.is_empty(), "{seen:?}");
+    }
 
     #[test]
     fn a_credential_list_splits_on_commas_and_trims() {

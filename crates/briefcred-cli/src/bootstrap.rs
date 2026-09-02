@@ -16,9 +16,23 @@
 //! has proved presence for this profile. That is `Request::Unlock`, which
 //! fetches nothing and retains nothing.
 //!
+//! # Why the profile is written before the gate runs
+//!
+//! The gate is the profile's own `unlock.policy`, and the daemon cannot apply a
+//! policy for a profile it has never seen. So the order is: write the YAML,
+//! wait for the daemon's watcher to report it through `ShowProfile`, run the
+//! gate, and only then ask for the master.
+//!
+//! That ordering means a bootstrap can fail with a file already on disk, so
+//! every failure after the write takes the file back off again. A profile whose
+//! master was never stored is worse than no profile: it fails at the first
+//! `briefcred exec`, a week later, with a message about a missing master rather
+//! than about an abandoned setup.
+//!
 //! [`MasterSource`]: briefcred_core::MasterSource
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use briefcred_core::paths::Paths;
 use briefcred_core::{Registry, SourceKind};
@@ -87,27 +101,46 @@ pub async fn run(paths: &Paths, sock: &Path, source_kind: SourceKind) -> Result<
     profile.validate(&registry)?;
     let source_key = profile.credentials[0].source_key().to_string();
 
-    // The gate before the secret is asked for, so a cancelled prompt means the
-    // master was never typed rather than typed and then thrown away.
-    unlock(sock, &name).await?;
+    // The profile is written *before* the gate, because the gate is the
+    // profile's own `unlock.policy` and the daemon cannot apply a policy for a
+    // profile it has never seen. Writing first, waiting for the hot reload, and
+    // then asking is what makes the check real rather than decorative.
+    briefcred_core::paths::ensure_private_dir(&paths.profiles_dir())?;
+    std::fs::write(&path, &yaml).map_err(|e| Error::io("write", &path, e))?;
 
-    let master = Zeroizing::new(
-        Password::new()
-            .with_prompt(format!("Master credential for `{source_key}`"))
-            .with_confirmation("Confirm", "They did not match")
-            .interact()
-            .map_err(prompt_failed)?,
-    );
+    // Anything from here on removes the file again: a profile on disk whose
+    // master was never stored is a profile whose every `exec` fails with a
+    // confusing "no master credential" a week later.
+    if let Err(err) = gate(sock, &name).await {
+        remove_written(&path);
+        return Err(err);
+    }
+
+    let master = match Password::new()
+        .with_prompt(format!("Master credential for `{source_key}`"))
+        .with_confirmation("Confirm", "They did not match")
+        .interact()
+    {
+        Ok(master) => Zeroizing::new(master),
+        Err(err) => {
+            remove_written(&path);
+            return Err(prompt_failed(err));
+        }
+    };
     if master.is_empty() {
+        remove_written(&path);
         return Err(Error::Refused(
             "an empty master credential is not usable; nothing was written".to_string(),
         ));
     }
 
-    briefcred_core::paths::ensure_private_dir(&paths.profiles_dir())?;
-    std::fs::write(&path, &yaml).map_err(|e| Error::io("write", &path, e))?;
-
-    let location = store_master(paths, source_kind, &source_key, &master)?;
+    let location = match store_master(paths, source_kind, &source_key, &master) {
+        Ok(location) => location,
+        Err(err) => {
+            remove_written(&path);
+            return Err(err);
+        }
+    };
     Ok(Bootstrapped {
         path,
         source_key,
@@ -115,28 +148,88 @@ pub async fn run(paths: &Paths, sock: &Path, source_kind: SourceKind) -> Result<
     })
 }
 
-/// Ask the daemon to run the profile's unlock gate, and nothing else.
+/// How long to wait for the daemon's profile watcher to pick the file up.
 ///
-/// A profile that has just been described does not exist to the daemon yet, so
-/// a `no such profile` answer here is expected on a first bootstrap and is not
-/// a reason to refuse: the presence check is best effort for a profile the
-/// daemon has never seen.
-async fn unlock(sock: &Path, profile: &str) -> Result<()> {
-    let request = Request::Unlock {
-        profile: profile.to_string(),
-        client_headless: briefcred_core::session_env::is_headless(),
-    };
-    match crate::client::request(sock, request).await {
-        Ok(Response::Unlocked { .. }) | Ok(Response::Error { .. }) => Ok(()),
-        Ok(Response::Locked { reason, message }) => Err(Error::Locked { reason, message }),
-        Ok(other) => Err(Error::Unexpected(format!("{other:?}"))),
+/// The watcher debounces for 250 ms, so this is an order of magnitude more
+/// than the happy path needs and still short enough that a user does not
+/// wonder whether it has hung.
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Wait for the daemon to see the new profile, then run its unlock gate.
+///
+/// Both halves have to succeed. A profile the daemon never loaded cannot have
+/// its policy applied, and a gate that was not satisfied means the master must
+/// not be collected — those are the two ways this check could quietly become a
+/// no-op, which is exactly what it did in the first version of this command.
+async fn gate(sock: &Path, profile: &str) -> Result<()> {
+    let mut connection = match crate::client::Connection::open(sock).await {
+        Ok(connection) => connection,
         // The daemon being down does not stop somebody setting a profile up;
-        // it stops them using it, which they will find out at the first exec.
+        // it stops them using it, which they find out at the first exec. This
+        // is the one case where the gate is skipped, and it says so out loud.
         Err(Error::NotRunning) => {
-            eprintln!("briefcred: the daemon is not running, so presence was not checked");
-            Ok(())
+            eprintln!(
+                "briefcred: the daemon is not running, so presence was not checked; \
+                 the profile's unlock policy will apply from the first `briefcred exec`"
+            );
+            return Ok(());
         }
-        Err(err) => Err(err),
+        Err(err) => return Err(err),
+    };
+
+    wait_for_profile(&mut connection, profile).await?;
+
+    match connection
+        .send(Request::Unlock {
+            profile: profile.to_string(),
+            client_headless: briefcred_core::session_env::is_headless(),
+        })
+        .await?
+    {
+        Response::Unlocked { .. } => Ok(()),
+        Response::Locked { reason, message } => Err(Error::Locked { reason, message }),
+        Response::Error { message } => Err(Error::Refused(message)),
+        other => Err(Error::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Poll `ShowProfile` until the daemon has loaded the file that was just written.
+async fn wait_for_profile(connection: &mut crate::client::Connection, profile: &str) -> Result<()> {
+    let deadline = Instant::now() + RELOAD_TIMEOUT;
+    let mut last;
+    loop {
+        match connection
+            .send(Request::ShowProfile {
+                name: profile.to_string(),
+            })
+            .await?
+        {
+            Response::Profile { .. } => return Ok(()),
+            // The expected answer while the watcher's debounce is still
+            // running; kept so the timeout can quote the daemon's own words.
+            Response::Error { message } => last = message,
+            other => return Err(Error::Unexpected(format!("{other:?}"))),
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Refused(format!(
+                "the daemon did not load the new profile within {}s ({last}); \
+                 nothing was written",
+                RELOAD_TIMEOUT.as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Take the profile back off the disk after a bootstrap that did not finish.
+fn remove_written(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "briefcred: could not remove the half-written profile {}: {err}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -298,6 +391,142 @@ fn prompt_failed(err: dialoguer::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use briefcred_proto::{read_frame, write_frame};
+
+    /// A stub daemon on a real socket, answering each request from a script.
+    ///
+    /// The gate's whole contract is "what did the daemon say, and what did the
+    /// CLI do about it", so the tests drive it with a daemon that says exactly
+    /// what the case under test needs.
+    async fn stub_daemon(
+        sock: std::path::PathBuf,
+        replies: Vec<Response>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            for reply in replies {
+                match read_frame::<_, Request>(&mut stream).await {
+                    Ok(Some(_)) => {}
+                    _ => return,
+                }
+                if write_frame(&mut stream, &reply).await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// A profile file, already written, as `run` would have left it.
+    fn written_profile(dir: &Path) -> PathBuf {
+        let path = dir.join("db-ro.yaml");
+        std::fs::write(&path, "name: db-ro\n").unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_refused_unlock_aborts_and_takes_the_profile_back_off_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        let path = written_profile(dir.path());
+
+        let daemon = stub_daemon(
+            sock.clone(),
+            vec![
+                // The watcher has seen it...
+                Response::Profile {
+                    profile: briefcred_proto::ProfileSummary {
+                        name: "db-ro".into(),
+                        description: None,
+                        unlock_policy: "biometric".into(),
+                        unlock_cache_secs: 300,
+                        credentials: Vec::new(),
+                    },
+                },
+                // ...and then the user cancels the Touch ID prompt.
+                Response::Locked {
+                    reason: "cancelled".into(),
+                    message: "the unlock prompt was cancelled".into(),
+                },
+            ],
+        )
+        .await;
+
+        let err = gate(&sock, "db-ro").await.unwrap_err();
+        assert!(matches!(err, Error::Locked { .. }), "{err}");
+        assert_eq!(err.exit_code(), crate::error::EXIT_LOCKED);
+
+        // `run` removes the file on any gate failure; this asserts the helper
+        // it calls to do so leaves nothing behind.
+        remove_written(&path);
+        assert!(
+            !path.exists(),
+            "a bootstrap that did not finish must not leave a profile behind"
+        );
+        daemon.abort();
+    }
+
+    #[tokio::test]
+    async fn a_profile_the_daemon_never_loads_aborts_rather_than_asking_for_the_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        // Every `ShowProfile` answers "no such profile", so the poll times out.
+        let daemon = stub_daemon(
+            sock.clone(),
+            (0..64)
+                .map(|_| Response::Error {
+                    message: "no profile `db-ro`".to_string(),
+                })
+                .collect(),
+        )
+        .await;
+
+        let err = gate(&sock, "db-ro").await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("did not load the new profile"), "{text}");
+        assert!(
+            text.contains("no profile `db-ro`"),
+            "the daemon's own words: {text}"
+        );
+        assert!(text.contains("nothing was written"), "{text}");
+        daemon.abort();
+    }
+
+    #[tokio::test]
+    async fn a_loaded_profile_and_a_satisfied_gate_is_the_only_way_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        let daemon = stub_daemon(
+            sock.clone(),
+            vec![
+                Response::Profile {
+                    profile: briefcred_proto::ProfileSummary {
+                        name: "db-ro".into(),
+                        description: None,
+                        unlock_policy: "none".into(),
+                        unlock_cache_secs: 0,
+                        credentials: Vec::new(),
+                    },
+                },
+                Response::Unlocked {
+                    profile: "db-ro".into(),
+                },
+            ],
+        )
+        .await;
+
+        gate(&sock, "db-ro").await.unwrap();
+        daemon.abort();
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_is_not_running_skips_the_gate_and_says_so() {
+        // The one documented case where the check is skipped: setting a profile
+        // up must not require the daemon to be running.
+        gate(Path::new("/nonexistent/sock"), "db-ro").await.unwrap();
+    }
 
     #[test]
     fn a_generated_postgres_profile_loads_and_validates() {

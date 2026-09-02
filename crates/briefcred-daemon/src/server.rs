@@ -543,6 +543,7 @@ async fn handle_exec(request: Request, state: Arc<State>) -> Response {
         &args,
         pid,
         state.raw_args,
+        state.metrics(),
     )
     .await;
 
@@ -585,6 +586,7 @@ async fn handle_exec_done(request: Request, state: Arc<State>) -> Response {
         mint_ids,
         exit_code,
         duration_ms,
+        hold_until_expiry,
     } = request
     else {
         return mismatched(&request);
@@ -592,7 +594,7 @@ async fn handle_exec_done(request: Request, state: Arc<State>) -> Response {
 
     let _ = state.sessions.touch(&session_id).await;
     let parsed: Vec<MintId> = mint_ids.iter().filter_map(|id| id.parse().ok()).collect();
-    let entries = match state.sessions.take_mints(&session_id, &parsed).await {
+    let mut entries = match state.sessions.take_mints(&session_id, &parsed).await {
         Ok(entries) => entries,
         Err(err) => {
             return Response::Error {
@@ -600,6 +602,15 @@ async fn handle_exec_done(request: Request, state: Arc<State>) -> Response {
             }
         }
     };
+    // `briefcred get` printed a value the caller is about to use, so the
+    // credential has to outlive the command that fetched it. It is still
+    // queued — just scheduled for its own expiry, so it is cleaned up promptly
+    // once it stops being useful instead of being left to the reconciler.
+    if hold_until_expiry {
+        for entry in &mut entries {
+            entry.hold_until_expiry();
+        }
+    }
     let profile = state
         .sessions
         .profile_of(&session_id)
