@@ -20,6 +20,18 @@ Four things go into the decision, and nothing else.
 | `resource` | `Http::"<host><path>"`, with attributes `host`, `path`, `scheme` |
 | `context` | what the session has already done, and what time it is |
 
+The `Http` resource is **per request**, and on HTTP/2 that means per stream. A
+client that multiplexes a hundred calls onto one connection is asked a hundred
+separate questions, each with its own method, path, and `context`; nothing is
+decided once for the connection. A gRPC call is a `POST` whose path is the
+service and method, so it is named the same way anything else is:
+
+```cedar
+permit(principal, action == Action::"POST", resource)
+when { resource.host == "api.vendor.com" &&
+  resource.path like "/vendor.v1.Embeddings/*" };
+```
+
 The seven methods are grouped under `Action::"http"`, so `action in
 [Action::"http"]` permits any of them without listing them. A method that is
 not one of the seven — `TRACE`, say — has no action at all, so no policy can
@@ -90,6 +102,10 @@ is now attack surface.
 
 **Headers.** The one header that matters is the credential, and briefcred
 already knows which credential the request is for from the token.
+
+**A gRPC call's trailers.** `grpc-status` and `grpc-message` arrive after the
+body, and briefcred relays them without reading them. A policy rules on which
+method may be called and never on what it answered.
 
 **A WebSocket's messages.** A handshake is a `GET`, and the policy decides it as
 one: permitting `resource.path == "/ws"` for `Action::"GET"` is what opens a

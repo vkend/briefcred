@@ -408,6 +408,7 @@ only credential the vendor accepts. So the proxy is the mechanism, and the
 | `swap` | What does the outgoing request carry instead? |
 | `tls` | Terminating the client's TLS, and re-encrypting upstream. |
 | `stream` | What happens after the head, when a response is long-lived. |
+| `http2` | The client connection's shape, and the upstream connection cache. |
 | `listener` | The loop that puts all of it in order. |
 | `revocation` | The `(session, credential)` pairs no longer honoured. |
 
@@ -512,6 +513,51 @@ Neither outlives its grant. `until_stale` is the same one-second poll
 `pgproxy` runs on a live connection, mirrored rather than shared so that
 neither proxy's liveness rules can be changed by an edit aimed at the other,
 and it ends both halves on expiry, revocation, or the session closing.
+
+### HTTP/2, and where it does not diverge
+
+The client-facing `ServerConfig` advertises ALPN `h2` and `http/1.1`. A client
+that picks `h2` is served by `hyper::server::conn::http2` instead of `http1`,
+over **the same service**: `forward` is called once per stream, and the token,
+the proof, the quota, the Cedar decision, the swap, and the `ProxyRequest` row
+are the ones any other request gets. That is the whole of the server-side
+change, and it is deliberate — a stream *is* a request, so there is nothing for
+a second pipeline to do.
+
+The upstream negotiates independently, by ALPN on the connection the proxy
+opens. Three cases, and the pipeline does not distinguish between them:
+an HTTP/2 client with an HTTP/1.1 upstream, an HTTP/1.1 client with an HTTP/2
+upstream, and both ends on the same version. A WebSocket handshake is the one
+exception and is pinned to `http/1.1` at both ends, because RFC 8441's HTTP/2
+spelling of `Upgrade` is a protocol briefcred does not speak.
+
+An HTTP/2 upstream connection is cached and multiplexed; an HTTP/1.1 one is
+still a fresh connection per request. The cache key is
+`(session, credential, host, port)` and nothing looser. Two sessions hold two
+different masters, and connection reuse is exactly what invites an upstream to
+treat a connection as authenticated, so the key makes the isolation a type-level
+fact rather than a rule to remember. Dials happen under the cache lock, because
+two streams racing to be first to a host would otherwise each open a
+connection — which passes every correctness assertion while quietly undoing the
+multiplexing gRPC exists for.
+
+Headers that HTTP/2 forbids — `connection`, `keep-alive`, `proxy-connection`,
+`transfer-encoding`, `upgrade` — are stripped when an HTTP/1.1 client's request
+goes over an HTTP/2 upstream. `te` is not: gRPC sends `te: trailers`, which is
+the one value HTTP/2 keeps, and stripping it would break the requests that most
+need trailers.
+
+Trailers are relayed as body frames, never buffered and never read. That is all
+gRPC needs from a proxy: `grpc-status` and `grpc-message` arrive after the body,
+so the trailer frame is the call's result, and briefcred forwards it without
+ever knowing what it says.
+
+One `ProxyH2Connection` row is written when a client's connection closes, and
+every `ProxyRequest` and `ProxyStream` row from it carries its `connection_id`.
+Without it a hundred rows from one connection could only be reassembled by
+guessing from timestamps. The connection row names the mint of the first stream
+that resolved a session, and a connection where none ever did gets no row — the
+same rule every proxy row follows.
 
 ### What never happens
 

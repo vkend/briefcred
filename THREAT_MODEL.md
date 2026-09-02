@@ -462,6 +462,36 @@ An event stream is a narrower case of the same trade: its body is forwarded
 rather than examined, but it is a response, so the policy already decided the
 request that produced it and nothing the agent sends travels on it.
 
+### Phase 9: HTTP/2 changes the framing, and trailers are opaque
+
+HTTP/2 does not widen what the policy decides. Each stream on a client's
+connection is one request: it carries its own token, is charged its own quota
+token, is put to Cedar on its own method, host, and path, and writes its own
+`ProxyRequest` row. A connection carrying a hundred calls is a hundred
+decisions. Nothing is decided once for the connection, which is the mistake a
+connection-level proxy would make.
+
+**Trailers are opaque to policy, and to the audit log.** gRPC ends a call in a
+trailer frame — `grpc-status`, `grpc-message` — that arrives after the body.
+briefcred relays it untouched and never reads it, so a policy decides whether a
+method may be *called* and never what it *answered*, and no trailer's value can
+appear in a row. That is the same trade the response body has always been:
+briefcred rules on requests, not on results.
+
+Upstream connection reuse is where HTTP/2 could have introduced a new hole, and
+the cache key is what closes it. An HTTP/2 upstream connection is cached on
+`(session, credential, host, port)`, so two sessions holding two different
+masters can never share one. This matters because connection reuse is precisely
+what invites an upstream to treat a connection as authenticated: a vendor that
+authenticated the first stream on a connection and trusted the rest would be
+handed only streams from the session that opened it. HTTP/1.1 upstreams are not
+pooled at all.
+
+The `ProxyH2Connection` row carries no path, no status, and nothing from any
+stream's headers, body, or trailers. It is a shape — how many streams, how long,
+how many bytes each way — and the per-stream rows it aggregates are the ones
+that say what was reached.
+
 ## Phase 8: profile distribution, and what a trust root is worth
 
 A profile is not inert configuration. It names the hosts a subprocess may
@@ -625,6 +655,9 @@ dangerous state, so it is worth being exact about what protects it.
   session that holds it. Every runtime `briefcred exec` wraps is on that path,
   because an environment variable is the only channel it has. See **Phase 4**
   above for what the token is still bounded by.
+- A gRPC call's trailers are outside the policy. briefcred relays `grpc-status`
+  and `grpc-message` without reading them, so a policy rules on which methods
+  may be called and never on what they answered; see **Phase 9** above.
 - A WebSocket's payloads are outside the policy. briefcred decides whether the
   connection may be opened and then forwards bytes without reading them; see
   **Phase 6** above for what still bounds it.

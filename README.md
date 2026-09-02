@@ -1029,6 +1029,57 @@ A stream does not outlive its grant. The same one-second liveness poll the
 Postgres proxy uses runs for as long as a stream is open, and expiry,
 revocation, or the session closing ends both halves within about a second.
 
+### HTTP/2 and gRPC
+
+The client-facing side of a `CONNECT` tunnel advertises ALPN `h2` and
+`http/1.1`, and a client that picks `h2` is served HTTP/2. The upstream
+negotiates **separately**, on its own connection: an HTTP/2 client whose vendor
+only speaks HTTP/1.1 still gets its request forwarded, and an HTTP/1.1 client
+whose vendor speaks HTTP/2 gets the benefit without knowing about it. A plain
+`http://` request with an absolute URI stays HTTP/1.1, and so does a WebSocket
+handshake, which has no HTTP/2 spelling briefcred speaks.
+
+Nothing else changes. **A stream is a request**: the token is verified, the
+quota is charged, and the Cedar policy decides each stream on its own, so a
+connection carrying a hundred calls is a hundred decisions and a hundred
+`proxy_request` rows.
+
+An upstream HTTP/2 connection is kept and multiplexed, keyed on the session,
+the credential, and the destination together. Nothing looser: two sessions hold
+two different masters, and an upstream that treats a connection as
+authenticated must never be handed one session's stream on another's.
+
+**gRPC works over this with nothing gRPC-specific in the proxy.** A gRPC call is
+a `POST` whose path is the service and method, so a policy names it as one:
+
+```yaml
+policy: |
+  permit(principal, action == Action::"POST", resource)
+  when { resource.host == "api.vendor.com" &&
+    resource.path like "/vendor.v1.Embeddings/*" };
+```
+
+Bodies are never buffered, so all four call shapes work: unary,
+server-streaming, client-streaming, and bidirectional. Trailers are relayed
+frame for frame, which is what makes gRPC work at all — `grpc-status` and
+`grpc-message` arrive after the body, and a proxy that dropped the trailer frame
+would deliver every byte of every response and then fail every call. briefcred
+forwards trailers without reading them.
+
+When a client's HTTP/2 connection closes it gets one `proxy_h2_connection` row,
+alongside the per-stream rows, which each name it:
+
+```json
+{"event":"proxy_h2_connection","connection_id":"h2-9f31c0a2b4de",
+ "host":"api.vendor.com","started":"...","ended":"...",
+ "streams":140,"bytes_up":81204,"bytes_down":2140338}
+```
+
+There is no path and no status on it, because a connection has many of each.
+`briefcred_proxy_h2_connections_total` and `briefcred_proxy_h2_streams_total`
+count the same two things; the ratio between them is how you tell a client that
+is multiplexing from one that has fallen back to a connection per call.
+
 ### Revoking
 
 `briefcred exec` finishing revokes the grant: the daemon stops honouring any
@@ -1039,6 +1090,10 @@ discardable exactly when the token it names would have expired anyway, so a
 daemon restart loses nothing a token could still be used with.
 
 ### The limit, stated plainly
+
+A gRPC call's trailers are opaque to the policy. briefcred relays
+`grpc-status` and `grpc-message` untouched and never reads them, so a policy
+decides whether a method may be called and never what it answered.
 
 A WebSocket is opaque to the policy after its handshake. briefcred decides
 whether the connection may be opened, and then forwards bytes; it does not

@@ -8,6 +8,32 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **HTTP/2 and gRPC through the HTTP proxy**, and with it Phase 9 of the
+  roadmap. The client-facing side of a `CONNECT` tunnel advertises ALPN `h2`
+  and `http/1.1`; a client that picks `h2` is served by `hyper`'s HTTP/2 server
+  over the same request pipeline, one call per stream. Plain `http://`
+  absolute-URI requests and WebSocket handshakes stay HTTP/1.1.
+- **The upstream negotiates separately.** An HTTP/2 client whose vendor speaks
+  only HTTP/1.1 is forwarded either way, and so is the reverse. An HTTP/2
+  upstream connection is kept and multiplexed, keyed on
+  `(session, credential, host, port)` so two sessions holding two different
+  masters can never share one; HTTP/1.1 upstreams are still a connection per
+  request. Connection-specific headers an HTTP/1.1 client may send are stripped
+  when a request crosses to an HTTP/2 upstream, except `te`, which gRPC needs.
+- **gRPC works with nothing gRPC-specific in the proxy.** Bodies are never
+  buffered and trailers are relayed as frames, so all four call shapes — unary,
+  server-streaming, client-streaming, bidirectional — work, and `grpc-status`
+  and `grpc-message` reach the client unread. A gRPC call is a `POST` whose
+  path is the service and method, so a Cedar policy names it like anything
+  else, per stream.
+- **A `proxy_h2_connection` audit row** when a client's HTTP/2 connection
+  closes, carrying the connection's shape — streams, duration, bytes each way —
+  and nothing from any stream's headers, body, or trailers. Every
+  `proxy_request` and `proxy_stream` row from that connection gains a
+  `connection_id` naming it, so a hundred rows read back as the one connection
+  they were. New metrics `briefcred_proxy_h2_connections_total` and
+  `briefcred_proxy_h2_streams_total`.
+
 - **Zero-downtime upgrade**, and with it Phase 7 of the roadmap.
   `briefcred daemon upgrade [--binary <path>]` replaces the running daemon
   without closing a socket. The CLI starts the new binary with
