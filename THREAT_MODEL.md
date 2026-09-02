@@ -465,15 +465,58 @@ parses one.
 So what bounds a `postgres-proxy` credential is:
 
 - **the upstream role's own privileges.** Whatever `config.user` may do, the
-  subprocess may do, for the life of the session. This is the whole of the
+  subprocess may do, for as long as it holds the grant. This is the whole of the
   authorisation story, and it means the role named in a `postgres-proxy` config
   should be the least-privileged role that can do the job — not the superuser,
   where there is any alternative.
 - **the credential's `ttl_secs`,** after which the token stops verifying.
 - **the session,** which a `briefcred exec` finishing or a session close ends.
 - **the daemon being alive.** Unlike a minted role, this credential is worthless
-  the moment the daemon stops. That is a availability cost and a security
+  the moment the daemon stops. That is an availability cost and a security
   benefit at the same time.
+
+### The bound applies to connections that are already open
+
+This is the part that is easy to get wrong, so it is stated as a guarantee
+rather than left implied. A credential is checked when a connection is opened,
+and a database connection then lives for as long as its client keeps it — so a
+proxy that checked once and relayed thereafter would let a subprocess that
+connected at the start of a run keep master-privileged access after its grant
+was revoked and past the token's own expiry. The three bounds above would be
+true of new connections and false of the connection that mattered.
+
+briefcred therefore re-checks every live connection **once a second**, and
+closes it when any of three things becomes true: the token's `exp` has passed,
+the `(session, credential)` pair has been revoked, or the session is gone. The
+guarantee is:
+
+> A `postgres-proxy` connection outlives its grant by at most one second.
+
+Not zero seconds, and the difference is deliberate: a subscription would have a
+window between reading the current state and registering for changes in which a
+revoke could be missed, and closing that window would mean new locking inside
+two structures the HTTP proxy also depends on. A stated one-second bound is
+worth more than an invariant spread across three modules.
+
+The `exp` used here is the token's own, **not** `exp + CLOCK_SKEW_SECS`. The
+skew allowance exists so a client whose clock is a minute fast can still present
+a token; it is not an extension of what the credential is good for, and a
+connection that is already open has no clock of its own to forgive.
+
+The client is told why. briefcred sends an `ErrorResponse` under SQLSTATE
+`57P01` (`admin_shutdown`) — the same code PostgreSQL itself uses when an
+administrator terminates a backend, so a driver already knows to treat the
+connection as gone. It is sent only when the server-to-client stream is between
+messages; mid-row, the sockets are closed without it, because handing a client
+bytes its parser cannot place is a worse failure than a socket that ends. The
+proxy tracks message boundaries by arithmetic on the five-byte header alone and
+never examines a body, so this costs nothing of the "no statement is ever seen"
+property.
+
+What this does **not** bound is a statement already in flight when the second
+elapses: it completes at the database. Ending a running query would mean issuing
+a cancellation and waiting on it, and a connection that is being closed for a
+revoked credential is not one to keep alive while negotiating.
 
 Where `postgres-dynamic` is possible, it remains the better answer: a minted
 role can be granted strictly less than the master holds, and it is revocable at

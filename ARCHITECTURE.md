@@ -519,6 +519,21 @@ briefcred's own CA, for a client that will not connect without one.
   through a fixed 16 KiB buffer without parsing them, so the audit row's silence
   about queries is structural rather than a policy that could be changed.
 
+### And it keeps checking
+
+`relay` does not run until a socket closes. It runs until a socket closes **or**
+a liveness check fires, and the check asks three questions on a one-second timer:
+has the token's `exp` passed, has the `(session, credential)` pair been revoked,
+is the session still open. Without it the proxy would be a chokepoint that
+checks a credential once and then relays for as long as the client likes, which
+is worth very little.
+
+On termination the client gets an `ErrorResponse` under `57P01`
+(`admin_shutdown`), but only if the server-to-client stream is between messages.
+To know that, the relay tracks frame boundaries in that one direction —
+arithmetic on the tag-and-length header, never a body — so "no statement is ever
+seen" survives intact. Mid-message, the sockets simply close.
+
 ### What it does not do
 
 The profile's Cedar policy is not applied. The policy vocabulary is HTTP's —

@@ -31,6 +31,13 @@ All notable changes to briefcred are recorded here. The format follows
   to the unbound mechanism, and refuses a master password outside printable
   ASCII rather than hashing it without SASLprep. MD5 is refused unless
   `pgproxy.allow_md5` is set; cleartext upstream is never answered at all.
+- **A live `postgres-proxy` connection is bound by its grant, not only checked
+  at connect time.** Every open connection is re-examined once a second and
+  closed when the token expires, when the `(session, credential)` pair is
+  revoked, or when the session ends — so a connection outlives its grant by at
+  most a second. The client is told why with an `ErrorResponse` under SQLSTATE
+  `57P01` (`admin_shutdown`), sent only when the stream is between messages so a
+  client that is mid-parse is never handed bytes it cannot place.
 - **`PgConnection` audit rows**: timestamp, mint id, the upstream role's name,
   start and end times, and the bytes each way. No statement, and no field one
   could be recorded in.

@@ -622,6 +622,23 @@ the mint id, the upstream role, when it started and ended, and the bytes each
 way. There is no query in it, and there is no field a query could go in — after
 authentication the proxy does not parse the protocol at all.
 
+### A connection does not outlive its grant
+
+The credential is checked when the connection opens, and a database connection
+then lives for as long as the client keeps it — so the proxy keeps checking.
+Every live connection is re-examined once a second, and closed when the token
+expires, when the grant is revoked, or when the session ends. A `postgres-proxy`
+connection outlives its grant by at most one second.
+
+The client is told why: an `ErrorResponse` under SQLSTATE `57P01`
+(`admin_shutdown`), which is what PostgreSQL sends when an administrator
+terminates a backend. If the connection is mid-message when the moment comes,
+the sockets are closed without it rather than corrupting the client's parse.
+
+So `briefcred exec` finishing really does end the access, `briefcred session
+close` really does end it, and `ttl_secs` is a lifetime rather than a lifetime
+for new connections only.
+
 ### The limit, stated plainly
 
 A `postgres-proxy` credential is **not** bounded by the profile's Cedar policy.
