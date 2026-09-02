@@ -64,7 +64,7 @@ impl Ports {
             Err(_) => return Ports::default(),
         };
         let mut ports = Ports::default();
-        let mut read = |key: &str, into: &mut u16| {
+        let read = |key: &str, into: &mut u16| {
             if let Some(port) = parsed.get(key).and_then(toml::Value::as_integer) {
                 if let Ok(port) = u16::try_from(port) {
                     *into = port;

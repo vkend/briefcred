@@ -244,6 +244,33 @@ impl Daemon {
         }
     }
 
+    /// Wait for the daemon to exit on its own, reaping it when it does.
+    ///
+    /// `try_wait` and not a signal probe: this process is the daemon's parent,
+    /// so an exited daemon it has not reaped is a zombie — and a zombie still
+    /// answers `kill -0`. A test asking "has the daemon that handed over
+    /// finished draining" would be told "no" forever.
+    pub async fn wait_for_exit(&mut self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            match self.child.as_mut() {
+                None => return true,
+                Some(child) => match child.try_wait() {
+                    Ok(Some(_)) => {
+                        self.child = None;
+                        return true;
+                    }
+                    Ok(None) => {}
+                    Err(_) => return false,
+                },
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// The daemon's own stdout and stderr, for a failure message.
     pub fn log(&self) -> String {
         std::fs::read_to_string(self.home.path().join("logs").join("daemon.log"))
