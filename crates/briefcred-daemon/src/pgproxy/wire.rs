@@ -91,6 +91,14 @@ pub const SQLSTATE_CONNECTION_FAILURE: &str = "08006";
 /// how to interpret as "this connection is gone, reconnect if you still can".
 pub const SQLSTATE_ADMIN_SHUTDOWN: &str = "57P01";
 
+/// The SQLSTATE for a connection the session's quota refuses.
+///
+/// `53300` is `too_many_connections`, from the `53` class — "insufficient
+/// resources". Deliberately not `28000`: a driver reads that as a credential
+/// problem and stops, where the truthful answer here is that the credential is
+/// fine and the client is asking for too much of it.
+pub const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
+
 /// Why a message could not be read.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
@@ -446,6 +454,7 @@ mod tests {
             (SQLSTATE_INVALID_AUTHORIZATION, "28000"),
             (SQLSTATE_CONNECTION_FAILURE, "08006"),
             (SQLSTATE_ADMIN_SHUTDOWN, "57P01"),
+            (SQLSTATE_TOO_MANY_CONNECTIONS, "53300"),
         ] {
             assert_eq!(sqlstate, expected);
             let body = String::from_utf8_lossy(&fatal_error(sqlstate, "x").body).to_string();

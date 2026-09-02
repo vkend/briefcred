@@ -37,6 +37,13 @@ pub const OUTCOME_UPSTREAM_ERROR: &str = "upstream_error";
 /// What arrived was not a PostgreSQL connection briefcred serves.
 pub const OUTCOME_PROTOCOL_ERROR: &str = "protocol_error";
 
+/// The token authorised the connection; the session's quota is spent.
+///
+/// Distinct from [`OUTCOME_DENY`] because nothing is wrong with the credential:
+/// a rising `deny` means a profile or a stale token, and a rising `quota` means
+/// a client opening connections faster than the profile budgeted for.
+pub const OUTCOME_QUOTA: &str = "quota";
+
 /// One `PgConnection` audit row. Metadata only, by construction.
 pub fn connection_row(
     mint_id: &MintId,
@@ -138,16 +145,17 @@ mod tests {
     }
 
     #[test]
-    fn the_four_outcomes_are_the_ones_the_metric_documents() {
+    fn the_five_outcomes_are_the_ones_the_metric_documents() {
         let outcomes = [
             OUTCOME_ALLOW,
             OUTCOME_DENY,
             OUTCOME_UPSTREAM_ERROR,
             OUTCOME_PROTOCOL_ERROR,
+            OUTCOME_QUOTA,
         ];
         assert_eq!(
             outcomes,
-            ["allow", "deny", "upstream_error", "protocol_error"]
+            ["allow", "deny", "upstream_error", "protocol_error", "quota"]
         );
     }
 }

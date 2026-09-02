@@ -64,12 +64,13 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::pgproxy::audit::{
-    OUTCOME_ALLOW, OUTCOME_DENY, OUTCOME_PROTOCOL_ERROR, OUTCOME_UPSTREAM_ERROR,
+    OUTCOME_ALLOW, OUTCOME_DENY, OUTCOME_PROTOCOL_ERROR, OUTCOME_QUOTA, OUTCOME_UPSTREAM_ERROR,
 };
 use crate::pgproxy::forward;
 use crate::pgproxy::startup::{self, Opening, Startup, StartupError};
 use crate::pgproxy::wire;
 use crate::proxy::issuer::ProxyIssuer;
+use crate::quota::TokenBucket;
 use crate::server::State;
 
 /// The hostname a `pgproxy.tls` leaf is issued for.
@@ -340,6 +341,18 @@ async fn serve_session(
         Err(reason) => return refuse(&mut stream, proxy, reason).await,
     };
 
+    // Before the upstream connect. A connection briefcred is going to refuse
+    // must not have opened a real one behind it, and a database that saw the
+    // connection would have logged a login the client never got.
+    if let Err(refusal) = crate::quota::charge(
+        grant.quota.as_deref(),
+        &grant.profile,
+        crate::quota::SURFACE_POSTGRES,
+        proxy.state.metrics(),
+    ) {
+        return throttle(&mut stream, proxy, &grant, refusal).await;
+    }
+
     let upstream = match forward::connect(
         &grant.config.upstream(),
         &grant.config.user,
@@ -475,6 +488,10 @@ struct Grant {
     config: PgProxyConfig,
     master: Zeroizing<String>,
     mint_id: MintId,
+    /// The profile the session was opened for, for the quota's metric label.
+    profile: String,
+    /// The session's token bucket, when its profile sets a `quota`.
+    quota: Option<Arc<TokenBucket>>,
     /// The session the token names, so the connection can be watched for it
     /// being closed while the connection is still open.
     sid: String,
@@ -524,11 +541,12 @@ async fn authorize(
                     .values()
                     .find(|mint| mint.credential == claims.cred)
                     .map(|mint| mint.mint_id.clone()),
+                session.quota.clone(),
             )
         })
         .await
         .map_err(|err| err.to_string())?;
-    let (profile_name, masters, mint_id) = session;
+    let (profile_name, masters, mint_id, quota) = session;
 
     let profile = proxy
         .state
@@ -577,6 +595,8 @@ async fn authorize(
         config,
         master,
         mint_id,
+        profile: profile_name,
+        quota,
         sid: claims.sid,
         credential: claims.cred,
         expires_at: claims.exp,
@@ -641,6 +661,44 @@ async fn refuse(
     .await;
     let _ = stream.shutdown().await;
     Err(ConnectionError::Refused(reason))
+}
+
+/// Refuse the connection because the session's quota is spent, then close it.
+///
+/// SQLSTATE `53300`, `too_many_connections`, which is the code PostgreSQL
+/// itself uses for "this server will not open another connection for you right
+/// now". A driver already knows not to treat it as a credential problem, which
+/// is exactly the distinction a client needs: retrying the same password later
+/// is the right move, and re-reading the connection string is not.
+///
+/// Unlike [`refuse`], the client is told which limit it hit. A quota is a
+/// number the profile's own author chose rather than a secret, and a client
+/// that cannot tell "slow down" from "you are not authorised" will retry the
+/// one case where retrying is wrong.
+async fn throttle(
+    stream: &mut ClientStream,
+    proxy: &PgProxy,
+    grant: &Grant,
+    refusal: crate::quota::Refusal,
+) -> std::result::Result<(), ConnectionError> {
+    proxy.count(OUTCOME_QUOTA);
+    let message = match refusal.retry_after() {
+        Some(retry_after) => format!(
+            "briefcred: this session is over its quota; try again in {}s",
+            retry_after.as_secs()
+        ),
+        None => "briefcred: this session has spent its quota; open a new one".to_string(),
+    };
+    let _ = wire::write_message(
+        stream,
+        &wire::fatal_error(wire::SQLSTATE_TOO_MANY_CONNECTIONS, &message),
+    )
+    .await;
+    let _ = stream.shutdown().await;
+    Err(ConnectionError::Refused(format!(
+        "profile `{}` is over its quota",
+        grant.profile
+    )))
 }
 
 /// Forward a `CancelRequest` to the server that issued the key, if it is ours.
