@@ -91,6 +91,13 @@ is now attack surface.
 **Headers.** The one header that matters is the credential, and briefcred
 already knows which credential the request is for from the token.
 
+**A WebSocket's messages.** A handshake is a `GET`, and the policy decides it as
+one: permitting `resource.path == "/ws"` for `Action::"GET"` is what opens a
+WebSocket, and a path the policy does not permit does not get upgraded. What
+crosses the connection afterwards is forwarded without being read, so permitting
+the handshake permits everything said over it. `THREAT_MODEL.md` states that
+cost in full.
+
 ## A first policy
 
 The narrowest useful shape: one host, one method, one path.

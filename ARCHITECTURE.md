@@ -398,6 +398,7 @@ only credential the vendor accepts. So the proxy is the mechanism, and the
 | `policy` | Is this session allowed to make this request? (cached compiles) |
 | `swap` | What does the outgoing request carry instead? |
 | `tls` | Terminating the client's TLS, and re-encrypting upstream. |
+| `stream` | What happens after the head, when a response is long-lived. |
 | `listener` | The loop that puts all of it in order. |
 | `revocation` | The `(session, credential)` pairs no longer honoured. |
 
@@ -462,6 +463,38 @@ in UTC, and the session's own `requests_so_far` and `resp_bytes_so_far`, both
 counting what happened *before* this request. That is what lets a policy
 express a time window or a per-session budget, which a per-request vocabulary
 of method, host and path cannot.
+
+### Streaming, and where it diverges
+
+Two responses do not end when their head does, and `proxy::stream` is the whole
+of the difference. Everything above still happens first: a stream is one
+request, and it is authorised, charged, and decided exactly as any other.
+
+An event stream — `Content-Type: text/event-stream` — keeps the ordinary
+streamed body and puts a line scanner over it. The scanner holds at most the
+first five bytes of the line in flight, which is enough to tell a `data:` field
+from any other and not enough to hold an event's value, and it counts blocks
+that a blank line dispatched. The `Content-Length` the upstream may have sent is
+dropped, because the body the client is about to receive ends when the upstream
+stops rather than at a count stated in advance.
+
+A WebSocket handshake is a `GET` with `Upgrade: websocket` and `Connection:
+Upgrade`, and the policy decides it as a `GET` on that path. After the swap the
+handshake goes upstream intact; briefcred forwarded the client's own
+`Sec-WebSocket-Key`, so the upstream's `101` is only accepted if
+`Sec-WebSocket-Accept` is the token derived from it. The client then gets a
+`101` built field by field from the upstream's, and both halves are taken over
+and byte-forwarded. The frame parser reads opcode, mask bit, and length, steps
+over the payload, and never unmasks one.
+
+Each stream writes a `ProxyStream` row when it closes, in addition to the
+`ProxyRequest` row for the head that opened it. A stream that ran for an hour
+would otherwise be one row written at the start with nothing after it.
+
+Neither outlives its grant. `until_stale` is the same one-second poll
+`pgproxy` runs on a live connection, mirrored rather than shared so that
+neither proxy's liveness rules can be changed by an edit aimed at the other,
+and it ends both halves on expiry, revocation, or the session closing.
 
 ### What never happens
 

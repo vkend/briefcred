@@ -406,6 +406,43 @@ deliberate and load-bearing:
 The path is enough to answer "what did the agent reach" without being enough to
 reconstruct what it sent.
 
+A stream adds a `ProxyStream` row when it closes, on the same terms and with the
+same omissions. Its `events_or_frames` is a count of framing — event blocks a
+blank line dispatched, or WebSocket frame headers — produced without reading any
+event's data or any frame's payload. The row cannot hold content because nothing
+that builds it ever has any.
+
+### Phase 6: what a WebSocket costs, and it is not nothing
+
+A WebSocket is the one thing that crosses this proxy which the Cedar policy does
+not decide. The handshake is decided: it is a `GET`, it goes through the token
+check, the quota, and the policy on its path, and an upstream that answers `101`
+without the correct `Sec-WebSocket-Accept` for the client's own key is refused
+rather than relayed. After that, briefcred forwards bytes.
+
+**The payloads are opaque to policy.** briefcred does not decode, inspect, or
+rule on WebSocket messages. It parses frame headers — opcode, mask bit, length
+— to know how far the next header is and to count what went past, and it never
+unmasks a payload. So a profile that permits a WebSocket path has permitted
+everything an agent chooses to say over that connection, for as long as the
+connection lives.
+
+Three things still bound it, and they are the reason this is a stated cost
+rather than a hole:
+
+- The connection reaches exactly one host and path, the one the policy
+  permitted. A WebSocket is not a general tunnel: the destination came from the
+  `CONNECT` line and the handshake was decided against it.
+- The real credential is on the handshake and never reaches the client. What
+  the subprocess holds is still only a synthetic token.
+- The connection does not outlive its grant. Expiry, revocation, or the session
+  closing ends both halves within about a second, on the same one-second poll
+  the Postgres proxy uses.
+
+An event stream is a narrower case of the same trade: its body is forwarded
+rather than examined, but it is a response, so the policy already decided the
+request that produced it and nothing the agent sends travels on it.
+
 ## Phase 8: profile distribution, and what a trust root is worth
 
 A profile is not inert configuration. It names the hosts a subprocess may
@@ -497,6 +534,9 @@ own trust root, or run the credential-bearing subprocess directly.
   session that holds it. Every runtime `briefcred exec` wraps is on that path,
   because an environment variable is the only channel it has. See **Phase 4**
   above for what the token is still bounded by.
+- A WebSocket's payloads are outside the policy. briefcred decides whether the
+  connection may be opened and then forwards bytes without reading them; see
+  **Phase 6** above for what still bounds it.
 - A trust root is a key without a scope, and there is no signature revocation.
   Withdrawing a publisher means removing its trust root from `daemon.toml`; see
   **Phase 8** above.

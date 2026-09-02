@@ -8,6 +8,36 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **Streaming through the HTTP proxy**, and with it Phase 6 of the roadmap.
+  Server-sent events and WebSocket now cross the proxy, and both go through the
+  same checks as any other request first — the token, the quota, and the Cedar
+  policy all decide a stream before a byte of it exists.
+- **Server-sent events** are forwarded chunk by chunk as the upstream produces
+  them, with nothing collected: an event reaches the subprocess when it is sent,
+  keep-alive comments pass through untouched, and an upstream close closes the
+  client's stream. Any `Content-Length` the upstream put on an event stream is
+  dropped, because a body that ends when its upstream ends has no length to
+  state in advance. Events are counted by a line scanner that never holds more
+  than the first five bytes of the line it is reading.
+- **WebSocket.** A request carrying `Upgrade: websocket` and `Connection:
+  Upgrade` is decided by the policy as the `GET` it is, so a profile that does
+  not permit the handshake's path does not get a WebSocket. briefcred forwards
+  the client's own `Sec-WebSocket-Key` and refuses to relay unless the
+  upstream's `101` carries the `Sec-WebSocket-Accept` derived from it; after
+  that both halves are byte-forwarded, with frame headers parsed for the count
+  and payloads never unmasked or inspected.
+- **A `proxy_stream` audit row** when a stream closes, alongside the
+  `proxy_request` row for the response or `101` that opened it: kind, host,
+  path, start, end, `events_or_frames`, and bytes in each direction. It counts
+  framing only, so no event's data and no frame's payload can reach it.
+- **`briefcred_proxy_streams_total{kind}`** and
+  **`briefcred_proxy_stream_duration_seconds{kind}`**, both labelled `sse` or
+  `ws` and both seeded at zero. The duration histogram has bucket bounds of its
+  own, from a second to two hours: a stream is not a latency, and on the request
+  scale every one of them would land in `+Inf`.
+- **A stream does not outlive its grant.** The same one-second liveness poll the
+  Postgres proxy runs on a live connection now runs for as long as a stream is
+  open, and ends both halves on expiry, revocation, or the session closing.
 - **Signed profile distribution**, and with it Phase 8 of the roadmap. A
   profile fetched from somewhere else names the hosts a subprocess may reach
   and the credentials briefcred will mint, so briefcred now keeps two kinds of

@@ -226,13 +226,20 @@ currently being written, and ignores any filename it did not write.
 | `briefcred_revoke_failures_total{kind}` | counter | Revoke attempts that failed, by minter kind |
 | `briefcred_proxy_requests_total{decision,status_class}` | counter | Proxied requests, by decision and status class |
 | `briefcred_proxy_latency_seconds{kind}` | histogram | Time for one proxied request, by policy decision |
+| `briefcred_proxy_streams_total{kind}` | counter | Long-lived streams that have ended, `sse` or `ws` |
+| `briefcred_proxy_stream_duration_seconds{kind}` | histogram | How long a stream stayed open, by kind |
 | `briefcred_pgproxy_connections_total{outcome}` | counter | Postgres connections, by outcome |
 | `briefcred_pgproxy_bytes_total{direction}` | counter | Bytes relayed by the Postgres proxy, by direction |
 | `briefcred_quota_saturation{profile}` | gauge | How full a profile's session quota is, 0 to 1, where 1 is empty |
 | `briefcred_quota_rejections_total{profile,surface}` | counter | Charges a quota refused, by profile and by `http`/`postgres`/`exec`/`mcp` |
 
-The two histograms time failures as well as successes: a backend that takes
-thirty seconds to refuse is exactly what they exist to show. A rising
+`briefcred_proxy_stream_duration_seconds` has bucket bounds of its own, running
+from a second to two hours: a stream is not a latency, and measured on the
+request scale every one of them would land in `+Inf`. It is counted when a
+stream *closes*, because that is the only moment its duration exists.
+
+The mint and revoke histograms time failures as well as successes: a backend
+that takes thirty seconds to refuse is exactly what they exist to show. A rising
 `briefcred_revoke_failures_total` is the series to alert on — a revoke that
 keeps failing is a credential that is still live.
 
@@ -938,6 +945,46 @@ proxy: always
 That points a subprocess at the proxy with a Cedar allowlist and no credentials
 at all, which is a usable egress control on its own.
 
+### Streaming: server-sent events and WebSocket
+
+Both go through the proxy, and both go through the same checks first. A
+streaming response is still one request: the token is verified, the quota is
+charged, and the policy decides it before a byte of it exists.
+
+**Server-sent events.** A response whose `Content-Type` is `text/event-stream`
+is forwarded chunk by chunk as the upstream produces it. Nothing is collected:
+an event reaches the subprocess when it is sent, keep-alive comments
+(`: still here`) are passed through untouched, and the upstream closing closes
+the client's stream. The proxy drops any `Content-Length` the upstream put on
+it, because the length of a stream that ends when its upstream ends is not a
+number anyone can state in advance.
+
+**WebSocket.** A request carrying `Upgrade: websocket` and `Connection:
+Upgrade` is a `GET`, and the policy decides it as one — a profile that does not
+permit the handshake's path does not get a WebSocket. If it is permitted, the
+credential is swapped in, the handshake is completed with the upstream, and the
+upstream's `101` is checked: briefcred forwards the client's own
+`Sec-WebSocket-Key` and will not relay unless the accept token comes back
+correct. After that the two halves are byte-forwarded in both directions.
+
+Each stream gets a `proxy_stream` audit row when it ends, alongside the
+`proxy_request` row for the response or the `101` that started it:
+
+```json
+{"event":"proxy_stream","kind":"sse","host":"api.openai.com",
+ "path":"/v1/responses","started":"...","ended":"...",
+ "events_or_frames":412,"bytes_up":390,"bytes_down":88213}
+```
+
+`events_or_frames` counts framing and nothing else: blank-line-terminated event
+blocks that carried a `data:` field, or WebSocket frame headers in both
+directions. No event's data and no frame's payload is read to produce it, and a
+WebSocket payload is never unmasked.
+
+A stream does not outlive its grant. The same one-second liveness poll the
+Postgres proxy uses runs for as long as a stream is open, and expiry,
+revocation, or the session closing ends both halves within about a second.
+
 ### Revoking
 
 `briefcred exec` finishing revokes the grant: the daemon stops honouring any
@@ -948,6 +995,11 @@ discardable exactly when the token it names would have expired anyway, so a
 daemon restart loses nothing a token could still be used with.
 
 ### The limit, stated plainly
+
+A WebSocket is opaque to the policy after its handshake. briefcred decides
+whether the connection may be opened, and then forwards bytes; it does not
+read, decode, or rule on the messages that cross it. A profile that permits a
+WebSocket path permits everything an agent chooses to say over it.
 
 A token bound to a session key can be proved: a client that signs a `DPoP`
 header demonstrates possession of the key the token's `cnf.jkt` names, and the
