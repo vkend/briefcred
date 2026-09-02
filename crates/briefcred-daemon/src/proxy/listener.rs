@@ -498,6 +498,11 @@ async fn forward(
     let Some(session) = resolve_session(&proxy, &claims.sid, &claims.cred).await else {
         return attempt.refuse(StatusCode::UNAUTHORIZED, None, DECISION_DENY);
     };
+    // The connection is named by the first grant a stream of it resolved, and
+    // this is the only place one is resolved.
+    if let Some(connection) = connection.as_deref() {
+        connection.note_mint(&session.mint_id);
+    }
 
     // 3. A proof, if the client made one.
     if let Some(proof) = request.headers().get("dpop").and_then(|v| v.to_str().ok()) {

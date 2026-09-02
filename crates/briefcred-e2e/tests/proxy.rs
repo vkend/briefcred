@@ -507,6 +507,20 @@ impl ProxyClient {
         &self,
         port: u16,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+        self.tunnel_with_alpn(port, &[]).await
+    }
+
+    /// The same tunnel, offering `alpn` when it terminates TLS.
+    ///
+    /// Empty offers nothing, which is what a client that only speaks HTTP/1.1
+    /// does; `[b"h2"]` is what an HTTP/2 client or a gRPC runtime sends, and
+    /// is how a test says which half of the proxy's ALPN branch it is
+    /// exercising.
+    async fn tunnel_with_alpn(
+        &self,
+        port: u16,
+        alpn: &[&[u8]],
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
         let mut stream = TcpStream::connect(&self.proxy_addr)
             .await
             .map_err(|e| e.to_string())?;
@@ -544,13 +558,14 @@ impl ProxyClient {
         for certificate in rustls_pemfile::certs(&mut self.briefcred_ca.as_bytes()) {
             roots.add(certificate.map_err(|e| e.to_string())?).unwrap();
         }
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
+        config.alpn_protocols = alpn.iter().map(|name| name.to_vec()).collect();
         let name = rustls_pki_types::ServerName::try_from(UPSTREAM_HOST).unwrap();
         tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect(name, stream)
@@ -1734,24 +1749,23 @@ async fn scrape(daemon: &Daemon) -> String {
 /// answered and durable a moment later. Polling for it is the difference
 /// between a test that checks the row and one that checks the scheduler.
 async fn proxy_row_written(daemon: &Daemon) -> bool {
+    row_written(daemon, "proxy_request").await
+}
+
+/// Wait until a row of `event` has reached the disk.
+///
+/// The audit writer is a task of its own, so every row lands a moment after the
+/// thing it records finished.
+async fn row_written(daemon: &Daemon, event: &str) -> bool {
     briefcred_e2e::daemon_harness::wait_until(Duration::from_secs(10), || async {
-        daemon
-            .audit_rows()
-            .iter()
-            .any(|row| row["event"] == "proxy_request")
+        daemon.audit_rows().iter().any(|row| row["event"] == event)
     })
     .await
 }
 
 /// Wait until a `ProxyStream` row has reached the disk.
 async fn stream_row_written(daemon: &Daemon) -> bool {
-    briefcred_e2e::daemon_harness::wait_until(Duration::from_secs(10), || async {
-        daemon
-            .audit_rows()
-            .iter()
-            .any(|row| row["event"] == "proxy_stream")
-    })
-    .await
+    row_written(daemon, "proxy_stream").await
 }
 
 /// The mint identifiers the daemon recorded for this session.
@@ -1762,4 +1776,173 @@ async fn mint_ids(daemon: &Daemon) -> Vec<String> {
         .filter(|row| row["event"] == "mint")
         .filter_map(|row| row["mint_id"].as_str().map(str::to_string))
         .collect()
+}
+
+// ------------------------------------------------------------------- HTTP/2
+
+/// Open an HTTP/2 connection through the tunnel and hand back its sender.
+///
+/// The `alpn` the client offers is `h2` and nothing else, so a proxy that had
+/// not learned to speak it would fail the handshake rather than quietly answer
+/// HTTP/1.1 — which is the failure this whole branch exists to prevent.
+async fn http2_through_the_proxy(
+    client: &ProxyClient,
+    port: u16,
+) -> (
+    hyper::client::conn::http2::SendRequest<http_body_util::Empty<hyper::body::Bytes>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let tls = client
+        .tunnel_with_alpn(port, &[b"h2"])
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(&b"h2"[..]),
+        "the proxy must offer h2 on the connection it terminates"
+    );
+    let (sender, connection) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(tls),
+    )
+    .await
+    .unwrap();
+    (sender, tokio::spawn(async move { let _ = connection.await; }))
+}
+
+#[tokio::test]
+async fn an_http2_client_reaches_the_upstream_with_the_real_key() {
+    let fixture = start("enforce").await;
+    let (mut sender, driver) = http2_through_the_proxy(&fixture.client, fixture.upstream.port).await;
+
+    // Two streams on the one connection, which is the thing HTTP/1.1 could not
+    // have done and the reason the connection row exists at all.
+    for _ in 0..2 {
+        let request = hyper::Request::builder()
+            .method("GET")
+            .uri(format!("https://{UPSTREAM_HOST}/v1/models"))
+            .header("authorization", format!("Bearer {}", fixture.token))
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+            .unwrap();
+        let response = sender
+            .send_request(request)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+        assert_eq!(response.status(), 200, "{}", fixture.daemon.log());
+        assert_eq!(response.version(), hyper::Version::HTTP_2);
+        use http_body_util::BodyExt as _;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"{\"data\":[]}");
+    }
+
+    let seen = fixture.upstream.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for request in &seen {
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some(format!("Bearer {REAL_KEY}").as_str()),
+            "the upstream must see the real key on every stream"
+        );
+    }
+
+    // The connection's row is written when the connection closes.
+    drop(sender);
+    let _ = driver.await;
+    assert!(
+        row_written(&fixture.daemon, "proxy_h2_connection").await,
+        "no proxy_h2_connection row:\n{}",
+        fixture.daemon.log()
+    );
+
+    let rows = fixture.daemon.audit_rows();
+    let connection = rows
+        .iter()
+        .find(|row| row["event"] == "proxy_h2_connection")
+        .expect("a proxy_h2_connection row");
+    assert_eq!(connection["host"], UPSTREAM_HOST);
+    assert_eq!(connection["streams"], 2);
+    assert_eq!(connection["bytes_down"], 22, "two eleven-byte bodies");
+    let id = connection["connection_id"].as_str().expect("an identifier");
+
+    let requests: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"] == "proxy_request")
+        .collect();
+    assert_eq!(requests.len(), 2, "one row per stream");
+    for request in requests {
+        assert_eq!(request["decision"], "allow");
+        assert_eq!(
+            request["connection_id"], id,
+            "every stream's row must name the connection it was one of"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_http2_stream_the_policy_refuses_is_still_a_stream_on_the_connection() {
+    let fixture = start("enforce").await;
+    let (mut sender, driver) = http2_through_the_proxy(&fixture.client, fixture.upstream.port).await;
+
+    let request = hyper::Request::builder()
+        .method("GET")
+        .uri(format!("https://{UPSTREAM_HOST}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {}", fixture.token))
+        .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+        .unwrap();
+    let response = sender.send_request(request).await.unwrap();
+    assert_eq!(response.status(), 403);
+    // The body has to go before the connection can: an unread response body
+    // holds its stream open, and the connection outlives its last stream.
+    drop(response);
+    assert!(
+        fixture.upstream.seen.lock().unwrap().is_empty(),
+        "a denied stream must not reach the upstream"
+    );
+
+    drop(sender);
+    let _ = driver.await;
+    assert!(
+        row_written(&fixture.daemon, "proxy_h2_connection").await,
+        "rows: {:?}
+log: {}",
+        fixture.daemon.audit_rows(),
+        fixture.daemon.log()
+    );
+    let rows = fixture.daemon.audit_rows();
+    let connection = rows
+        .iter()
+        .find(|row| row["event"] == "proxy_h2_connection")
+        .expect("a proxy_h2_connection row");
+    assert_eq!(
+        connection["streams"], 1,
+        "a refused stream is still a stream the client opened"
+    );
+    assert_eq!(connection["bytes_up"], 0);
+    assert_eq!(connection["bytes_down"], 0);
+}
+
+#[tokio::test]
+async fn an_http1_client_is_unaffected_and_gets_no_connection_row() {
+    let fixture = start("enforce").await;
+    let (status, _, _) = fixture
+        .client
+        .get("/v1/models", &bearer(&fixture.token))
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+    assert_eq!(status, 200);
+
+    assert!(proxy_row_written(&fixture.daemon).await);
+    let rows = fixture.daemon.audit_rows();
+    let request = rows
+        .iter()
+        .find(|row| row["event"] == "proxy_request")
+        .expect("a proxy_request row");
+    assert!(
+        request.get("connection_id").is_none(),
+        "an HTTP/1.1 request is not one stream of anything: {request}"
+    );
+    assert!(
+        !rows.iter().any(|row| row["event"] == "proxy_h2_connection"),
+        "no connection row without an HTTP/2 connection"
+    );
 }
