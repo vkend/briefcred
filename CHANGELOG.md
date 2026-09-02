@@ -8,6 +8,58 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **The HTTP proxy** (`briefcred-daemon::proxy`), and with it Phase 4 of the
+  roadmap. A `CONNECT` listener on `127.0.0.1:9318` terminates the wrapped
+  subprocess's TLS with a leaf from briefcred's own CA, applies the profile's
+  policy, swaps the real credential in, and re-encrypts upstream against the
+  system trust store. Plain `http://` absolute-URI requests are handled too.
+  Bodies stream in both directions and are counted as they pass; nothing is
+  buffered whole.
+- **Three credential kinds the proxy serves**: `http-bearer`, `http-header
+  { name }`, and `http-basic`. None of them mints anything — an API key is the
+  only credential the vendor will accept — so instead the daemon signs a
+  **synthetic token**, `bc.<base64url(payload)>.<base64url(signature)>`, whose
+  payload names the session, the credential, and its expiry. The subprocess
+  gets that; the real key never leaves the daemon. Each kind publishes two
+  fields, `TOKEN` and `PROXY_URL`.
+- **A per-machine Ed25519 signing key**, kept in the platform key store under
+  `token-signer` and read on the first token rather than at daemon start, so a
+  daemon nobody proxies through never prompts for keychain access.
+- **`cnf` binding and DPoP.** `OpenSession` gains `session_pubkey`: the client
+  generates a per-session Ed25519 pair and offers the public half, whose
+  thumbprint goes into every token the session is issued. A client that sends a
+  `DPoP` proof has it verified against that key; one that cannot — anything
+  whose only channel is an environment variable, which is most of them — sends
+  the token bare and it is accepted. `THREAT_MODEL.md` states what each path is
+  worth.
+- **Cedar policy** (`briefcred_core::policy`). A profile's `policy:` field is
+  Cedar source over a fixed schema: `principal` is the session, `action` is the
+  HTTP method, `resource` carries `host`, `path` and `scheme`. Compiled and
+  validated when the profile is loaded, so a typo is an error next to the file.
+  Default deny. `policy_mode: observe` logs the denial it would have made and
+  forwards the request anyway, which is how a policy is written for a real
+  workload; `enforce` is the default. `docs/policy.md` is the guide.
+- **Placeholder swap.** Any header value containing `__<credential name>__` gets
+  the master substituted, for every credential the session holds, so a profile
+  can replace an existing placeholder tool without the agent changing.
+- **Proxy environment.** `briefcred exec` sets `HTTPS_PROXY`, `HTTP_PROXY` and
+  `ALL_PROXY` alongside the trust environment whenever the profile declares an
+  HTTP credential, or whenever it says `proxy: always`.
+- **`ProxyRequest` audit rows**: timestamp, mint id, method, host, path,
+  status, request and response byte counts, latency, and decision. No headers,
+  no body, and **no query string** — a query string routinely carries a
+  credential.
+- **Two metrics series**: `briefcred_proxy_requests_total{decision,status_class}`
+  and `briefcred_proxy_latency_seconds`.
+- **`daemon.toml` gains `proxy_port` (default `9318`), `proxy_enabled`, and
+  `upstream_roots`.** The last is for the test suite and is documented as such:
+  it adds certificate authorities the proxy will believe for every upstream.
+- **`briefcred daemon status` reports the proxy's address**, next to the metrics
+  endpoint, so a user debugging "my agent cannot reach the internet" does not
+  have to read `daemon.toml` and guess whether the port was taken.
+- **`examples/profiles/openai.yaml`**: an OpenAI key that never reaches the
+  agent, with a two-endpoint Cedar allowlist.
+
 - **The `aws-sts` minter** (`briefcred-helper-sts`, binary
   `briefcred-helper-aws-sts`): one `sts:AssumeRole` session per mint, with
   `RoleSessionName` set to the mint id so every CloudTrail event resolves to a
@@ -107,6 +159,16 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Changed
 
+- **The CA's leaf cache is bounded.** It was an unbounded map keyed on the
+  hostname list joined with a comma, which both grew without limit and made
+  `["a,b"]` and `["a", "b"]` the same key. It is now a 256-entry
+  least-recently-used cache keyed on the list itself.
+- **`MinterFactory` gains `Hosting::Proxy`.** The `http-*` kinds register their
+  schema so a profile naming one is validated at load, and have no minter to
+  build: their credential's lifecycle belongs to the proxy, which needs the
+  signing key and the session, neither of which exists behind the `Minter`
+  contract. The mint, revoke, and reconcile paths all ask the registry rather
+  than special-casing three strings.
 - **`MinterFactory` splits `build` into `validate` and `construct`.** Every
   binary that reads profiles must be able to reject a bad one, but only the
   binary that mints needs the minter, so a minter whose implementation drags in

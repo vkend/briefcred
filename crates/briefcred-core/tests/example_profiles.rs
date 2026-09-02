@@ -88,3 +88,63 @@ fn the_kubectl_example_tunnels_through_a_short_lived_ssh_certificate() {
          certificate useless elsewhere"
     );
 }
+
+#[test]
+fn the_openai_example_puts_a_synthetic_token_in_the_variable_the_sdk_reads() {
+    let yaml = std::fs::read_to_string(examples_dir().join("openai.yaml")).unwrap();
+    let profile = Profile::from_yaml_str(&yaml).unwrap();
+
+    assert_eq!(profile.name, "openai");
+    let credential = profile
+        .credential("openai")
+        .expect("the example declares one credential named `openai`");
+    assert_eq!(
+        credential.kind,
+        briefcred_core::minters::http::BEARER_KIND,
+        "the point of the example is that the real key never leaves the daemon"
+    );
+
+    // The variable every OpenAI SDK reads must hold the token and nothing else.
+    assert_eq!(
+        profile.env.get("OPENAI_API_KEY").map(String::as_str),
+        Some("${minted.openai.TOKEN}")
+    );
+
+    // An example whose whole subject is the policy has to ship one, has to
+    // enforce it, and has to have it compile.
+    assert!(
+        profile.wants_proxy(),
+        "the example must route through the proxy"
+    );
+    assert_eq!(
+        profile.policy_mode,
+        briefcred_core::policy::PolicyMode::Enforce,
+        "an example left in observe mode is an example with no policy"
+    );
+    assert!(
+        profile.compiled_policy().unwrap().is_some(),
+        "the example must carry a policy"
+    );
+
+    // And it has to be an allowlist rather than a whole host: the point of the
+    // example is that `/v1/models` and `/v1/chat/completions` are permitted and
+    // fine-tuning and file uploads are not.
+    let policy = profile.compiled_policy().unwrap().unwrap();
+    let allowed = |method: &str, path: &str| {
+        policy.decide(
+            "s1",
+            &briefcred_core::policy::HttpRequest {
+                method,
+                scheme: "https",
+                host: "api.openai.com",
+                path,
+            },
+            profile.policy_mode,
+        ) == briefcred_core::policy::Outcome::Allow
+    };
+    assert!(allowed("GET", "/v1/models"));
+    assert!(allowed("POST", "/v1/chat/completions"));
+    assert!(!allowed("POST", "/v1/files"));
+    assert!(!allowed("POST", "/v1/fine_tuning/jobs"));
+    assert!(!allowed("DELETE", "/v1/models"));
+}

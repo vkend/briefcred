@@ -48,6 +48,12 @@ variables, which is Model C for that credential: the process can read
 complete the PostgreSQL authentication handshake itself. That is why Phase 10
 is sequenced immediately after the thin proxy rather than at the end.
 
+Phase 4 is what makes Model A real for HTTP. The `http-*` kinds hand the
+subprocess a **synthetic token** and keep the API key in the daemon, so the
+process can read its whole environment and still not have the credential. What
+it holds is a bearer token for briefcred's own loopback proxy, bounded by the
+session it was issued to, the profile's Cedar policy, and its own expiry.
+
 ## Crate map
 
 ```
@@ -93,6 +99,7 @@ two things every crate has to agree on.
 | `keystore` | The `KeyStore` trait, the macOS keychain backend, and the file backend. |
 | `ca` | The root CA, leaf issuance, and the runtime trust environment. |
 | `exec` | The two pure decisions behind `briefcred exec`: is the command allowed, and what environment does it get. |
+| `policy` | The fixed Cedar schema, the compiled form of a profile's `policy`, and the enforce/observe split. |
 
 ## Data flow: one `briefcred exec`
 
@@ -321,6 +328,91 @@ itself.** `Hosting::Helper` is the default and the safe answer;
 the master is then resident in the daemon. `ssh-cert` is the only one. Both
 shapes answer the same `MintChannel` trait in the daemon, so `exec` and
 `reconcile` never branch on which they have. See `CONTRIBUTING.md`.
+
+## The HTTP proxy
+
+The `http-*` credential kinds have no backend to mint at: an API key is the
+only credential the vendor accepts. So the proxy is the mechanism, and the
+`briefcred-daemon::proxy` module is where every part of it lives.
+
+| Module | Question it answers |
+| --- | --- |
+| `token` | Who sent this, and is the token still within its lifetime? |
+| `issuer` | And has the grant it names been revoked? |
+| `policy` | Is this session allowed to make this request? (cached compiles) |
+| `swap` | What does the outgoing request carry instead? |
+| `tls` | Terminating the client's TLS, and re-encrypting upstream. |
+| `listener` | The loop that puts all of it in order. |
+| `revocation` | The `(session, credential)` pairs no longer honoured. |
+
+### One request, in order
+
+```
+  subprocess          proxy                        upstream
+      |                 |                             |
+      |  CONNECT host:443                             |
+      |---------------->|                             |
+      |  200            |                             |
+      |<----------------|                             |
+      |  TLS (leaf from briefcred's CA)               |
+      |<===============>|                             |
+      |  GET /v1/models                               |
+      |  Authorization: Bearer bc.…                   |
+      |---------------->|                             |
+      |                 | 1. verify signature, expiry |
+      |                 | 2. revoked?                 |
+      |                 | 3. DPoP proof, if present   |
+      |                 | 4. Cedar: allow / deny      |
+      |                 | 5. swap in the real key     |
+      |                 |  TLS (system trust store)   |
+      |                 |<===========================>|
+      |                 |  GET /v1/models             |
+      |                 |  Authorization: Bearer sk-… |
+      |                 |---------------------------->|
+      |  streamed response body, counted as it passes |
+      |<----------------|<----------------------------|
+      |                 | 6. ProxyRequest audit row   |
+```
+
+The order is the design. The signature is checked before the payload is parsed,
+so a forged token never reaches a JSON parser. The policy runs before the swap,
+so a refused request never has a credential attached to it. And the audit row
+is written when the response body *ends*, because that is when the byte counts
+are known — streaming a gigabyte and reporting zero would make them worse than
+useless.
+
+### What never happens
+
+- **A synthetic token is never forwarded upstream.** After the swap, every
+  header value is checked again, and a request still carrying anything
+  token-shaped is refused rather than sent.
+- **Upstream TLS is never weakened.** There is no "accept any certificate" path
+  in the module. The only way to add a root is `upstream_roots` in
+  `daemon.toml`, which exists for the test suite and says so in its own
+  documentation.
+- **No header value is ever logged, formatted, or audited.** The errors name
+  headers and credentials; the values are the secrets.
+- **No query string reaches a policy or an audit row.** It routinely carries an
+  API key.
+
+### Where the destination comes from
+
+Inside a `CONNECT` tunnel the request line is origin-form, so the host and port
+come from the `CONNECT` line and nowhere else. A request that could name its own
+destination would be one that could obtain a certificate for one vendor and a
+connection to somewhere else entirely.
+
+### Lazy loading, and why
+
+Both the CA and the token-signing key live in the platform key store. Reading
+either at daemon start would prompt for keychain access at every login,
+regardless of whether anything on the machine ever proxies. So the signing key
+is read on the first token and the CA on the first tunnel, and a daemon nobody
+proxies through touches neither.
+
+The proxy **loads** a CA; it never generates one. `briefcred install` does that.
+A generated one would be a certificate nothing on the machine trusts, so the
+honest failure is to say the CA is missing and name the command that makes it.
 
 ## The MCP upgrade
 

@@ -317,6 +317,90 @@ the audit log.
   or an append-only system store is deliberately out of scope for now, and this
   line should be revisited before anyone treats the log as compliance evidence.
 
+## Phase 4: the HTTP proxy, and Model A for HTTP
+
+The `http-*` credential kinds are the first Model A path briefcred ships. The
+subprocess never holds the API key. What it holds is a **synthetic token**, and
+the whole question is what that token is worth to whoever gets it.
+
+### What the token is bounded by
+
+A stolen token is useful only:
+
+- **through this machine's loopback proxy.** It is not a credential any vendor
+  accepts. Sent to `api.openai.com` directly it is an invalid key.
+- **for the session it was issued to.** The payload names the session; the proxy
+  looks that session up, and a session that has been closed or evicted no longer
+  resolves. Closing a session is therefore a real revocation, not a hint.
+- **for the one credential it names.** A token for `openai` cannot be presented
+  to get the `stripe` key out of the same session.
+- **within the profile's Cedar policy.** The token authenticates; the policy
+  authorises. A token that reaches every endpoint is a policy that permitted
+  every endpoint.
+- **until its `exp`, or until the grant is revoked.** `briefcred exec` finishing
+  revokes it, and the proxy refuses it from that moment.
+
+### What it is not bounded by, and this is the important part
+
+**Possession.** The token's `cnf.jkt` names a per-session key, and a client that
+sends a `DPoP` proof has it checked against that key — signature, method, URI,
+and freshness. But `briefcred exec` cannot send one. The credential reaches the
+subprocess as an environment variable, and the subprocess is `curl`, or a vendor
+SDK, and neither has any idea briefcred exists.
+
+So **the proxy accepts a bare token**, and on that path the token is a bearer
+credential. Anything that can read the subprocess's environment — a sibling
+process of the same user, a core dump, a log line that prints `env` — can use
+it, for as long as it lives, from this machine.
+
+This is a real weakening and it is stated rather than hidden. What it still buys
+over Model C:
+
+| | Model C (`PGPASSWORD`) | Model A with a bare token |
+| --- | --- | --- |
+| Usable off the machine | yes | no |
+| Usable after the session closes | until revoked at the backend | no |
+| Usable outside the policy | yes | no |
+| Recorded per request | no | yes, one audit row each |
+| Value if the vendor's logs leak it | the key | nothing |
+
+The `cnf` binding is carried anyway. It costs one key generation per session, it
+is what a first-party in-process client will use the moment there is one, and a
+proof made with the wrong key is refused rather than shrugged at — so a client
+that *does* present one cannot be downgraded by an attacker who strips it.
+
+### What the proxy itself is trusted with
+
+The proxy holds every master its open sessions opened, and it terminates the
+subprocess's TLS. That makes it the most valuable process on the machine after
+the daemon it is part of — which it is, deliberately: putting it in the daemon
+means the master never crosses another process boundary to reach it.
+
+Three things bound what it can do wrong:
+
+- **The listener is loopback only.** `127.0.0.1`, never a routable address.
+- **Upstream verification is never weakened.** There is no code path that
+  accepts an unverified certificate. `upstream_roots` in `daemon.toml` adds
+  roots, is documented as being for the test suite, and logs a warning naming
+  itself every time it is used.
+- **A synthetic token cannot leak upstream.** After the credential swap, every
+  header is checked again and a request still carrying anything token-shaped is
+  refused rather than forwarded.
+
+### What the audit row does and does not hold
+
+One `ProxyRequest` row per request, whatever happened to it: timestamp, mint id,
+method, host, path, status, byte counts, latency, decision. Three omissions are
+deliberate and load-bearing:
+
+- **No headers.** One of them is the credential.
+- **No body.** It is whatever the agent decided to send.
+- **No query string.** It routinely carries an API key, and an audit log that
+  recorded it would be the secret store this row exists to make unnecessary.
+
+The path is enough to answer "what did the agent reach" without being enough to
+reconstruct what it sent.
+
 ## Known limitations, stated plainly
 
 - A local process running as the same user is inside every boundary. briefcred
@@ -333,6 +417,10 @@ the audit log.
   Revoking afterwards ends the credential's usefulness; it does not undo what
   was done with it while it was live. This is the whole of what Model C means,
   and it is why Phase 10 exists.
+- A synthetic token used without a `DPoP` proof is a bearer credential for the
+  session that holds it. Every runtime `briefcred exec` wraps is on that path,
+  because an environment variable is the only channel it has. See **Phase 4**
+  above for what the token is still bounded by.
 - The revoke queue gives up after eight attempts. A backend that is unreachable
   for longer leaves a principal behind until the reconciler's next sweep, which
   is bounded by the profile's `ttl_secs` in how long that principal is useful.

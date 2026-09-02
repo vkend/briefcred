@@ -447,11 +447,18 @@ async fn observe_mode_forwards_the_request_and_records_that_it_would_have_denied
     assert_eq!(status, 200, "observe mode must not block");
     assert_eq!(fixture.upstream.seen.lock().unwrap().len(), 1);
 
+    // The audit writer is a task of its own, so the row reaches the disk a
+    // moment after the response reaches the client.
+    assert!(
+        proxy_row_written(&fixture.daemon).await,
+        "no proxy_request row:\n{}",
+        fixture.daemon.log()
+    );
     let rows = fixture.daemon.audit_rows();
     let row = rows
         .iter()
         .find(|row| row["event"] == "proxy_request")
-        .unwrap_or_else(|| panic!("no proxy_request row in {rows:#?}"));
+        .expect("a proxy_request row");
     assert_eq!(row["decision"], "would_deny");
 }
 
@@ -574,16 +581,8 @@ async fn the_audit_row_carries_metadata_and_never_a_credential() {
         .await
         .unwrap();
 
-    let rows = briefcred_e2e::daemon_harness::wait_until(Duration::from_secs(10), || async {
-        fixture
-            .daemon
-            .audit_rows()
-            .iter()
-            .any(|row| row["event"] == "proxy_request")
-    })
-    .await;
     assert!(
-        rows,
+        proxy_row_written(&fixture.daemon).await,
         "a forwarded request must be audited:\n{}",
         fixture.daemon.log()
     );
@@ -626,6 +625,21 @@ async fn a_large_response_is_streamed_rather_than_buffered() {
         first_byte_at < Duration::from_millis(500),
         "the first byte took {first_byte_at:?}; the response was buffered"
     );
+}
+
+/// Wait until a `ProxyRequest` row has reached the disk.
+///
+/// The audit writer is its own task, so a row is queued when the response is
+/// answered and durable a moment later. Polling for it is the difference
+/// between a test that checks the row and one that checks the scheduler.
+async fn proxy_row_written(daemon: &Daemon) -> bool {
+    briefcred_e2e::daemon_harness::wait_until(Duration::from_secs(10), || async {
+        daemon
+            .audit_rows()
+            .iter()
+            .any(|row| row["event"] == "proxy_request")
+    })
+    .await
 }
 
 /// The mint identifiers the daemon recorded for this session.

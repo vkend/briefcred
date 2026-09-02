@@ -182,6 +182,9 @@ the socket file, and writes a `daemon_stop` row.
 | `retention_days` | `90` | Audit logs older than this are deleted |
 | `metrics_port` | `9317` | Loopback port for `/metrics`; `0` asks for a free one |
 | `metrics_enabled` | `true` | Whether to serve `/metrics` at all |
+| `proxy_port` | `9318` | Loopback port for the HTTP proxy; `0` asks for a free one |
+| `proxy_enabled` | `true` | Whether to run the HTTP proxy at all |
+| `upstream_roots` | none | **For tests.** A PEM bundle of extra CAs the proxy trusts upstream |
 | `session_idle_secs` | `1800` | Seconds a session may go untouched before it is wiped |
 | `master_source` | platform default | `"keychain"`, `"file"`, or `"env"` |
 | `ca.keystore` | platform default | `"keychain"` or `"file"`; where the CA key lives |
@@ -209,6 +212,8 @@ currently being written, and ignores any filename it did not write.
 | `briefcred_mint_duration_seconds{kind}` | histogram | Time to mint one credential, by minter kind |
 | `briefcred_revoke_duration_seconds{kind}` | histogram | Time for one revoke attempt, by minter kind |
 | `briefcred_revoke_failures_total{kind}` | counter | Revoke attempts that failed, by minter kind |
+| `briefcred_proxy_requests_total{decision,status_class}` | counter | Proxied requests, by policy decision and status class |
+| `briefcred_proxy_latency_seconds{kind}` | histogram | Time for one proxied request, by policy decision |
 
 The two histograms time failures as well as successes: a backend that takes
 thirty seconds to refuse is exactly what they exist to show. A rising
@@ -254,7 +259,9 @@ The child starts from **nothing**. `env_clear()` runs first, so a credential
 that happens to be in your shell does not travel into a process briefcred is
 meant to be constraining. It then gets, in order:
 
-1. the trust environment (`SSL_CERT_FILE` and the rest) pointing at the local CA;
+1. the trust environment (`SSL_CERT_FILE` and the rest) pointing at the local
+   CA, and — where the profile has HTTP credentials or asks for it — the proxy
+   environment (`HTTPS_PROXY` and the rest) pointing at the local proxy;
 2. the passthrough list — `PATH`, `HOME`, `TERM`, `LANG`, `TMPDIR`, plus
    anything the profile's `env_passthrough` names — copied from your own
    environment, and only when you actually have it;
@@ -394,6 +401,20 @@ entry that is a path permits only that path, which is how you pin a binary. An
 empty list means "any", for both allowlists, and is worth narrowing before an
 agent uses the profile.
 
+Three more keys govern the HTTP proxy, described under **The HTTP proxy**:
+
+```yaml
+policy: |                  # Cedar source; absent means deny everything
+  permit(principal, action == Action::"GET", resource)
+  when { resource.host == "api.openai.com" };
+policy_mode: enforce       # enforce (default) | observe
+proxy: auto                # auto (default) | always
+```
+
+`policy` is compiled and validated against briefcred's fixed Cedar schema when
+the profile is loaded, so a typo is an error next to the file rather than a
+request that is quietly denied later. `docs/policy.md` is the guide.
+
 Unknown keys are errors at every level, so a typo cannot silently switch a
 control off. `${minted.<credential>.<field>}` must name a credential the
 profile declares; `${config.<key>}` is resolved at exec time. Every regex in
@@ -490,6 +511,9 @@ it, so they never touch real user directories.
 | `postgres-dynamic` | A `LOGIN` role with a random password and a `VALID UNTIL` | The master role's password | `briefcred-helper-postgres-dynamic` |
 | `aws-sts` | An `sts:AssumeRole` session | `AKIA...:secret`, or the ambient chain | `briefcred-helper-aws-sts` |
 | `ssh-cert` | An OpenSSH user certificate and the key it belongs to | The CA private key, OpenSSH PEM | The daemon itself |
+| `http-bearer` | A synthetic token; the real key stays in the daemon | The API key | The daemon's HTTP proxy |
+| `http-header` | The same, sent under a header the profile names | The header's value | The daemon's HTTP proxy |
+| `http-basic` | The same, sent as HTTP basic auth | `user:password` | The daemon's HTTP proxy |
 
 The third column is not decoration. A minter that opens a network connection
 with a master credential gets a process of its own, so a bug in its parser
@@ -597,6 +621,117 @@ and why a short `ttl_secs` is doing most of the work.
 A daemon killed mid-`exec` leaves a key directory behind, so the reconciler
 sweeps `$TMPDIR/briefcred-*` for mints whose certificate has passed its
 `valid_before`. A directory whose certificate cannot be read is left alone.
+
+## The HTTP proxy
+
+The three `http-*` credential kinds work differently from every other minter,
+because there is nothing to mint. An OpenAI API key is the only credential
+OpenAI will accept; briefcred cannot create a short-lived one. What it can do
+is make sure the subprocess never holds it.
+
+So `briefcred exec` hands the subprocess a **synthetic token** —
+`bc.<payload>.<signature>` — and points it at a proxy on loopback:
+
+```sh
+briefcred exec --profile=openai -- \
+  curl https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"
+```
+
+The subprocess believes it has a key. What it has is a signed statement naming
+a session and a credential, which is worth nothing to anything except
+briefcred's proxy on this machine.
+
+### What happens to one request
+
+1. `curl` sends `CONNECT api.openai.com:443` to `127.0.0.1:9318`.
+2. The proxy answers `200` and terminates the TLS the client then starts, with
+   a leaf issued by briefcred's own CA. The client trusts it because
+   `briefcred exec` set the CA-bundle variables (see **Trust environment**).
+3. The proxy reads the inner HTTP/1.1 request and finds the synthetic token.
+   It checks the signature, the expiry, and whether the grant has been revoked.
+4. It asks the profile's Cedar policy whether this session may make this
+   request. Default deny; see `docs/policy.md`.
+5. It replaces the token with the real credential, rendered for the kind, and
+   forwards the request over its own TLS connection to the real vendor —
+   verified against the system trust store, with no way to weaken that.
+6. Bodies stream through in both directions. Nothing is buffered whole.
+7. One `ProxyRequest` audit row is written when the response ends: method,
+   host, path, status, byte counts, latency, decision. No headers, no body,
+   and no query string.
+
+A request the policy refuses never reaches the vendor at all, and no
+credential is attached to it.
+
+### The three kinds
+
+| `kind` | Master | What the upstream receives |
+| --- | --- | --- |
+| `http-bearer` | the token | `Authorization: Bearer <master>` |
+| `http-header` | the value | `<config.name>: <master>` |
+| `http-basic` | `user:password` | `Authorization: Basic <base64(master)>` |
+
+Each publishes two fields: `TOKEN`, the synthetic token, and `PROXY_URL`, the
+address it has to be sent through — for a runtime that ignores `HTTPS_PROXY`
+and has to be told explicitly.
+
+```yaml
+credentials:
+  - name: openai
+    kind: http-bearer
+    ttl_secs: 900
+env:
+  OPENAI_API_KEY: ${minted.openai.TOKEN}
+```
+
+`examples/profiles/openai.yaml` is a complete one.
+
+### Placeholders
+
+For a tool that already speaks the `__name__` convention, any header value
+containing `__<credential name>__` gets the real value substituted, for every
+credential the session holds:
+
+```yaml
+env:
+  MY_TOOL_HEADER: "X-Api-Key: __openai__"
+```
+
+The request still has to carry a synthetic token somewhere, because that is how
+the proxy knows which session it belongs to.
+
+### The proxy environment
+
+`briefcred exec` sets `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` — three
+spellings because there is no agreement on which one a runtime reads — whenever
+the profile declares at least one `http-*` credential. A profile whose value is
+the *policy* rather than a credential can ask for them anyway:
+
+```yaml
+proxy: always
+```
+
+That points a subprocess at the proxy with a Cedar allowlist and no credentials
+at all, which is a usable egress control on its own.
+
+### Revoking
+
+`briefcred exec` finishing revokes the grant: the daemon stops honouring any
+token naming that session and credential, at once, and the proxy answers `403`.
+There is nothing at a vendor to undo, so the revoke cannot fail. It is held in
+memory only, which is correct rather than a shortcut — every entry is
+discardable exactly when the token it names would have expired anyway, so a
+daemon restart loses nothing a token could still be used with.
+
+### The limit, stated plainly
+
+A token bound to a session key can be proved: a client that signs a `DPoP`
+header demonstrates possession of the key the token's `cnf.jkt` names, and the
+proxy checks it. `briefcred exec` cannot do that, because the credential
+reaches the subprocess as an environment variable and the subprocess is `curl`.
+So the proxy also accepts a bare token, and on that path **the token is a bearer
+credential**: anything that can read the subprocess's environment can use it,
+for as long as it lives, from this machine. `THREAT_MODEL.md` says what that
+does and does not buy.
 
 ## Model Context Protocol tools
 
