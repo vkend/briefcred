@@ -1454,7 +1454,7 @@ async fn serve_connection(
     table: Arc<HashMap<&'static str, Handler>>,
     mut closing: tokio::sync::watch::Receiver<bool>,
 ) {
-    let expected_uid = own_uid();
+    let expected_uid = crate::own_uid();
     match stream.peer_cred() {
         Ok(cred) if cred.uid() == expected_uid => {}
         Ok(cred) => {
@@ -1527,14 +1527,6 @@ async fn serve_connection(
             return;
         }
     }
-}
-
-/// The uid this process is running as, and the only one it serves.
-#[allow(unsafe_code)]
-fn own_uid() -> u32 {
-    // SAFETY: `getuid` takes no arguments, touches no memory, and is
-    // documented as always succeeding.
-    unsafe { libc::getuid() }
 }
 
 #[cfg(test)]

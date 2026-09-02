@@ -45,14 +45,6 @@ use crate::proxy::issuer::ProxyIssuer;
 use crate::server::State;
 use crate::session::HttpCounters;
 
-/// How often a live stream re-checks that its grant is still a grant.
-///
-/// The same second the Postgres proxy uses, and for the same reason: the cost
-/// is a map lookup per second per live stream, and what it buys is a bound on
-/// how long a revoked credential keeps delivering that can be stated in
-/// seconds rather than argued from three modules at once.
-const LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// How many bytes a relay accumulates before telling the session's counters.
 ///
 /// The counters are what a Cedar `context.resp_bytes_so_far` reads, so a
@@ -349,26 +341,14 @@ pub struct Liveness {
 ///
 /// The returned string is the reason, for the daemon's log.
 pub async fn until_stale(state: &State, issuer: &ProxyIssuer, live: &Liveness) -> &'static str {
-    let mut ticker = tokio::time::interval(LIVENESS_INTERVAL);
-    // `interval` fires immediately, and the grant was checked a moment ago.
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        // The token's own `exp`, with no skew allowance. The allowance exists
-        // so a client whose clock runs fast can still present a token; it is
-        // not an extension of what the credential is good for, and a stream
-        // already open has no clock of its own to forgive.
-        if now >= live.expires_at {
-            return "the credential expired";
-        }
-        if issuer.is_revoked(&live.sid, &live.credential, now) {
-            return "the credential was revoked";
-        }
-        if !state.sessions().contains(&live.sid).await {
-            return "the session was closed";
-        }
-    }
+    crate::proxy::revocation::until_stale(
+        state,
+        issuer,
+        &live.sid,
+        &live.credential,
+        live.expires_at,
+    )
+    .await
 }
 
 /// Everything a [`AuditEntry::ProxyStream`] row needs, fixed when it opens.

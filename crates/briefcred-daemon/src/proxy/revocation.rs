@@ -28,6 +28,54 @@ use std::sync::Mutex;
 
 use crate::proxy::token::CLOCK_SKEW_SECS;
 
+/// How often a live connection or stream re-checks the grant behind it.
+///
+/// One second. Both proxies state the same bound — a connection or a stream
+/// outlives its grant by at most this long — so it is one constant rather than
+/// two that could drift apart.
+pub const LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Wait until the grant behind a live connection stops being one.
+///
+/// Resolves with the reason, which is what the client is told and what the
+/// daemon logs. It never resolves while the grant is good, so a caller selects
+/// on it against whatever the connection is actually doing.
+///
+/// Three things end a grant, and they are checked in the order they are cheap:
+/// the token's `exp` has passed, the `(session, credential)` pair has been
+/// revoked, or the session is gone. The expiry is the token's own `exp` with no
+/// skew allowance — the allowance exists so a client whose clock runs fast can
+/// still *present* a token, and a connection already open has no clock of its
+/// own to forgive.
+///
+/// Shared by the HTTP proxy's streams and the Postgres proxy's connections
+/// because it is the same guarantee: one grant, re-checked once a second, for
+/// as long as something is open on it.
+pub async fn until_stale(
+    state: &crate::server::State,
+    issuer: &crate::proxy::issuer::ProxyIssuer,
+    sid: &str,
+    credential: &str,
+    expires_at: i64,
+) -> &'static str {
+    let mut ticker = tokio::time::interval(LIVENESS_INTERVAL);
+    // `interval` fires immediately, and the grant was checked a moment ago.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if now >= expires_at {
+            return "the credential expired";
+        }
+        if issuer.is_revoked(sid, credential, now) {
+            return "the credential was revoked";
+        }
+        if !state.sessions().contains(sid).await {
+            return "the session was closed";
+        }
+    }
+}
+
 /// Every `(session, credential)` pair the proxy will no longer serve.
 #[derive(Debug, Default)]
 pub struct RevocationSet {

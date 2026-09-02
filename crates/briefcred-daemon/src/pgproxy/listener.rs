@@ -96,9 +96,9 @@ const TERMINATION: &str = "briefcred: this credential has been revoked or has ex
 
 /// How often a live connection's grant is re-checked.
 ///
-/// One second. It is the bound `THREAT_MODEL.md` states, so it is a constant
-/// rather than a literal: a connection outlives its grant by at most this long.
-pub const LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// One second, and the same constant the HTTP proxy's streams use: the bound
+/// `THREAT_MODEL.md` states is one bound, not two that could drift apart.
+pub use crate::proxy::revocation::LIVENESS_INTERVAL;
 
 /// Everything one proxied connection needs, shared across all of them.
 pub struct PgProxy {
@@ -634,26 +634,14 @@ async fn authorize(
 ///
 /// The returned string is the reason, for the log and for the audit trail.
 async fn until_stale(proxy: &PgProxy, grant: &Grant) -> &'static str {
-    let mut ticker = tokio::time::interval(LIVENESS_INTERVAL);
-    // `interval` fires immediately, and the grant was checked a moment ago.
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        // The token's own `exp`, not `exp + CLOCK_SKEW_SECS`. The allowance
-        // exists so a client whose clock is a minute fast can still present a
-        // token; it is not an extension of what the credential is good for, and
-        // a connection already open has no clock of its own to forgive.
-        if now >= grant.expires_at {
-            return "the credential expired";
-        }
-        if proxy.issuer.is_revoked(&grant.sid, &grant.credential, now) {
-            return "the credential was revoked";
-        }
-        if !proxy.state.sessions().contains(&grant.sid).await {
-            return "the session was closed";
-        }
-    }
+    crate::proxy::revocation::until_stale(
+        &proxy.state,
+        &proxy.issuer,
+        &grant.sid,
+        &grant.credential,
+        grant.expires_at,
+    )
+    .await
 }
 
 /// Refuse the connection with a proper `ErrorResponse`, then close it.

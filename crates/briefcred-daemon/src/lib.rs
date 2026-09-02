@@ -31,6 +31,19 @@ pub mod session;
 pub mod test_support;
 pub mod unlock;
 
+/// The uid this process runs as, and the only one briefcred serves.
+///
+/// One function, because it answers one question in two places that must not
+/// disagree: the IPC socket refuses a peer whose uid is not this, and a handoff
+/// refuses a successor whose uid is not this. Two copies of a security check
+/// are two chances for one of them to be edited.
+#[allow(unsafe_code)]
+pub fn own_uid() -> u32 {
+    // SAFETY: `getuid` takes no arguments, touches no memory, and is
+    // documented as always succeeding.
+    unsafe { libc::getuid() }
+}
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::net::SocketAddr;

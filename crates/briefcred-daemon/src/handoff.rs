@@ -691,7 +691,7 @@ impl Takeover {
 
         // The same uid check the IPC socket makes, for the same reason: the
         // mode bits are the boundary, and this is the assertion that they held.
-        let expected = own_uid();
+        let expected = crate::own_uid();
         match stream.peer_cred() {
             Ok(cred) if cred.uid() == expected => {}
             Ok(cred) => {
@@ -1062,14 +1062,6 @@ pub async fn rebuild_sessions(
         });
     }
     Ok(out)
-}
-
-/// The uid this process runs as, and the only one a handoff is accepted from.
-#[allow(unsafe_code)]
-fn own_uid() -> u32 {
-    // SAFETY: `getuid` takes no arguments, touches no memory, and is
-    // documented as always succeeding.
-    unsafe { libc::getuid() }
 }
 
 /// Turn a raw descriptor back into a listening socket.
