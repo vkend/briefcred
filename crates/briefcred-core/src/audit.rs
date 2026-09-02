@@ -13,8 +13,8 @@ use crate::types::{MintId, RevokeOutcome};
 
 /// One append-only audit record.
 ///
-/// Later phases add `ProxyRequest` and `PgConnection` variants; the enum is
-/// tagged so adding one does not change how existing rows deserialise.
+/// The enum is tagged, so adding a variant does not change how existing rows
+/// deserialise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AuditEntry {
@@ -156,6 +156,42 @@ pub enum AuditEntry {
         /// to go and look at something.
         decision: String,
     },
+    /// One connection crossed the Postgres proxy.
+    ///
+    /// Metadata only, and here the omissions are almost the whole row. There is
+    /// no query, no result, and no parameter, because after authentication the
+    /// proxy copies bytes without parsing them and could not record a statement
+    /// if it wanted to. What is left is who connected, as whom upstream, for how
+    /// long, and how much moved — which is what an operator investigating "who
+    /// was in the warehouse at four in the morning" actually needs.
+    ///
+    /// Written when the connection closes, because that is when the byte counts
+    /// and the end time exist. A connection refused before its session was
+    /// resolved gets no row at all: the row names a `mint_id`, and a client
+    /// whose token did not verify has not named a grant briefcred made.
+    PgConnection {
+        /// When the row was written, which is when the connection closed.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The synthetic token's mint, tying the connection to its `Mint` row.
+        mint_id: MintId,
+        /// The real role the daemon authenticated as upstream.
+        ///
+        /// The name only. Its password is the master, and the master is the
+        /// thing this row exists to prove the client never held.
+        master_user: String,
+        /// When the client was told it was authenticated.
+        #[serde(with = "time::serde::rfc3339")]
+        started: OffsetDateTime,
+        /// When either side closed.
+        #[serde(with = "time::serde::rfc3339")]
+        ended: OffsetDateTime,
+        /// Bytes the client sent towards the server.
+        client_bytes: u64,
+        /// Bytes the server sent back to the client.
+        server_bytes: u64,
+    },
+
     /// A revoke attempt finished.
     Revoke {
         /// When it happened.
@@ -303,7 +339,8 @@ impl AuditEntry {
         match self {
             AuditEntry::Mint { mint_id, .. }
             | AuditEntry::Revoke { mint_id, .. }
-            | AuditEntry::ProxyRequest { mint_id, .. } => std::slice::from_ref(mint_id),
+            | AuditEntry::ProxyRequest { mint_id, .. }
+            | AuditEntry::PgConnection { mint_id, .. } => std::slice::from_ref(mint_id),
             AuditEntry::ExecStart { mint_ids, .. }
             | AuditEntry::ExecEnd { mint_ids, .. }
             | AuditEntry::McpCall { mint_ids, .. } => mint_ids,
