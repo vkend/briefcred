@@ -156,6 +156,45 @@ pub enum AuditEntry {
         /// to go and look at something.
         decision: String,
     },
+    /// One long-lived stream through the HTTP proxy ended.
+    ///
+    /// Written in addition to the [`AuditEntry::ProxyRequest`] row for the
+    /// response that started it, not instead of it: the request row says a
+    /// stream was authorised and opened, and this one says what went through it
+    /// and for how long. A stream that lasts an hour would otherwise be a
+    /// single row written at the start with nothing after it.
+    ///
+    /// Metadata only, on the same terms as every other proxy row and with one
+    /// more omission that matters. `events_or_frames` is a count of framing —
+    /// blank-line-terminated event blocks, or WebSocket frame headers — and no
+    /// event's data and no frame's payload is read to produce it. A WebSocket
+    /// payload is never unmasked, so this row could not carry one even if it
+    /// wanted to.
+    ProxyStream {
+        /// When the row was written, which is when the stream ended.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The synthetic token's mint, tying the stream to its `Mint` row.
+        mint_id: MintId,
+        /// `sse` for an event stream, `ws` for a WebSocket.
+        kind: String,
+        /// The upstream host, without the port.
+        host: String,
+        /// The request path, with any query string already stripped.
+        path: String,
+        /// When the stream opened: the response head, or the `101`.
+        #[serde(with = "time::serde::rfc3339")]
+        started: OffsetDateTime,
+        /// When either side closed, or briefcred ended it.
+        #[serde(with = "time::serde::rfc3339")]
+        ended: OffsetDateTime,
+        /// Events dispatched, or frame headers seen in both directions.
+        events_or_frames: u64,
+        /// Bytes the client sent towards the upstream.
+        bytes_up: u64,
+        /// Bytes the upstream sent back to the client.
+        bytes_down: u64,
+    },
     /// One connection crossed the Postgres proxy.
     ///
     /// Metadata only, and here the omissions are almost the whole row. There is
@@ -357,6 +396,7 @@ impl AuditEntry {
             AuditEntry::Mint { mint_id, .. }
             | AuditEntry::Revoke { mint_id, .. }
             | AuditEntry::ProxyRequest { mint_id, .. }
+            | AuditEntry::ProxyStream { mint_id, .. }
             | AuditEntry::PgConnection { mint_id, .. } => std::slice::from_ref(mint_id),
             AuditEntry::ExecStart { mint_ids, .. }
             | AuditEntry::ExecEnd { mint_ids, .. }
@@ -491,6 +531,55 @@ mod tests {
         }
         .mint_ids()
         .is_empty());
+    }
+
+    #[test]
+    fn a_stream_row_carries_framing_counts_and_no_content() {
+        let entry = AuditEntry::ProxyStream {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            mint_id: MintId::generate(),
+            kind: "sse".into(),
+            host: "api.openai.com".into(),
+            path: "/v1/responses".into(),
+            started: OffsetDateTime::UNIX_EPOCH,
+            ended: OffsetDateTime::UNIX_EPOCH,
+            events_or_frames: 100,
+            bytes_up: 40,
+            bytes_down: 9_000,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["event"], "proxy_stream");
+        assert_eq!(json["kind"], "sse");
+        assert_eq!(json["events_or_frames"], 100);
+        assert_eq!(json["bytes_up"], 40);
+        assert_eq!(json["bytes_down"], 9_000);
+        assert_eq!(json["path"], "/v1/responses");
+        assert_eq!(entry.mint_ids().len(), 1);
+
+        // The field list is the whole promise: nothing here can hold a header,
+        // a body, or a query string, because there is nowhere to put one.
+        let mut fields: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            [
+                "bytes_down",
+                "bytes_up",
+                "ended",
+                "event",
+                "events_or_frames",
+                "host",
+                "kind",
+                "mint_id",
+                "path",
+                "started",
+                "ts",
+            ]
+        );
+
+        let back: AuditEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(back, entry);
     }
 
     #[test]
