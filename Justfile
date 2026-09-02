@@ -1,9 +1,24 @@
 default: check test
 
-# Formatting and lints, both enforced in CI.
+# Formatting, lints, and the supply chain. All four enforced in CI.
+#
+# `cargo deny` and `cargo vet` are here rather than in a separate recipe because
+# a dependency is added on the same afternoon somebody runs `just check`, and a
+# supply-chain gate nobody runs until release is one that fails at release.
+# Install them with:
+#
+#     cargo install cargo-deny cargo-vet --locked
+#
+# `cargo vet check --locked` is deliberately offline: `supply-chain/config.toml`
+# imports no third-party audit sets, so the whole graph sits in `exemptions` and
+# the check asserts that the exemption list still covers the lockfile. That
+# turns a new dependency into a diff somebody has to look at, which is the part
+# of `cargo vet` that is worth having before there is an audit team to run it.
 check:
     cargo fmt --all -- --check
     cargo clippy --all-targets -- -D warnings
+    cargo deny check
+    cargo vet check --locked
 
 # The whole workspace: unit tests and end-to-end tests.
 #

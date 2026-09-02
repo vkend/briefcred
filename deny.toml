@@ -1,0 +1,68 @@
+# Supply-chain policy, enforced by `cargo deny check` in `just check`.
+#
+# briefcred terminates TLS for other people's credentials, so its dependency
+# graph is an exfiltration target and a build-time compromise of any crate in
+# it is a compromise of every master a daemon holds. That is the reason this
+# file is strict about where code may come from, and why an advisory is an
+# error rather than a warning.
+
+[graph]
+# The platforms briefcred is built for. Narrowing the targets keeps the check
+# honest: an advisory against a Windows-only crate that no briefcred build ever
+# links is noise, and noise is what gets a check switched off.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+# Every advisory is an error. There is no triage tier here on purpose: a
+# vulnerability in this graph is a vulnerability in a credential broker.
+#
+# An advisory that genuinely does not apply goes in `ignore` with the RUSTSEC
+# id and a comment saying why, so the exception is reviewable rather than
+# invisible.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licences only. briefcred ships as a signed binary, and a copyleft
+# dependency would make that a distribution question rather than a build one.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    # `webpki-roots`, which is Mozilla's CA bundle rather than code. The
+    # Community Data License Agreement's permissive variant is the licence a
+    # data set ships under; it imposes no condition on a binary that embeds it.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are warned about rather than denied. In a graph with the
+# AWS SDK and two TLS stacks in it, "no crate appears twice" is not a bar that
+# can be held, and a denial nobody can satisfy is one somebody eventually
+# deletes.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Nothing from anywhere but crates.io. A git dependency is a dependency on a
+# revision somebody can move, which is precisely the supply-chain shape this
+# project cannot accept.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
