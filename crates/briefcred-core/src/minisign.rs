@@ -719,7 +719,8 @@ mod tests {
         assert_eq!(who.key_id(), alice_pub.key_id());
 
         let stranger = carol.sign(content, "c").unwrap();
-        let err = verify_with_any(content, &stranger, &[alice_pub.clone()]).unwrap_err();
+        let err =
+            verify_with_any(content, &stranger, std::slice::from_ref(&alice_pub)).unwrap_err();
         assert!(err.to_string().contains("not a trust root"), "{err}");
     }
 

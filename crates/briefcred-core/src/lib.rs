@@ -19,6 +19,7 @@
 
 pub mod audit;
 pub mod ca;
+pub mod distribution;
 pub mod error;
 pub mod exec;
 pub mod helper_adapter;

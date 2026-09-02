@@ -83,6 +83,15 @@ pub enum Error {
     #[error("master source: {0}")]
     Master(String),
 
+    /// A configuration file could not be parsed.
+    #[error("invalid configuration {path}: {message}")]
+    Config {
+        /// The file that failed.
+        path: PathBuf,
+        /// What is wrong with it.
+        message: String,
+    },
+
     /// A signature, or the key material for one, could not be handled.
     ///
     /// Covers a malformed key file, a malformed `.minisig`, and a signature
