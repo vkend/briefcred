@@ -280,6 +280,19 @@ async fn db_query_runs_as_a_minted_role_and_revokes_it_when_the_client_leaves() 
     daemon.shutdown().await;
 }
 
+/// How many audit rows of one `event` the daemon has written so far.
+///
+/// Read as a *delta* around a connection rather than as a total: the
+/// consolidated test below shares one daemon across several connections, so a
+/// bare count would fold in whatever the previous blocks did.
+fn audit_count(daemon: &Daemon, event: &str) -> usize {
+    daemon
+        .audit_rows()
+        .iter()
+        .filter(|row| row["event"] == event)
+        .count()
+}
+
 /// A profile whose `postgres-dynamic` credential points at `cluster`.
 fn db_profile(cluster: &PgCluster) -> String {
     format!(
@@ -346,6 +359,14 @@ async fn a_fresh_connection_mints_once_bounds_its_fetch_and_reports_sql_errors()
     // overwrite the first — leaving a role that nothing revokes, because the
     // disconnect can only close the session it can still see.
     {
+        // Counted before the connection exists and again after it has gone, so
+        // what is asserted is what *this* connection did. The role count says
+        // one principal reached the backend; these say the daemon also believes
+        // it opened one session, minted once inside it, and closed it again.
+        let mints_before = audit_count(&daemon, "mint");
+        let opened_before = audit_count(&daemon, "session_open");
+        let closed_before = audit_count(&daemon, "session_close");
+
         let client = mcp_client(&daemon).await;
         let query = |sql: &'static str| {
             client.call_tool(
@@ -377,6 +398,25 @@ async fn a_fresh_connection_mints_once_bounds_its_fetch_and_reports_sql_errors()
             "a role survived the disconnect, so a session was stranded\n{}",
             daemon.log()
         );
+
+        // Rows reach the disk through the audit writer task, so this waits for
+        // them rather than reading once and racing it.
+        let settled = wait_until(Duration::from_secs(20), || async {
+            audit_count(&daemon, "mint") - mints_before == 1
+                && audit_count(&daemon, "session_close") - closed_before == 1
+        })
+        .await;
+        let mints = audit_count(&daemon, "mint") - mints_before;
+        let opened = audit_count(&daemon, "session_open") - opened_before;
+        let closed = audit_count(&daemon, "session_close") - closed_before;
+        assert!(
+            settled,
+            "the audit rows never settled: {mints} mint, {opened} open, {closed} close\n{}",
+            daemon.log()
+        );
+        assert_eq!(mints, 1, "two concurrent calls must produce one mint row");
+        assert_eq!(opened, 1, "one session for one connection");
+        assert_eq!(closed, opened, "every session opened must be closed");
     }
 
     // --- `max_rows` bounds what the *server* produces. ---

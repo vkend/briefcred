@@ -141,8 +141,15 @@ impl Metrics {
 
     /// Record one request that crossed the HTTP proxy.
     ///
-    /// `decision` is the policy outcome — `allow`, `deny`, or `would_deny` —
-    /// and `status_class` is the upstream's status rounded to its class
+    /// `decision` is one of five values. Three are policy outcomes —
+    /// `allow`, `deny`, `would_deny` — and two are briefcred's own faults on a
+    /// request the policy allowed: `swap_error`, where the credential could
+    /// not be put into the request, and `upstream_error`, where the upstream
+    /// could not be reached. Keeping the last two out of `deny` is what lets
+    /// an operator tell "widen the policy" from "look at the master" from
+    /// "the vendor is down".
+    ///
+    /// `status_class` is the upstream's status rounded to its class
     /// (`2xx`, `4xx`, …) or `none` where the request never reached an upstream.
     /// The class rather than the code: a per-code series would let a vendor's
     /// error taxonomy decide how many series briefcred exports.
