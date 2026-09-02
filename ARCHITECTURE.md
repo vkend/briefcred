@@ -109,6 +109,8 @@ two things every crate has to agree on.
 | `ca` | The root CA, leaf issuance, and the runtime trust environment. |
 | `exec` | The two pure decisions behind `briefcred exec`: is the command allowed, and what environment does it get. |
 | `policy` | The fixed Cedar schema, the request context, the compiled form of a profile's `policy`, and the enforce/observe split. |
+| `minisign` | Minisign-compatible Ed25519 keys, detached signatures, and their file formats. Signs nothing but profiles. |
+| `distribution` | The `[profiles]` config, the three registry URL schemes, the fetch, and the trusted profile set with its precedence rules. |
 
 `minters::http` and `minters::postgres_proxy` are the two modules that register
 a schema and no minter at all: both are `Hosting::Proxy`, meaning the "mint" is
@@ -207,7 +209,8 @@ macOS:
 ```
 ~/Library/Application Support/briefcred/
   sock            daemon Unix socket, mode 0600
-  profiles/       *.yaml work envelopes
+  profiles/       *.yaml work envelopes you wrote
+  profiles/registry/<name>/   *.yaml fetched from a registry, each with a .minisig
   audit/          append-only JSONL, daily rotation
   ca/             ca.pem (0644) and, on the file backend, ca.key (0600)
   logs/           daemon stdout and stderr, written by the service manager
@@ -224,6 +227,45 @@ the real `~/Library/LaunchAgents`.
 Linux uses `$XDG_DATA_HOME/briefcred` (default `~/.local/share/briefcred`) with
 the socket at `$XDG_RUNTIME_DIR/briefcred/sock`. `BRIEFCRED_HOME` relocates the
 whole layout, including the socket; tests always set it.
+
+## Profile distribution
+
+Two directories, two standards.
+
+```
+profiles/*.yaml                     local; no signature required
+profiles/registry/<name>/*.yaml     fetched; dropped unless a .minisig verifies
+```
+
+`briefcred profile sync` fetches each registry named in `daemon.toml` into a
+staging directory beside the target and moves it into place at the end, so a
+failed sync leaves the previous contents rather than a mix of two. It refuses
+to write a file no trust root vouches for. The daemon then checks again at
+load, because the CLI's check is feedback for a person and the daemon's is the
+one that decides what runs — and a file that reaches the registry directory by
+some other route still has to pass it.
+
+`ProfileSet::load` builds the set the daemon serves: registry profiles first,
+in alphabetical order of registry name, then local ones over the top. A local
+profile that shadows a registry one records which. The wire type carries all of
+it — `source`, `signature`, `signer_key_id`, `overrides` — so a client deciding
+whether to run a profile can see who chose its allowlist.
+
+Two failure modes, deliberately handled differently:
+
+| What went wrong | What happens |
+| --- | --- |
+| A file does not parse or does not validate | The whole reload fails; the previous set stays in force; `profile_load_error` |
+| A registry file does not verify | That file is dropped; the rest of the set loads; `profile_trust_warning` |
+
+Last-good exists so one typo does not cost you every profile. Applying it to a
+signature failure would mean continuing to run a profile *because* its
+signature had just gone bad, so it does not.
+
+`dev_mode` inverts the second row — the file loads, marked `dev_mode` — and
+pays for it in noise: stderr at every load, a banner above
+`briefcred profiles`, and a `profile_trust_warning` row per file with
+`action: "loaded_dev_mode"`.
 
 ## Invariants
 

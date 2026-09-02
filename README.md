@@ -192,9 +192,14 @@ the socket file, and writes a `daemon_stop` row.
 | `session_idle_secs` | `1800` | Seconds a session may go untouched before it is wiped |
 | `master_source` | platform default | `"keychain"`, `"file"`, or `"env"` |
 | `ca.keystore` | platform default | `"keychain"` or `"file"`; where the CA key lives |
+| `profiles.trust_roots` | `[]` | Minisign public key lines whose signatures vouch for a registry profile |
+| `profiles.registries` | `[]` | `{ name, url }` entries `briefcred profile sync` fetches |
+| `profiles.dev_mode` | `false` | Load registry profiles that fail verification, loudly |
 
 An unknown key is an error rather than a silent no-op, so a typo cannot switch
-a control off. `pg_proxy_enabled` needs `proxy_enabled`: both proxies verify
+a control off. A `profiles.trust_roots` entry that is not a well-formed
+minisign public key stops the daemon starting, rather than leaving it running
+with a trust root it silently ignores. `pg_proxy_enabled` needs `proxy_enabled`: both proxies verify
 synthetic tokens with the same signing key, and a daemon configured with one
 and not the other refuses to start rather than failing every `postgres-proxy`
 mint at the point of use.
@@ -328,7 +333,11 @@ always run whatever you liked with it. `THREAT_MODEL.md` says this at length.
 | `briefcred health` | Daemon, profiles, CA trust, and outstanding revokes, with the command that fixes each. |
 | `briefcred audit [--since 24h] [--json]` | Audit rows, read straight off the disk so it works with the daemon stopped. |
 | `briefcred profile bootstrap` | An interactive interview that writes a profile and stores its master. |
-| `briefcred profile show <name>` | One profile, as the daemon parsed it. |
+| `briefcred profile show <name>` | One profile, as the daemon parsed it, and where it came from. |
+| `briefcred profile keygen --out <dir>` | A minisign signing key pair for publishing profiles. |
+| `briefcred profile sign <file> --key <path>` | Sign a profile, writing `<file>.minisig` beside it. |
+| `briefcred profile verify <file> --pub <path>` | Check a profile against its `.minisig`. |
+| `briefcred profile sync` | Fetch every registry in `daemon.toml`, verifying as it goes. |
 | `briefcred mcp` | Serve the Model Context Protocol tools on stdin and stdout, for an agent. |
 
 `briefcred profile bootstrap` asks for the master credential **last**, after the
@@ -474,11 +483,44 @@ against the six briefcred sets.
 The master credential is never written in a profile. `user` names the master
 role; its password comes from a master source, described below.
 
-Profiles hot-reload. The daemon watches `profiles/` and reloads 250 ms after
-the last change, so an editor's save burst is one reload rather than five. A
-file that does not parse leaves the previous set in force, logs, and writes a
-`profile_load_error` audit row: a typo in one profile must not cost you the
-others.
+Profiles hot-reload. The daemon watches `profiles/` and everything under it,
+and reloads 250 ms after the last change, so an editor's save burst is one
+reload rather than five. A file that does not parse leaves the previous set in
+force, logs, and writes a `profile_load_error` audit row: a typo in one profile
+must not cost you the others.
+
+### Where a profile came from
+
+Profiles you write live in `profiles/*.yaml`. Profiles fetched from a registry
+live in `profiles/registry/<name>/*.yaml`, and **a registry profile is dropped
+unless a minisign signature beside it verifies against a trust root you named
+in `daemon.toml`**. A profile you did not write names the hosts a subprocess
+may reach and the credentials briefcred will mint, so an unsigned one is an
+instruction from whoever last had write access to a web server.
+
+```console
+$ briefcred profile sync
+briefcred profile sync
+  platform         4 profile(s) into .../profiles/registry/platform
+    ! draft.yaml: no .minisig alongside it
+
+$ briefcred profiles
+PROFILE             UNLOCK      CACHE   SOURCE              SIGNATURE CREDENTIALS
+analytics           biometric   300s    registry(platform)  verified  db (postgres-dynamic, 900s)
+```
+
+A local profile of the same name overrides a registry one, and
+`briefcred profile show` says so — which is what makes a registry usable: take
+the set somebody publishes, and change the one profile you need to.
+
+Last-good protects a typo, not a bad signature. A profile whose signature stops
+verifying is dropped on the next reload rather than kept from the previous one.
+`[profiles] dev_mode = true` suspends verification for writing a registry, and
+is loud about it: a warning on every daemon start, a warning above the
+`briefcred profiles` table, and a `profile_trust_warning` audit row per file.
+
+The full story, including the three registry URL schemes and the signature
+format, is in [`docs/profile-distribution.md`](docs/profile-distribution.md).
 
 ## Master credentials
 
@@ -543,6 +585,10 @@ macOS:
 ~/Library/Application Support/briefcred/
   sock  profiles/  audit/  ca/  secrets/  logs/  state/  daemon.toml
 ```
+
+Profiles you write live directly in `profiles/`. Profiles fetched from a
+registry live in `profiles/registry/<registry name>/`, each beside its
+`.minisig`, and are replaced wholesale by the next `briefcred profile sync`.
 
 Every directory is mode `0700` and the socket is `0600`. The service unit lives
 outside this tree, under `~/Library/LaunchAgents` or

@@ -31,6 +31,11 @@ weakens a guarantee has to say so out loud before it ships.
    kind, never the daemon's whole state.
 5. **Machine / backend boundary.** Outbound database and API connections use
    TLS with the platform trust store. `sslmode` defaults to `require`.
+6. **Publisher / consumer boundary.** A profile fetched from a registry is
+   authored outside this machine, so it crosses a boundary that TLS alone does
+   not close. It is authenticated by a minisign signature over the file's
+   bytes, checked against a trust root the operator listed in `daemon.toml` —
+   not by the transport it arrived over, and not by who hosts it.
 
 ## Attacker model
 
@@ -401,6 +406,76 @@ deliberate and load-bearing:
 The path is enough to answer "what did the agent reach" without being enough to
 reconstruct what it sent.
 
+## Phase 8: profile distribution, and what a trust root is worth
+
+A profile is not inert configuration. It names the hosts a subprocess may
+reach, the credentials briefcred will mint, and the Cedar policy the proxy
+enforces. Executing a profile somebody else wrote is closer to executing their
+code than to reading their config file, and the threat it introduces is
+**profile substitution**: getting briefcred to run an envelope the operator did
+not choose.
+
+### What the signature is bounded by
+
+The signature covers the file's exact bytes. It is Ed25519 over the content,
+plus a second Ed25519 signature over the first signature concatenated with the
+trusted comment, so:
+
+- Editing the profile after signing invalidates it.
+- Lifting a valid signature onto a different profile fails, because the key id
+  and then the content check fail.
+- Rewriting the trusted comment fails, even though the content signature still
+  verifies — which is why briefcred puts the file name there rather than in the
+  untrusted comment, which nothing signs.
+
+### What it is not bounded by
+
+- **A trust root is unconditional.** It is a key, not a key plus a scope. Any
+  profile that key signs is accepted: there is no "this key may publish
+  read-only profiles". A compromised publisher key is a compromised profile
+  set, and the response is to remove the trust root and re-verify what is on
+  disk.
+- **Nothing revokes a signature.** There is no revocation list for minisign
+  keys and briefcred does not invent one. A profile signed by a key you later
+  stop trusting keeps verifying until you remove the trust root from
+  `daemon.toml` — which the daemon then acts on at the next reload, dropping
+  every profile that key vouched for.
+- **The signature says who, not when.** The trusted comment carries a
+  timestamp, but nothing enforces freshness: a registry that serves an old but
+  correctly signed profile is serving a profile briefcred will accept. The
+  SHA-256 in a plain-HTTPS `index.json` bounds a mirror serving *different*
+  bytes, not a mirror serving *stale* ones.
+- **The transport is not the control.** HTTPS and the same-host redirect limit
+  are defence in depth. A registry served over a compromised connection still
+  cannot produce a profile that loads, because the signature is checked against
+  a local trust root either way.
+- **Signing keys are password-less.** `briefcred profile keygen` writes a
+  `0600` file with no passphrase, because signing happens where there is nobody
+  to prompt. Its secrecy is the filesystem's, and a reader of that file can
+  publish profiles the operator's daemon will accept.
+
+### What `dev_mode` costs
+
+`[profiles] dev_mode = true` turns the whole of the above off for registry
+profiles: an unsigned or invalid file loads. It exists because a registry
+cannot be written while every draft is refused, and it is deliberately noisy —
+a `!! PROFILE NOT VERIFIED` line on the daemon's stderr at every load, a banner
+above `briefcred profiles`, `signature: dev_mode` on the profile itself, and a
+`profile_trust_warning` audit row per file with `action: "loaded_dev_mode"`.
+
+The audit rows are the security property. `dev_mode` is a machine that will run
+whatever appears in its registry directory, and the one thing that must survive
+that is the ability to establish afterwards exactly which unverified profiles
+ran, and when. A production `daemon.toml` has no business setting it.
+
+### What is deliberately not protected
+
+Local profiles in `profiles/*.yaml` are never checked against a trust root, and
+a local profile overrides a registry one of the same name. That is not a gap:
+an attacker who can write to `profiles/` is running as the user and is already
+inside boundary 1, where they could equally rewrite `daemon.toml`, add their
+own trust root, or run the credential-bearing subprocess directly.
+
 ## Known limitations, stated plainly
 
 - A local process running as the same user is inside every boundary. briefcred
@@ -422,6 +497,9 @@ reconstruct what it sent.
   session that holds it. Every runtime `briefcred exec` wraps is on that path,
   because an environment variable is the only channel it has. See **Phase 4**
   above for what the token is still bounded by.
+- A trust root is a key without a scope, and there is no signature revocation.
+  Withdrawing a publisher means removing its trust root from `daemon.toml`; see
+  **Phase 8** above.
 - The revoke queue gives up after eight attempts. A backend that is unreachable
   for longer leaves a principal behind until the reconciler's next sweep, which
   is bounded by the profile's `ttl_secs` in how long that principal is useful.

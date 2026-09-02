@@ -8,6 +8,50 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **Signed profile distribution**, and with it Phase 8 of the roadmap. A
+  profile fetched from somewhere else names the hosts a subprocess may reach
+  and the credentials briefcred will mint, so briefcred now keeps two kinds of
+  profile apart: `profiles/*.yaml` are yours and need no vouching, while
+  `profiles/registry/<name>/*.yaml` are **dropped unless a detached signature
+  beside them verifies against a trust root**. The format is minisign's,
+  unmodified — `<file>.minisig`, Ed25519 over the file's bytes, plus a second
+  signature over the trusted comment — so `minisign -S` can sign a profile
+  briefcred accepts and `minisign -V` can check one briefcred produced.
+- **`daemon.toml` gains a `[profiles]` table**: `trust_roots` (minisign public
+  key lines), `registries` (`{ name, url }`), and `dev_mode`. A trust root that
+  is not a well-formed key stops the daemon starting rather than being silently
+  ignored, and an empty `trust_roots` means no registry profile can load — it
+  never means "trust everything".
+- **`briefcred profile sync`** fetches each registry into
+  `profiles/registry/<name>/`, verifying as it goes. Three URL schemes and no
+  others: `file://` for a directory, `https://` for an `index.json` whose
+  SHA-256 is checked before the signature, and `git+https://` for a shallow
+  clone through the system `git`. Each fetch lands in a staging directory and is
+  moved into place at the end, so a failed sync leaves the previous contents
+  rather than a mix of two, and a withdrawn profile really does disappear. One
+  unreachable registry never stops the others; the exit code is non-zero if any
+  file was skipped.
+- **`briefcred profile keygen`, `sign`, and `verify`.** `keygen --out <dir>`
+  writes `briefcred.key` (mode `0600`, password-less, and the command says so)
+  and `briefcred.pub`, and prints the line to paste into `trust_roots`. Signing
+  puts the file's name in the trusted comment, which the second signature
+  covers, so a signature moved onto another profile still names the file it was
+  made for.
+- **Provenance on every profile.** `briefcred profiles` gains `SOURCE` and
+  `SIGNATURE` columns, and `briefcred profile show` prints where a profile came
+  from, what its signature was worth, which key vouched for it, and what it
+  overrides. A local profile of the same name overrides a registry one, which is
+  what makes a registry usable: take the set somebody publishes and change the
+  one profile you need to.
+- **A `profile_trust_warning` audit row** per file that failed verification,
+  with `action` of `dropped` or `loaded_dev_mode` and the file's path. Under
+  `dev_mode` an unverified profile loads, and pays for it with a
+  `!! PROFILE NOT VERIFIED` line on every daemon start, a banner above
+  `briefcred profiles`, and one of those rows per file — because the thing that
+  must survive running an unverified profile is the ability to establish
+  afterwards which ones ran.
+- `docs/profile-distribution.md`, covering the signature format, publishing, the
+  three URL schemes, precedence, and what `dev_mode` costs.
 - **Per-session quotas**, and with them Phase 5 of the roadmap. A profile may
   set `quota: { rate, burst, total }` — a token bucket, in tokens per second,
   where `rate` may be fractional and `total` is an optional hard cap for the
@@ -256,6 +300,18 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Changed
 
+- **Last-good no longer extends to trust.** A profile that does not *parse*
+  still leaves the previous set in force, because one typo must not cost you
+  every profile. A registry profile whose signature stops verifying is dropped
+  on the next reload instead — continuing to run a profile precisely because its
+  signature has just gone bad is the opposite of what that news calls for.
+- The profile watcher is recursive, so a `briefcred profile sync` into
+  `profiles/registry/` is picked up without restarting the daemon.
+- The end-to-end daemon harness inserted its ephemeral-port overrides at the end
+  of `daemon.toml`. In TOML a top-level key written after a table header belongs
+  to that table, so a test whose config ended in a table got a daemon that
+  refused to start complaining about the wrong key entirely. The overrides now
+  go in before the first table header.
 - **The CA's leaf cache is bounded.** It was an unbounded map keyed on the
   hostname list joined with a comma, which both grew without limit and made
   `["a,b"]` and `["a", "b"]` the same key. It is now a 256-entry
