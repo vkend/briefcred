@@ -290,6 +290,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

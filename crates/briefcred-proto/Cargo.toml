@@ -7,12 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Adds `Request::HeapScan` and `Response::HeapScanned`. Only the memory-hygiene
+# test enables it; a production daemon must never be built with it, because it
+# lets a same-uid caller probe the daemon's address space.
+debug-heapscan = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
+zeroize.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }

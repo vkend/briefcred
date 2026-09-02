@@ -1,9 +1,12 @@
 //! The request and response vocabulary.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+
+use crate::secret::SecretString;
 
 /// A message from a client to the daemon.
 ///
@@ -55,6 +58,72 @@ pub enum Request {
         /// The identifier from [`Response::SessionOpened`].
         session_id: String,
     },
+    /// Run the unlock gate for a profile without opening a session.
+    ///
+    /// Used by `briefcred profile bootstrap` before it writes a master: the
+    /// master itself never crosses this socket, so the CLI writes it straight
+    /// to the platform key store, and this is how it still proves presence
+    /// first. Nothing is fetched and nothing is retained.
+    Unlock {
+        /// The profile whose policy and cache window apply.
+        profile: String,
+        /// Whether the *client* has no graphical session. See
+        /// [`Request::OpenSession`].
+        client_headless: bool,
+    },
+    /// Mint the credentials an already-open session's profile declares, and
+    /// compose the environment the subprocess will run with.
+    ///
+    /// The allowlists are enforced here, before anything is minted: a command
+    /// the profile does not permit must not cause a role to be created at all.
+    Exec {
+        /// The handle from [`Response::SessionOpened`].
+        session_id: String,
+        /// Which declared credentials to mint. `None` means all of them.
+        credentials: Option<Vec<String>>,
+        /// The program the client is about to run.
+        argv0: String,
+        /// Its arguments, in order.
+        args: Vec<String>,
+    },
+    /// Report that the subprocess has exited, so its mints can be revoked.
+    ///
+    /// Sent after the child is reaped. The daemon enqueues the revokes and
+    /// writes the `ExecEnd` audit row; the client does not wait for either.
+    ExecDone {
+        /// The session the mints belong to.
+        session_id: String,
+        /// The principals to revoke.
+        mint_ids: Vec<String>,
+        /// The child's exit status, absent when a signal killed it.
+        exit_code: Option<i32>,
+        /// How long the child ran.
+        duration_ms: u64,
+    },
+    /// Ask whether a command *would* be permitted, minting nothing.
+    ///
+    /// The hook's question. It runs before the agent's tool call, so it must
+    /// not create a principal that the tool call might never use.
+    HookCheck {
+        /// The profile whose `exec` policy applies.
+        profile: String,
+        /// The program that would run.
+        argv0: String,
+        /// The arguments that would be passed.
+        args: Vec<String>,
+    },
+    /// Ask the daemon to scan its own memory for a known 32-byte marker.
+    ///
+    /// Compiled only into a daemon built with the `debug-heapscan` feature,
+    /// and used by exactly one test: the memory-hygiene check that asserts a
+    /// master is gone from the daemon's address space after a revoke. It takes
+    /// a digest rather than the needle so the needle itself never crosses the
+    /// socket.
+    #[cfg(feature = "debug-heapscan")]
+    HeapScan {
+        /// Lowercase hex SHA-256 of the 32-byte marker to look for.
+        needle_sha256: String,
+    },
 }
 
 impl Request {
@@ -71,6 +140,12 @@ impl Request {
             Request::ShowProfile { .. } => "show_profile",
             Request::OpenSession { .. } => "open_session",
             Request::CloseSession { .. } => "close_session",
+            Request::Unlock { .. } => "unlock",
+            Request::Exec { .. } => "exec",
+            Request::ExecDone { .. } => "exec_done",
+            Request::HookCheck { .. } => "hook_check",
+            #[cfg(feature = "debug-heapscan")]
+            Request::HeapScan { .. } => "heap_scan",
         }
     }
 
@@ -83,6 +158,12 @@ impl Request {
         "show_profile",
         "open_session",
         "close_session",
+        "unlock",
+        "exec",
+        "exec_done",
+        "hook_check",
+        #[cfg(feature = "debug-heapscan")]
+        "heap_scan",
     ];
 }
 
@@ -138,6 +219,56 @@ pub enum Response {
         /// The session that was closed.
         session_id: String,
     },
+    /// Answer to [`Request::Unlock`]: presence was proved and cached.
+    Unlocked {
+        /// The profile the unlock applies to.
+        profile: String,
+    },
+    /// Answer to [`Request::Exec`]: what was minted, and the environment.
+    ///
+    /// This is the one reply that carries credential material, and it is why
+    /// the socket is mode `0600` inside a `0700` directory and why the daemon
+    /// checks the peer's uid before reading a single frame. It is never
+    /// written to disk, and it is never logged: `SecretString` redacts itself.
+    Minted {
+        /// One entry per credential that was minted, in declaration order.
+        mints: Vec<MintSummary>,
+        /// The environment the subprocess is to run with, already composed
+        /// from the profile's `env` templates and its trust environment.
+        ///
+        /// The daemon composes this rather than the client because it is the
+        /// only side that holds the profile, the minted fields, and the CA
+        /// path at once. The client's job is to apply it verbatim on top of a
+        /// cleared environment.
+        env: BTreeMap<String, SecretString>,
+        /// Variable names the client should copy from its own environment.
+        ///
+        /// The client's environment is the one thing the daemon cannot see,
+        /// so the daemon names what may pass through and the client fills it.
+        passthrough: Vec<String>,
+    },
+    /// Answer to [`Request::ExecDone`]: the revokes are queued.
+    ExecRecorded {
+        /// How many principals were enqueued for revoke.
+        queued: usize,
+    },
+    /// Answer to [`Request::HookCheck`].
+    HookDecision {
+        /// Whether the profile's `exec` policy permits the command.
+        allowed: bool,
+        /// Why, in words a user can act on. Present for both answers.
+        reason: String,
+    },
+    /// Answer to [`Request::HeapScan`].
+    #[cfg(feature = "debug-heapscan")]
+    HeapScanned {
+        /// Whether a window matching the digest was found.
+        present: bool,
+        /// How many readable private regions were examined.
+        regions_scanned: usize,
+        /// How many bytes those regions covered.
+        bytes_scanned: u64,
+    },
     /// The unlock gate refused, so nothing was opened.
     ///
     /// Distinct from [`Response::Error`] because a cancelled Touch ID prompt is
@@ -154,6 +285,17 @@ pub enum Response {
         /// What went wrong, in operator-readable terms.
         message: String,
     },
+}
+
+/// One credential the daemon minted for an [`Request::Exec`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintSummary {
+    /// The credential's name within its profile.
+    pub credential: String,
+    /// The principal that was created, for the later [`Request::ExecDone`].
+    pub mint_id: String,
+    /// The minter's own fields, for `briefcred get --field`.
+    pub fields: BTreeMap<String, SecretString>,
 }
 
 /// A loaded profile, reduced to what a client is allowed to see.

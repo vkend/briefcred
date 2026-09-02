@@ -1,11 +1,12 @@
 //! The wire framing contract: a 4-byte big-endian length prefix in front of a
 //! JSON payload, with a hard 16 MiB ceiling on either side of the socket.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use briefcred_proto::{
-    decode_frame, encode_frame, read_frame, write_frame, CredentialSummary, FrameError,
-    ProfileSummary, Request, Response, MAX_FRAME_BYTES,
+    decode_frame, encode_frame, read_frame, write_frame, CredentialSummary, FrameError, MintSummary,
+    ProfileSummary, Request, Response, SecretString, MAX_FRAME_BYTES,
 };
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
@@ -53,6 +54,27 @@ async fn every_request_and_response_round_trips() {
         Request::CloseSession {
             session_id: "s-1".into(),
         },
+        Request::Unlock {
+            profile: "analytics".into(),
+            client_headless: false,
+        },
+        Request::Exec {
+            session_id: "s-1".into(),
+            credentials: Some(vec!["db".into()]),
+            argv0: "psql".into(),
+            args: vec!["-c".into(), "SELECT 1".into()],
+        },
+        Request::ExecDone {
+            session_id: "s-1".into(),
+            mint_ids: vec!["briefcred_t_0123456789ab".into()],
+            exit_code: Some(0),
+            duration_ms: 42,
+        },
+        Request::HookCheck {
+            profile: "analytics".into(),
+            argv0: "psql".into(),
+            args: vec!["-c".into()],
+        },
     ];
     let responses = [
         Response::Pong,
@@ -77,6 +99,26 @@ async fn every_request_and_response_round_trips() {
         },
         Response::Error {
             message: "nope".into(),
+        },
+        Response::Unlocked {
+            profile: "analytics".into(),
+        },
+        Response::Minted {
+            mints: vec![MintSummary {
+                credential: "db".into(),
+                mint_id: "briefcred_t_0123456789ab".into(),
+                fields: BTreeMap::from([(
+                    "PGPASSWORD".to_string(),
+                    SecretString::new("t0p-s3cret"),
+                )]),
+            }],
+            env: BTreeMap::from([("PGUSER".to_string(), SecretString::new("briefcred_t_x"))]),
+            passthrough: vec!["PATH".into()],
+        },
+        Response::ExecRecorded { queued: 1 },
+        Response::HookDecision {
+            allowed: false,
+            reason: "`rm` is not in `exec.allow_argv0`".into(),
         },
     ];
 
@@ -204,6 +246,31 @@ fn the_name_list_covers_every_request_variant_exactly_once() {
         Request::CloseSession {
             session_id: "x".into(),
         },
+        Request::Unlock {
+            profile: "x".into(),
+            client_headless: false,
+        },
+        Request::Exec {
+            session_id: "x".into(),
+            credentials: None,
+            argv0: "psql".into(),
+            args: vec![],
+        },
+        Request::ExecDone {
+            session_id: "x".into(),
+            mint_ids: vec![],
+            exit_code: Some(0),
+            duration_ms: 1,
+        },
+        Request::HookCheck {
+            profile: "x".into(),
+            argv0: "psql".into(),
+            args: vec![],
+        },
+        #[cfg(feature = "debug-heapscan")]
+        Request::HeapScan {
+            needle_sha256: "00".into(),
+        },
     ];
     let mut names: Vec<&str> = variants.iter().map(|r| r.name()).collect();
     names.sort_unstable();
@@ -220,6 +287,31 @@ fn a_profile_summary_carries_key_names_and_never_a_secret() {
     assert!(json.contains("analytics-db"), "{json}");
     assert!(!json.contains("password"), "{json}");
     assert!(!json.contains("config"), "{json}");
+}
+
+/// `Minted` is the one reply that carries credential material, and the whole
+/// safety argument for it is that it cannot reach a log line by accident.
+#[test]
+fn a_minted_reply_serialises_its_secrets_and_debug_prints_none_of_them() {
+    let reply = Response::Minted {
+        mints: vec![MintSummary {
+            credential: "db".into(),
+            mint_id: "briefcred_t_0123456789ab".into(),
+            fields: BTreeMap::from([("PGPASSWORD".to_string(), SecretString::new("t0p-s3cret"))]),
+        }],
+        env: BTreeMap::from([("PGPASSWORD".to_string(), SecretString::new("t0p-s3cret"))]),
+        passthrough: vec!["PATH".into()],
+    };
+
+    // It has to serialise: this is how the credential reaches the subprocess.
+    let json = serde_json::to_string(&reply).unwrap();
+    assert!(json.contains("t0p-s3cret"), "{json}");
+
+    // It must not print. `{:?}` of a response is exactly what an error path
+    // reaches for, and that is the accident this guards against.
+    let rendered = format!("{reply:?}");
+    assert!(!rendered.contains("t0p-s3cret"), "{rendered}");
+    assert!(rendered.contains("PGPASSWORD"), "{rendered}");
 }
 
 /// The daemon's refusal depends on this flag, so a client that omits it must
