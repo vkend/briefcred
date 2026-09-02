@@ -22,7 +22,11 @@ jobs:
     # compile and are unit-tested, but there is nothing to ship for them yet.
     runs-on: macos-latest
     permissions:
-      # Only the release-creating step needs to write, and it is the last one.
+      # Job-wide, because GitHub grants permissions per job and not per step.
+      # Only the last step actually writes — `gh release create` — and every
+      # step before it reads. Narrowing this further would mean splitting the
+      # release creation into a job of its own, which would have to re-download
+      # what this one built to gain nothing.
       contents: write
     steps:
       - uses: actions/checkout@v5
@@ -77,6 +81,24 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: release/scripts/package.sh "$VERSION" staging dist
+
+      # The formula in the tree carries a placeholder checksum, because the
+      # checksum of a release that has not been built yet does not exist. This
+      # stamps in the real one and the matching URL. Publishing it is a
+      # separate, manual act: the tap is its own repository, created out of
+      # band, and this workflow has no business holding a token for it. What it
+      # does is put the finished formula next to the tarball it describes, so
+      # updating the tap is a copy rather than a hand-edit.
+      - name: Stamp the Homebrew formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BRIEFCRED_REPO: ${{ github.repository }}
+        run: |
+          release/scripts/stamp-formula.sh \
+            "$VERSION" \
+            "dist/briefcred-$VERSION-macos-universal.tar.gz" \
+            release/Formula/briefcred.rb \
+            dist/briefcred.rb
 
       # Uploaded whether or not a release is created, so a dispatch run leaves
       # something to download and a tag run leaves the same bytes twice.

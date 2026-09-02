@@ -1,9 +1,18 @@
 # Homebrew formula for briefcred.
 #
 # Lives here rather than in a tap repository so it is reviewed alongside the
-# code it installs; publishing copies this file into the tap. The `url` and
-# `sha256` below are filled in by the release workflow, which knows the tag and
-# has just computed the checksum.
+# code it installs.
+#
+# The `url` and `sha256` below are placeholders: the checksum of a release that
+# has not been built yet does not exist. The release workflow runs
+# `release/scripts/stamp-formula.sh` over this file, which rewrites exactly
+# those two lines from the tarball it just built, and uploads the result as a
+# release asset named `briefcred.rb`. Copying that asset into the tap
+# repository is a separate, manual act — the tap is its own repository, created
+# out of band, and the release workflow holds no token for it.
+#
+# `crates/briefcred-e2e/tests/release_scripts.rs` asserts that stamping changes
+# those two lines and leaves every other byte alone.
 class Briefcred < Formula
   desc "Local credential broker for AI agents and developer tooling"
   homepage "https://github.com/briefcred/briefcred"
