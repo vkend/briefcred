@@ -31,6 +31,10 @@
 //! 6. **Forward, streaming.** Bodies are passed through in both directions and
 //!    counted as they go; nothing is buffered whole.
 //! 7. **Audit and count.** One `ProxyRequest` row when the response body ends.
+//! 8. **Keep streaming, if it is a stream.** An event stream or a completed
+//!    WebSocket handshake hands off to [`crate::proxy::stream`], which counts
+//!    what crosses it and writes a `ProxyStream` row when it closes. Nothing
+//!    above changes: a stream is one request and was decided as one.
 //!
 //! # What each refusal is recorded as
 //!
@@ -83,6 +87,7 @@ use zeroize::Zeroizing;
 use crate::error::{Error, Result};
 use crate::proxy::issuer::ProxyIssuer;
 use crate::proxy::policy::PolicyCache;
+use crate::proxy::stream;
 use crate::proxy::swap::{self, Credential};
 use crate::proxy::token::{self, TokenError};
 use crate::quota::TokenBucket;
@@ -301,8 +306,13 @@ where
             )
         }
     });
+    // `with_upgrades` again, and for a second reason: inside the tunnel a
+    // request may be a WebSocket handshake, and without this the `101` is
+    // written and the connection then closed under whatever was about to
+    // start speaking frames on it.
     let _ = hyper::server::conn::http1::Builder::new()
         .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades()
         .await;
     Ok(())
 }
@@ -502,6 +512,43 @@ async fn forward(
 
     // 6. The real credential goes in.
     let (mut parts, body) = request.into_parts();
+
+    // A WebSocket handshake is recognised here and not earlier, because
+    // everything above this line is right for it already: the handshake is a
+    // `GET`, and the token, the quota, and the policy decided it on exactly
+    // those terms. What changes below is only what happens after the `101`.
+    let websocket = stream::is_websocket_upgrade(&parts.headers);
+    let client_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
+    let websocket_key = parts
+        .headers
+        .get(WEBSOCKET_KEY)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let handshake = match (websocket, client_upgrade, websocket_key) {
+        (false, _, _) => None,
+        (true, Some(upgrade), Some(key)) => Some((upgrade, key)),
+        // A handshake with no `Sec-WebSocket-Key`, or one this connection
+        // cannot be taken off, is not a handshake. Refused rather than
+        // forwarded as an ordinary `GET`: an upstream answering `101` to
+        // something briefcred could not then relay would leave a client
+        // talking frames into a connection nobody is reading.
+        (true, _, _) => {
+            eprintln!(
+                "briefcred-daemon: proxy refused a malformed websocket handshake for `{host}`"
+            );
+            return refuse(
+                &proxy,
+                StatusCode::BAD_REQUEST,
+                started,
+                Some(&session.mint_id),
+                &method,
+                &host,
+                &path,
+                DECISION_DENY,
+            );
+        }
+    };
+
     if let Err(err) = swap::apply(
         &mut parts.headers,
         &session.credentials,
@@ -536,7 +583,16 @@ async fn forward(
     let upstream_request = Request::from_parts(parts, counted);
 
     // 7. Forward, streaming.
-    let response = match send_upstream(&proxy, scheme, &host, port, upstream_request).await {
+    let response = match send_upstream(
+        &proxy,
+        scheme,
+        &host,
+        port,
+        upstream_request,
+        handshake.is_some(),
+    )
+    .await
+    {
         Ok(response) => response,
         Err(err) => {
             eprintln!("briefcred-daemon: proxy could not reach `{host}`: {err}");
@@ -553,17 +609,56 @@ async fn forward(
         }
     };
 
+    // The grant this request runs on, so a stream opened by it can be ended
+    // when the grant stops being one. Only streams use it; an ordinary request
+    // is over long before a second has passed.
+    let live = stream::Liveness {
+        sid: claims.sid.clone(),
+        credential: claims.cred.clone(),
+        expires_at: claims.exp,
+    };
+
     // 8. The row is written when the response body ends, because that is when
     // `resp_bytes` is known. Streaming a gigabyte and then reporting zero would
     // make the byte counts worse than useless.
     let status_code = response.status().as_u16();
-    let (parts, body) = response.into_parts();
+
+    // 8a. A handshake the upstream *completed* stops being HTTP here. One it
+    // declined is an ordinary response and falls through to be counted and
+    // audited as one, body and all: an upstream that refuses an upgrade with an
+    // explanation is telling the client something, and reporting zero bytes for
+    // it would be the same lie as reporting zero for any other response.
+    let completed = handshake.filter(|_| response.status() == StatusCode::SWITCHING_PROTOCOLS);
+    if let Some((client_upgrade, key)) = completed {
+        return upgrade_websocket(
+            response,
+            Handshake {
+                proxy,
+                mint_id: session.mint_id.clone(),
+                method,
+                host,
+                path,
+                started,
+                decision: decision.label(),
+                key,
+                client_upgrade,
+                live,
+            },
+        );
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let event_stream = stream::is_event_stream(&parts.headers);
+    let resp_bytes = Arc::new(AtomicU64::new(0));
     let done = {
         let proxy = Arc::clone(&proxy);
         let mint_id = session.mint_id.clone();
         let decision = decision.label();
         let req_bytes = Arc::clone(&req_bytes);
         let counters = Arc::clone(&session.http);
+        let method = method.clone();
+        let host = host.clone();
+        let path = path.clone();
         move |resp_bytes: u64| {
             let elapsed = started.elapsed();
             // Added when the body ends, which is the only moment the size is
@@ -587,10 +682,158 @@ async fn forward(
                 .record_proxy_request(decision, Some(status_code), elapsed);
         }
     };
+    let counted = Counting::new(body, Arc::clone(&resp_bytes), Some(Box::new(done)));
+
+    // 8b. An ordinary response ends here. An event stream is the same streamed
+    // body with a scanner over it and a row of its own when it closes.
+    if !event_stream {
+        return Response::from_parts(parts, counted.boxed());
+    }
+
+    // Whatever the upstream said the length was, it is not the length of what
+    // the client is about to be sent: this body ends when the upstream stops,
+    // and a `Content-Length` here would make the client wait for bytes that
+    // are never coming.
+    parts.headers.remove(hyper::header::CONTENT_LENGTH);
+    let row = stream::StreamRow {
+        state: Arc::clone(&proxy.state),
+        mint_id: session.mint_id.clone(),
+        kind: stream::KIND_SSE,
+        host,
+        path,
+        started: OffsetDateTime::now_utc(),
+        since: std::time::Instant::now(),
+    };
+    let watch = stream::watch(Arc::clone(&proxy.state), Arc::clone(&proxy.issuer), live);
     Response::from_parts(
         parts,
-        Counting::new(body, Arc::new(AtomicU64::new(0)), Some(Box::new(done))).boxed(),
+        stream::EventStream::new(counted, row, req_bytes, resp_bytes, watch).boxed(),
     )
+}
+
+/// The `Sec-WebSocket-Key` header, which is not one hyper names for us.
+const WEBSOCKET_KEY: &str = "sec-websocket-key";
+
+/// What the WebSocket branch of [`forward`] needs and the response does not
+/// carry.
+struct Handshake {
+    proxy: Arc<Proxy>,
+    mint_id: MintId,
+    method: String,
+    host: String,
+    path: String,
+    started: std::time::Instant,
+    decision: &'static str,
+    /// The client's own `Sec-WebSocket-Key`, which briefcred forwarded.
+    key: String,
+    client_upgrade: hyper::upgrade::OnUpgrade,
+    live: stream::Liveness,
+}
+
+/// Validate the upstream's `101`, answer the client with one, and relay.
+///
+/// The validation is the load-bearing part. briefcred forwarded the client's
+/// own key, so an upstream that completed this handshake must answer with the
+/// accept token derived from it; anything else is a server that answered `101`
+/// without agreeing to speak WebSocket, and handing raw byte forwarding to one
+/// of those is how a proxy gets used as a tunnel to something that is not a
+/// WebSocket server at all.
+///
+/// Only ever called with a `101`; anything else was an upstream declining the
+/// upgrade and never reached here.
+fn upgrade_websocket(response: Response<Incoming>, hand: Handshake) -> Response<OutBody> {
+    let Handshake {
+        proxy,
+        mint_id,
+        method,
+        host,
+        path,
+        started,
+        decision,
+        key,
+        client_upgrade,
+        live,
+    } = hand;
+
+    let expected = stream::accept_key(&key);
+    let accepted = response
+        .headers()
+        .get("sec-websocket-accept")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected);
+    let mut response = response;
+    let upstream_upgrade = response
+        .extensions_mut()
+        .remove::<hyper::upgrade::OnUpgrade>();
+    let Some(upstream_upgrade) = upstream_upgrade.filter(|_| accepted) else {
+        eprintln!(
+            "briefcred-daemon: `{host}` answered 101 without completing the handshake; not relaying"
+        );
+        return refuse(
+            &proxy,
+            StatusCode::BAD_GATEWAY,
+            started,
+            Some(&mint_id),
+            &method,
+            &host,
+            &path,
+            DECISION_UPSTREAM_ERROR,
+        );
+    };
+
+    // The handshake is a request like any other and gets its row now: the
+    // stream that follows gets one of its own when it closes.
+    let elapsed = started.elapsed();
+    proxy.state.audit(&proxy_row(
+        &mint_id,
+        &method,
+        &host,
+        &path,
+        Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+        0,
+        0,
+        elapsed,
+        decision,
+    ));
+    proxy.state.metrics().record_proxy_request(
+        decision,
+        Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+        elapsed,
+    );
+
+    let row = stream::StreamRow {
+        state: Arc::clone(&proxy.state),
+        mint_id,
+        kind: stream::KIND_WS,
+        host: host.clone(),
+        path,
+        started: OffsetDateTime::now_utc(),
+        since: std::time::Instant::now(),
+    };
+    let watch = stream::watch(Arc::clone(&proxy.state), Arc::clone(&proxy.issuer), live);
+    tokio::spawn(async move {
+        let (client, upstream) = match tokio::try_join!(client_upgrade, upstream_upgrade) {
+            Ok(both) => both,
+            Err(err) => {
+                eprintln!("briefcred-daemon: a websocket to `{host}` was not upgraded: {err}");
+                return;
+            }
+        };
+        stream::relay(TokioIo::new(client), TokioIo::new(upstream), row, watch).await;
+    });
+
+    // The `101` the client gets is built from the upstream's, field by field:
+    // a copy would forward whatever else that server chose to attach to it.
+    let mut switching = Response::new(empty());
+    *switching.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    for name in stream::HANDSHAKE_HEADERS {
+        if let Some(value) = response.headers().get(name) {
+            switching
+                .headers_mut()
+                .insert(hyper::header::HeaderName::from_static(name), value.clone());
+        }
+    }
+    switching
 }
 
 /// Open a connection to the upstream and send one request on it.
@@ -600,12 +843,15 @@ async fn forward(
 /// different keys must never share a connection an upstream might treat as
 /// authenticated — and getting that wrong is a credential mix-up rather than a
 /// slow proxy.
+/// `upgrades` is set for a WebSocket handshake, and is what makes the
+/// connection survive its own `101` so both halves can be taken over.
 async fn send_upstream<B>(
     proxy: &Proxy,
     scheme: &str,
     host: &str,
     port: u16,
     request: Request<B>,
+    upgrades: bool,
 ) -> Result<Response<Incoming>>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -622,13 +868,13 @@ where
             .connect(name, stream)
             .await
             .map_err(|e| Error::Proxy(format!("`{host}` did not verify: {e}")))?;
-        send_on(TokioIo::new(tls), request).await
+        send_on(TokioIo::new(tls), request, upgrades).await
     } else {
-        send_on(TokioIo::new(stream), request).await
+        send_on(TokioIo::new(stream), request, upgrades).await
     }
 }
 
-async fn send_on<I, B>(io: I, request: Request<B>) -> Result<Response<Incoming>>
+async fn send_on<I, B>(io: I, request: Request<B>, upgrades: bool) -> Result<Response<Incoming>>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -639,9 +885,15 @@ where
         .map_err(|e| Error::Proxy(format!("upstream handshake failed: {e}")))?;
     // Driven in its own task: the connection has to keep pumping while the
     // response body is being read, and awaiting it here would deadlock.
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    if upgrades {
+        tokio::spawn(async move {
+            let _ = connection.with_upgrades().await;
+        });
+    } else {
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+    }
     sender
         .send_request(request)
         .await
