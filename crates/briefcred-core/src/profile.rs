@@ -73,9 +73,40 @@ pub struct Profile {
     /// Whether a policy denial stops the request or is only recorded.
     #[serde(default)]
     pub policy_mode: PolicyMode,
+    /// How much work one session of this profile may do.
+    ///
+    /// Absent means unmetered. A policy says what a session may do; this says
+    /// how much of it, which no allowlist of hosts and paths can express.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<Quota>,
     /// When the subprocess is pointed at briefcred's HTTP proxy.
     #[serde(default)]
     pub proxy: ProxyMode,
+}
+
+/// A per-session token bucket: a sustained rate, a burst, and a hard cap.
+///
+/// Charged one token per HTTP proxy request, per Postgres proxy connection, and
+/// per `briefcred exec` or `briefcred get` that mints. The bucket is created
+/// when the session opens and dies with it, so two concurrent runs of the same
+/// profile get a budget each rather than competing for one.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Quota {
+    /// Tokens added per second, sustained. Must be greater than zero.
+    ///
+    /// Fractional on purpose: `rate: 0.1` is six an hour, which is the shape a
+    /// quota on something expensive wants.
+    pub rate: f64,
+    /// Tokens the bucket holds, and how many may be spent at once. At least 1.
+    pub burst: u32,
+    /// A hard cap for the whole session, if there is one.
+    ///
+    /// Once spent, every charge fails until the session closes: no waiting
+    /// brings it back, because the budget is the session's rather than the
+    /// minute's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
 }
 
 /// When `briefcred exec` sets `HTTPS_PROXY` and friends for a profile.
@@ -461,6 +492,23 @@ impl Profile {
             }
         }
 
+        // A quota that cannot refill, or that holds nothing, is a profile that
+        // refuses everything after its first charge. Caught here rather than
+        // discovered at three in the morning as a proxy returning 429s.
+        if let Some(quota) = &self.quota {
+            if !quota.rate.is_finite() || quota.rate <= 0.0 {
+                return Err(Error::profile(format!(
+                    "`quota.rate` must be a positive number of tokens per second, not {}",
+                    quota.rate
+                )));
+            }
+            if quota.burst == 0 {
+                return Err(Error::profile(
+                    "`quota.burst` must be at least 1; a bucket that holds nothing refuses everything",
+                ));
+            }
+        }
+
         // Compiled here rather than at the first request: a Cedar typo has to
         // be an error next to the file that has it, not a request the proxy
         // silently denies once the profile is already in production.
@@ -549,6 +597,49 @@ credentials:
         let yaml = format!("{OPENAI}policy: |\n  permit(principal\n");
         let err = Profile::from_yaml_str(&yaml).unwrap_err();
         assert!(err.to_string().contains("not valid Cedar"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_with_no_quota_is_unmetered() {
+        assert_eq!(Profile::from_yaml_str(MINIMAL).unwrap().quota, None);
+    }
+
+    #[test]
+    fn a_quota_is_read_with_its_total_optional() {
+        let profile =
+            Profile::from_yaml_str("name: dev\nquota:\n  rate: 10\n  burst: 20\n").unwrap();
+        let quota = profile.quota.expect("the profile declares a quota");
+        assert_eq!(quota.rate, 10.0);
+        assert_eq!(quota.burst, 20);
+        assert_eq!(quota.total, None);
+
+        let capped =
+            Profile::from_yaml_str("name: dev\nquota:\n  rate: 0.5\n  burst: 1\n  total: 40\n")
+                .unwrap();
+        assert_eq!(capped.quota.unwrap().total, Some(40));
+    }
+
+    #[test]
+    fn a_quota_that_cannot_refill_is_rejected_by_name() {
+        for rate in ["0", "-1", "0.0"] {
+            let err =
+                Profile::from_yaml_str(&format!("name: dev\nquota:\n  rate: {rate}\n  burst: 1\n"))
+                    .unwrap_err();
+            assert!(err.to_string().contains("quota.rate"), "{rate}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_quota_that_holds_nothing_is_rejected_by_name() {
+        let err = Profile::from_yaml_str("name: dev\nquota:\n  rate: 1\n  burst: 0\n").unwrap_err();
+        assert!(err.to_string().contains("quota.burst"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelt_quota_key_is_rejected_rather_than_ignored() {
+        let err = Profile::from_yaml_str("name: dev\nquota:\n  rate: 1\n  burst: 1\n  totl: 4\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("totl"), "{err}");
     }
 
     #[test]
