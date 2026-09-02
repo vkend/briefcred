@@ -57,6 +57,11 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **`LICENSE-MIT` and `LICENSE-APACHE`**, which the release tarball already
+  expected to find and which were not in the tree. A "Cutting a release"
+  checklist in the README says what a human does around the workflow: bump,
+  changelog, gates, tag, watch the first run, `brew audit` before the tap.
+
 - **End-to-end coverage of the two shipped binaries.** `briefcred exec` is run
   as a process against a real daemon and the child's actual environment is
   asserted, along with the audit rows the run left; `briefcred-hook` is fed a

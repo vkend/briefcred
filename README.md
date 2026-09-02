@@ -1360,7 +1360,30 @@ it: updating it means copying the `briefcred.rb` asset from the release into
 the tap and committing it. That is one deliberate manual act per release rather
 than a release workflow with write access to a second repository.
 
+### Cutting a release
+
+The workflow is the release; this is the order the human part goes in.
+
+1. **Bump the version** in the workspace `Cargo.toml` (`workspace.package
+   .version`) and run `cargo update --workspace` so `Cargo.lock` follows. Every
+   crate inherits it, so there is one number to change.
+2. **Write the CHANGELOG section.** Rename `## Unreleased` to the new version
+   with today's date, and open a fresh `## Unreleased` above it.
+3. **Run the gates.** `just check && cargo test --workspace --locked`. The
+   supply-chain half of `just check` is the one that fails at release time if
+   it has not been run since the last dependency was added.
+4. **Commit and tag.** The tag is the version with a `v` prefix and nothing
+   else: `v0.2.0` for version `0.2.0`. The workflow triggers on `v*` and the
+   release notes are built from the tag.
+5. **Watch the first workflow run**, because it is the live test of the release
+   path. An unsigned release is a successful run, not a failed one — check the
+   notes say which kind it produced.
+6. **Audit the formula before publishing the tap.** Download the `briefcred.rb`
+   asset and run `brew audit --strict --formula ./briefcred.rb` on a machine
+   with a working Homebrew. Then copy it into the tap repository and commit;
+   nothing automates that step, and deliberately so.
+
 ## Licence
 
-MIT OR Apache-2.0. The licence texts are not yet in the tree; the release
-tarball ships them once they are.
+MIT OR Apache-2.0, at your option. The texts are `LICENSE-MIT` and
+`LICENSE-APACHE` in this repository, and the release tarball ships both.
