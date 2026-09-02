@@ -40,6 +40,9 @@ pub const REGISTRY_DIR: &str = "registry";
 /// one to report rather than one to keep waiting for.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The subdirectory of the clone's temporary directory that `git` writes into.
+const CLONE_SUBDIR: &str = "repo";
+
 /// How many same-host redirects a registry fetch will follow.
 const MAX_REDIRECTS: usize = 5;
 
@@ -204,7 +207,13 @@ impl RegistrySource {
             return Ok(RegistrySource::Directory(path));
         }
         if let Some(repo) = url.strip_prefix("git+") {
-            if !repo.starts_with("https://") {
+            // `git+file://` is accepted only in test builds, so the clone path
+            // can be exercised against a local bare repository without a
+            // network. A shipping binary takes `git+https://` and nothing
+            // else: a `file://` remote in a real `daemon.toml` would be a
+            // registry whose "transport" is whatever wrote that path.
+            let local_ok = cfg!(test) && repo.starts_with("file://");
+            if !repo.starts_with("https://") && !local_ok {
                 return Err(Error::Signature(format!(
                     "git registry url `{url}` must be `git+https://`"
                 )));
@@ -227,8 +236,10 @@ pub struct SyncOutcome {
     pub name: String,
     /// Where its files were written.
     pub dir: PathBuf,
-    /// How many profiles were accepted.
+    /// How many profiles a trust root vouched for.
     pub accepted: usize,
+    /// How many were written unverified because `dev_mode` is on.
+    pub unverified: usize,
     /// One line per file that was not, saying which and why.
     pub skipped: Vec<String>,
 }
@@ -257,19 +268,39 @@ pub async fn sync_registry(
 
     let registry_root = profiles_dir.join(REGISTRY_DIR);
     let staging = tempdir_beside(&registry_root, &spec.name)?;
-    let outcome = stage(spec, &source, staging.path(), trust).await;
-    let (accepted, skipped) = match outcome {
+    let staged_counts = match stage(spec, &source, staging.path(), trust).await {
         Ok(counts) => counts,
         Err(err) => {
             let _ = std::fs::remove_dir_all(staging.path());
             return Err(err);
         }
     };
+    let Staged {
+        accepted,
+        unverified,
+        skipped,
+    } = staged_counts;
+
+    let target = registry_root.join(&spec.name);
+    // A fetch that produced nothing, over a registry that currently has
+    // something, is a fetch that went wrong: a bad URL, a moved branch, a
+    // clone that landed somewhere unexpected. Replacing a working profile set
+    // with an empty directory on that evidence is the worst available answer,
+    // so the swap is refused and the previous set stays.
+    if accepted + unverified == 0 && count_profiles(&target) > 0 {
+        let _ = std::fs::remove_dir_all(staging.path());
+        return Err(Error::Registry {
+            name: spec.name.clone(),
+            message: format!(
+                "fetched no profiles, but {} already has some; keeping what is there",
+                target.display()
+            ),
+        });
+    }
 
     // Hand the staged directory over to this function: from here on it is
     // moved into place rather than cleaned up.
     let staged = staging.keep();
-    let target = registry_root.join(&spec.name);
     // Not a single atomic operation: a directory rename onto a non-empty
     // directory is not portable. The window is between the remove and the
     // rename, and what it costs is a daemon reload that briefly sees no
@@ -290,40 +321,46 @@ pub async fn sync_registry(
         name: spec.name.clone(),
         dir: target,
         accepted,
+        unverified,
         skipped,
     })
 }
 
-/// Fetch into `staging`, returning how many files were accepted and rejected.
+/// Fetch into `staging`, returning what the pass accepted and refused.
 async fn stage(
     spec: &RegistrySpec,
     source: &RegistrySource,
     staging: &Path,
     trust: &Trust,
-) -> Result<(usize, Vec<String>)> {
+) -> Result<Staged> {
     let named = |message: String| Error::Registry {
         name: spec.name.clone(),
         message,
     };
-    let files = match source {
+    let files: Vec<FetchedFile> = match source {
         RegistrySource::Directory(dir) => read_directory(dir).map_err(|e| named(e.to_string()))?,
         RegistrySource::Git(repo) => {
             let clone = clone_shallow(repo).map_err(|e| named(e.to_string()))?;
-            read_directory(clone.path()).map_err(|e| named(e.to_string()))?
+            read_directory(&clone.path().join(CLONE_SUBDIR)).map_err(|e| named(e.to_string()))?
         }
         RegistrySource::Https(base) => fetch_https(base).await.map_err(|e| named(e.to_string()))?,
     };
 
     let mut accepted = 0usize;
+    let mut unverified = 0usize;
     let mut skipped = Vec::new();
     for file in &files {
         match check(file, trust) {
-            Ok(_) => {}
+            Ok(_) => accepted += 1,
             Err(why) => {
                 if !trust.dev_mode {
                     skipped.push(format!("{}: {why}", file.name));
                     continue;
                 }
+                // Written, but not counted as accepted: `accepted` is how many
+                // profiles a trust root vouched for, and under `dev_mode` that
+                // is exactly the number this file is not one of.
+                unverified += 1;
                 skipped.push(format!("{}: {why} (loaded anyway: dev_mode)", file.name));
             }
         }
@@ -335,9 +372,35 @@ async fn stage(
             let path = staging.join(format!("{}.minisig", file.name));
             std::fs::write(&path, signature).map_err(|source| Error::Io { path, source })?;
         }
-        accepted += 1;
     }
-    Ok((accepted, skipped))
+    Ok(Staged {
+        accepted,
+        unverified,
+        skipped,
+    })
+}
+
+/// What one staging pass produced.
+struct Staged {
+    /// Files a trust root vouched for.
+    accepted: usize,
+    /// Files written only because `dev_mode` is on.
+    unverified: usize,
+    /// One line per file that did not verify, whether or not it was written.
+    skipped: Vec<String>,
+}
+
+/// How many `*.yaml` files a registry directory currently holds.
+fn count_profiles(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            let path = entry.path();
+            path.extension().is_some_and(|ext| ext == "yaml") && path.is_file()
+        })
+        .count()
 }
 
 /// One profile file and its signature, as fetched.
@@ -405,9 +468,13 @@ fn clone_shallow(repo: &str) -> Result<tempfile::TempDir> {
         path: PathBuf::from("a temporary directory"),
         source,
     })?;
+    // The clone goes in a subdirectory, so the `TempDir` guard owns the parent
+    // and still removes everything when it drops. Callers read
+    // `dir.path().join(CLONE_SUBDIR)`, never `dir.path()` — which holds only
+    // the subdirectory and would read as a registry with no profiles in it.
     let output = std::process::Command::new("git")
         .args(["clone", "--depth", "1", "--quiet", repo])
-        .arg(dir.path().join("repo"))
+        .arg(dir.path().join(CLONE_SUBDIR))
         .output()
         .map_err(|e| Error::Signature(format!("cannot run git: {e}")))?;
     if !output.status.success() {
@@ -416,14 +483,6 @@ fn clone_shallow(repo: &str) -> Result<tempfile::TempDir> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    // The clone is a subdirectory so the `TempDir` guard owns the parent and
-    // still removes everything when it drops.
-    let repo_dir = dir.path().join("repo");
-    let staged = dir.path().join("staged");
-    std::fs::rename(&repo_dir, &staged).map_err(|source| Error::Io {
-        path: staged,
-        source,
-    })?;
     Ok(dir)
 }
 
@@ -600,16 +659,74 @@ pub struct LoadedProfile {
     pub overrides: Option<String>,
 }
 
+/// What briefcred did about a profile file it would not simply load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustAction {
+    /// It did not verify and was left out of the set.
+    Dropped,
+    /// It did not verify and was loaded anyway because `dev_mode` is on.
+    LoadedDevMode,
+    /// It verified, but another registry already publishes that profile name.
+    ///
+    /// Not a trust failure, and deliberately a different value: an operator
+    /// reading the audit log must not find a name collision filed as a
+    /// signature problem.
+    Ignored,
+}
+
+impl TrustAction {
+    /// The value this action is recorded under in the audit log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrustAction::Dropped => "dropped",
+            TrustAction::LoadedDevMode => "loaded_dev_mode",
+            TrustAction::Ignored => "ignored",
+        }
+    }
+
+    /// Whether this is a signature failure rather than a collision.
+    pub fn is_trust_failure(self) -> bool {
+        matches!(self, TrustAction::Dropped | TrustAction::LoadedDevMode)
+    }
+}
+
+/// One complaint about one file, in the form the daemon audits it.
+///
+/// Structured rather than a sentence: the daemon has to file each of these as
+/// an audit row with the path and the action in their own fields, and
+/// recovering them by looking for a substring in a message would be a parser
+/// for text this crate is also the only writer of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustWarning {
+    /// The file this is about.
+    pub path: PathBuf,
+    /// What was done about it.
+    pub action: TrustAction,
+    /// Why, in a form fit for an operator. Never file contents.
+    pub reason: String,
+}
+
+impl std::fmt::Display for TrustWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.action {
+            TrustAction::Dropped => "dropped",
+            TrustAction::LoadedDevMode => "loaded unverified because dev_mode is on",
+            TrustAction::Ignored => "ignored",
+        };
+        write!(f, "{}: {what}: {}", self.path.display(), self.reason)
+    }
+}
+
 /// Every profile briefcred will honour, and every complaint made getting there.
 #[derive(Debug, Clone, Default)]
 pub struct ProfileSet {
     /// The profiles, by name, after precedence has been applied.
     pub profiles: BTreeMap<String, LoadedProfile>,
-    /// Operator-readable lines about files that were dropped or distrusted.
+    /// The files that were dropped, distrusted, or shadowed.
     ///
     /// Each is audited and printed. A set can be perfectly usable and still
     /// carry warnings: one bad file in a registry does not stop the rest.
-    pub warnings: Vec<String>,
+    pub warnings: Vec<TrustWarning>,
 }
 
 impl ProfileSet {
@@ -667,7 +784,7 @@ fn load_registries(
     profiles_dir: &Path,
     registry: &Registry,
     trust: &Trust,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<TrustWarning>,
 ) -> Result<BTreeMap<String, LoadedProfile>> {
     let root = profiles_dir.join(REGISTRY_DIR);
     let mut names: Vec<String> = Vec::new();
@@ -709,13 +826,18 @@ fn load_registries(
                         SignatureStatus::Invalid
                     };
                     if !trust.dev_mode {
-                        warnings.push(format!("{}: dropped ({status}): {why}", path.display()));
+                        warnings.push(TrustWarning {
+                            path: path.clone(),
+                            action: TrustAction::Dropped,
+                            reason: format!("{status}: {why}"),
+                        });
                         continue;
                     }
-                    warnings.push(format!(
-                        "{}: loaded unverified because dev_mode is on ({status}): {why}",
-                        path.display()
-                    ));
+                    warnings.push(TrustWarning {
+                        path: path.clone(),
+                        action: TrustAction::LoadedDevMode,
+                        reason: format!("{status}: {why}"),
+                    });
                     (SignatureStatus::DevMode, None)
                 }
             };
@@ -732,12 +854,14 @@ fn load_registries(
                 // alphabetical order wins, and the collision is reported. The
                 // alternative — last one wins — makes which profile you get
                 // depend on a directory listing.
-                warnings.push(format!(
-                    "{}: ignored; `{}` is already published by {}",
-                    path.display(),
-                    profile.name,
-                    previous.source
-                ));
+                warnings.push(TrustWarning {
+                    path: path.clone(),
+                    action: TrustAction::Ignored,
+                    reason: format!(
+                        "`{}` is already published by {}",
+                        profile.name, previous.source
+                    ),
+                });
                 continue;
             }
             out.insert(
@@ -877,8 +1001,17 @@ mod tests {
 
         assert!(set.profiles.is_empty(), "an unsigned profile must not load");
         assert_eq!(set.warnings.len(), 1);
-        assert!(set.warnings[0].contains("alpha.yaml"), "{:?}", set.warnings);
-        assert!(set.warnings[0].contains("unsigned"), "{:?}", set.warnings);
+        assert_eq!(set.warnings[0].action, TrustAction::Dropped);
+        assert!(
+            set.warnings[0].path.ends_with("alpha.yaml"),
+            "{:?}",
+            set.warnings
+        );
+        assert!(
+            set.warnings[0].reason.contains("unsigned"),
+            "{:?}",
+            set.warnings
+        );
     }
 
     #[test]
@@ -897,7 +1030,12 @@ mod tests {
         let set = ProfileSet::load(&home.profiles(), &registry(), &trust_of(&key)).unwrap();
 
         assert!(set.profiles.is_empty());
-        assert!(set.warnings[0].contains("invalid"), "{:?}", set.warnings);
+        assert_eq!(set.warnings[0].action, TrustAction::Dropped);
+        assert!(
+            set.warnings[0].reason.contains("invalid"),
+            "{:?}",
+            set.warnings
+        );
     }
 
     #[test]
@@ -910,8 +1048,9 @@ mod tests {
         let set = ProfileSet::load(&home.profiles(), &registry(), &trust_of(&ours)).unwrap();
 
         assert!(set.profiles.is_empty());
+        assert_eq!(set.warnings[0].action, TrustAction::Dropped);
         assert!(
-            set.warnings[0].contains("not a trust root"),
+            set.warnings[0].reason.contains("not a trust root"),
             "{:?}",
             set.warnings
         );
@@ -932,7 +1071,13 @@ mod tests {
         assert_eq!(loaded.signature, SignatureStatus::DevMode);
         assert_eq!(loaded.signer_key_id, None);
         assert!(set.has_dev_mode_profiles());
-        assert!(set.warnings[0].contains("dev_mode"), "{:?}", set.warnings);
+        assert_eq!(set.warnings[0].action, TrustAction::LoadedDevMode);
+        assert_eq!(set.warnings[0].action.as_str(), "loaded_dev_mode");
+        assert!(
+            set.warnings[0].to_string().contains("dev_mode"),
+            "{:?}",
+            set.warnings
+        );
     }
 
     #[test]
@@ -1001,8 +1146,14 @@ mod tests {
             set.profiles.get("alpha").unwrap().source,
             ProfileSource::Registry("aaa".to_string())
         );
+        assert_eq!(
+            set.warnings[0].action,
+            TrustAction::Ignored,
+            "a name collision is not a signature failure"
+        );
+        assert!(!set.warnings[0].action.is_trust_failure());
         assert!(
-            set.warnings[0].contains("already published"),
+            set.warnings[0].reason.contains("already published"),
             "{:?}",
             set.warnings
         );
@@ -1124,6 +1275,180 @@ mod tests {
             })
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A bare git repository holding `files`, as a `git+file://` URL.
+    fn bare_repo(dir: &Path, files: &[(&str, String)]) -> String {
+        let work = dir.join("work");
+        let bare = dir.join("registry.git");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--quiet", "--initial-branch=main"], &work);
+        for (name, body) in files {
+            std::fs::write(work.join(name), body).unwrap();
+        }
+        // A repository with no files still needs a commit to be cloneable.
+        std::fs::write(work.join(".keep"), "").unwrap();
+        git(&["add", "-A"], &work);
+        git(&["commit", "--quiet", "-m", "profiles"], &work);
+        git(
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            dir,
+        );
+        format!("git+file://{}", bare.display())
+    }
+
+    #[tokio::test]
+    async fn syncing_a_git_registry_reads_the_files_in_the_clone() {
+        let home = Home::new();
+        let repo = tempfile::tempdir().unwrap();
+        let (key, _) = SecretKey::generate().unwrap();
+        let yaml = "name: alpha\n".to_string();
+        let signature = key.sign(yaml.as_bytes(), "alpha.yaml").unwrap();
+        let url = bare_repo(
+            repo.path(),
+            &[
+                ("alpha.yaml", yaml),
+                ("alpha.yaml.minisig", signature),
+                ("beta.yaml", "name: beta\n".to_string()),
+            ],
+        );
+
+        let spec = RegistrySpec {
+            name: "acme".to_string(),
+            url,
+        };
+        let outcome = sync_registry(&spec, &home.profiles(), &trust_of(&key))
+            .await
+            .expect("a git registry must sync");
+
+        // The bug this test exists for: the clone was read one directory too
+        // high, so every git registry fetched zero files and reported success.
+        assert_eq!(outcome.accepted, 1, "the signed profile must be read");
+        assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
+        assert!(outcome.dir.join("alpha.yaml").is_file());
+        assert!(outcome.dir.join("alpha.yaml.minisig").is_file());
+        assert!(!outcome.dir.join("beta.yaml").exists());
+
+        let set = ProfileSet::load(&home.profiles(), &registry(), &trust_of(&key)).unwrap();
+        assert!(set.profiles.contains_key("alpha"));
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_fetches_nothing_does_not_wipe_the_one_already_there() {
+        let home = Home::new();
+        let (key, _) = SecretKey::generate().unwrap();
+
+        // First sync: a good registry with one signed profile.
+        let full = tempfile::tempdir().unwrap();
+        let yaml = "name: alpha\n".to_string();
+        let signature = key.sign(yaml.as_bytes(), "alpha.yaml").unwrap();
+        let spec = RegistrySpec {
+            name: "acme".to_string(),
+            url: bare_repo(
+                full.path(),
+                &[("alpha.yaml", yaml), ("alpha.yaml.minisig", signature)],
+            ),
+        };
+        sync_registry(&spec, &home.profiles(), &trust_of(&key))
+            .await
+            .unwrap();
+        let target = home.profiles().join(REGISTRY_DIR).join("acme");
+        assert!(target.join("alpha.yaml").is_file());
+
+        // Second sync, from a repository holding no profiles at all — a moved
+        // branch, a bad URL, a clone that landed somewhere unexpected. It must
+        // be an error, and the working set must survive it.
+        let empty = tempfile::tempdir().unwrap();
+        let empty_spec = RegistrySpec {
+            name: "acme".to_string(),
+            url: bare_repo(empty.path(), &[]),
+        };
+        let err = sync_registry(&empty_spec, &home.profiles(), &trust_of(&key))
+            .await
+            .expect_err("an empty fetch over a populated registry must be refused");
+        assert!(err.to_string().contains("keeping what is there"), "{err}");
+        assert!(
+            target.join("alpha.yaml").is_file(),
+            "the previous profile set must survive an empty fetch"
+        );
+
+        // And no staging directory is left behind by the refusal.
+        let leftovers: Vec<PathBuf> = std::fs::read_dir(home.profiles().join(REGISTRY_DIR))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_fetch_into_an_empty_registry_is_allowed() {
+        // The guard is about not destroying something, so a first sync of a
+        // genuinely empty registry must still succeed.
+        let home = Home::new();
+        let (key, _) = SecretKey::generate().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let spec = RegistrySpec {
+            name: "acme".to_string(),
+            url: format!("file://{}", source.path().display()),
+        };
+        let outcome = sync_registry(&spec, &home.profiles(), &trust_of(&key))
+            .await
+            .unwrap();
+        assert_eq!(outcome.accepted, 0);
+    }
+
+    #[tokio::test]
+    async fn under_dev_mode_an_unverified_file_is_written_but_not_counted_as_accepted() {
+        let home = Home::new();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("alpha.yaml"), "name: alpha\n").unwrap();
+        let spec = RegistrySpec {
+            name: "acme".to_string(),
+            url: format!("file://{}", source.path().display()),
+        };
+        let trust = Trust {
+            roots: Vec::new(),
+            dev_mode: true,
+        };
+
+        let outcome = sync_registry(&spec, &home.profiles(), &trust)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.accepted, 0, "nothing vouched for it");
+        assert_eq!(outcome.unverified, 1);
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(
+            outcome.dir.join("alpha.yaml").is_file(),
+            "it is still written"
+        );
     }
 
     #[tokio::test]
