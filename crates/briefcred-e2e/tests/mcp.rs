@@ -185,6 +185,8 @@ credentials:
         grants:
           - privileges: [SELECT]
             on: ALL TABLES IN SCHEMA public
+          - privileges: [USAGE]
+            on: ALL SEQUENCES IN SCHEMA public
 exec:
   allow_argv0: [\"/bin/echo\"]
 ",
@@ -440,29 +442,68 @@ async fn two_concurrent_tool_calls_on_a_fresh_connection_mint_once() {
     assert_eq!(closed, opened, "every session opened must be closed");
 }
 
-/// `max_rows` must bound what the daemon *fetches*, not only what it returns.
+/// `max_rows` must bound what the **server** produces, not only what is
+/// returned.
+///
+/// Timing alone cannot show this. An implementation that asks for every row
+/// and then stops reading also finishes quickly, because dropping the client
+/// closes the connection and the backend is killed — so a stopwatch cannot
+/// tell "the server was asked for six rows" from "the server was asked for a
+/// billion and then hung up on". The difference is real work: rows computed,
+/// bytes written, a connection that had to be destroyed to stop it.
+///
+/// So this counts. `nextval` in the target list runs once per row the server
+/// actually produces, and a sequence's value is **not** rolled back — which
+/// makes it the one side effect that survives the read-only transaction
+/// `briefcred_db_query` runs in, and therefore the one that can be read back
+/// afterwards as a count of server-side work.
 #[tokio::test]
-async fn max_rows_stops_the_fetch_rather_than_trimming_the_answer() {
-    let Some(cluster) = cluster_or_skip("max_rows_stops_the_fetch").await else {
+async fn max_rows_bounds_what_the_server_produces() {
+    let Some(cluster) = cluster_or_skip("max_rows_bounds_what_the_server_produces").await else {
         return;
     };
+    // Created before the daemon starts, so it exists when the mint runs
+    // `GRANT USAGE ON ALL SEQUENCES`: a sequence created afterwards would not
+    // be covered and the query would fail on permissions instead.
+    let setup = cluster.connect_master().await;
+    setup
+        .batch_execute("CREATE SEQUENCE rows_produced")
+        .await
+        .expect("the counter sequence");
+
     let mut daemon = Daemon::prepare("metrics_enabled = false\nmaster_source = \"file\"\n");
     daemon.write_profile("analytics", &db_profile(&cluster));
     daemon.write_master("pg-master", &cluster.master_password());
     daemon.start().await.expect("start");
     let client = mcp_client(&daemon).await;
 
-    // A generator of a hundred million rows. Streaming and stopping at five
-    // returns in milliseconds; collecting the result set first takes minutes
-    // and gigabytes, so the timeout *is* the assertion — this test passed in
-    // under ten seconds only because the fetch stopped.
+    // Mint on a trivial query, so the timed call below is a fetch and not the
+    // one-off cost of starting a helper and creating a role.
+    client
+        .call_tool(
+            CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                serde_json::json!({ "profile": "analytics", "sql": "SELECT 1 AS one" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("the warm-up query runs");
+
+    // A million rows, from a generator in the **target list** rather than in
+    // `FROM`. That distinction is not cosmetic: a set-returning function in
+    // `FROM` is a function scan, which PostgreSQL materialises into a
+    // tuplestore before yielding its first row, so no row limit of any kind
+    // can stop it. In the target list it is a `ProjectSet`, produced lazily,
+    // which is what a portal limit can actually cut short.
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         client.call_tool(
             CallToolRequestParams::new("briefcred_db_query").with_arguments(
                 serde_json::json!({
                     "profile": "analytics",
-                    "sql": "SELECT i FROM generate_series(1, 100000000) AS i",
+                    "sql": "SELECT generate_series(1, 1000000) AS i, nextval('rows_produced')",
                     "max_rows": 5,
                 })
                 .as_object()
@@ -472,13 +513,28 @@ async fn max_rows_stops_the_fetch_rather_than_trimming_the_answer() {
         ),
     )
     .await
-    .expect("the fetch must stop at max_rows rather than collecting the result set")
+    .expect("a bounded fetch returns promptly")
     .expect("the query runs");
 
     let result = json_of(&result);
     assert_eq!(result["row_count"], 5);
     assert_eq!(result["truncated"], true);
     assert_eq!(result["rows"][0]["i"], 1);
+
+    // The count of rows the server actually produced. Six: the five asked for
+    // and the one extra that reveals there were more.
+    let produced: i64 = setup
+        .query_one(
+            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM rows_produced",
+            &[],
+        )
+        .await
+        .expect("read the counter")
+        .get(0);
+    assert_eq!(
+        produced, 6,
+        "the server produced {produced} rows for a five-row request"
+    );
 
     client.cancel().await.ok();
     daemon.shutdown().await;

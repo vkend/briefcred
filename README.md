@@ -752,7 +752,7 @@ Three tools, and the shape of them is the whole idea:
 | Tool | What it takes | What it gives back |
 | --- | --- | --- |
 | `briefcred_list_profiles` | nothing | Profile names, credential kinds, TTLs, allowed commands |
-| `briefcred_db_query` | `profile`, `sql`, `max_rows` | Rows as JSON |
+| `briefcred_db_query` | `profile`, `sql`, `max_rows` | Rows as JSON, read-only |
 | `briefcred_exec` | `profile`, `argv` | `stdout`, `stderr`, `exit_code` |
 
 **No tool returns a credential.** An agent handed a connection string has that
@@ -773,12 +773,22 @@ statement as the minted role and returns at most `max_rows` rows (100 by
 default, 10,000 at most). A column type briefcred cannot represent comes back
 as a note telling you to cast it to text.
 
-A statement is bounded at both ends. `max_rows` stops the *fetch*, not just
-what is returned, so a `SELECT *` on a large table costs one page rather than
-the table; and `mcp_query_timeout_secs` in `daemon.toml` (30 seconds by
-default) is set as the connection's `statement_timeout`, so a runaway query is
-cancelled by the server rather than waited out by the daemon. A command that
-writes without stopping is killed at the output cap rather than buffered.
+A statement is bounded at both ends, and by the **server** rather than by the
+daemon reading less than it asked for. `max_rows` becomes a portal row limit,
+so a `SELECT` over a billion rows produces the rows asked for and stops;
+`mcp_query_timeout_secs` in `daemon.toml` (30 seconds by default) becomes the
+connection's `statement_timeout`, so a runaway query is cancelled at the
+database. A command that writes without stopping is killed at the output cap
+rather than buffered.
+
+A portal needs a transaction, and that transaction is **rolled back**, so
+`briefcred_db_query` cannot write. This is deliberate and not a side effect of
+the mechanism: a partially fetched `INSERT ... RETURNING` has inserted the rows
+it produced and not the rest, and committing that would let a display limit
+decide how much of a write survived. The tool says so in its own description,
+so a model does not discover it by having a write disappear. A profile that
+needs to write should grant `SELECT` only and route writes through
+`briefcred_exec`, where the command owns its own transaction.
 
 Every call writes an `mcp_call` audit row carrying an `mcp_call_id`, the tool,
 the profile, the mints it used, and the outcome — never the SQL or the command

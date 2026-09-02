@@ -43,7 +43,6 @@ use briefcred_core::audit::AuditEntry;
 use briefcred_core::minters::postgres::{self, PostgresConfig};
 use briefcred_core::profile::Profile;
 use briefcred_proto::{MintSummary, SecretString};
-use futures_util::TryStreamExt as _;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
@@ -116,11 +115,26 @@ impl std::fmt::Debug for McpServer {
 }
 
 /// Arguments to `briefcred_db_query`.
+///
+/// # The statement is rolled back
+///
+/// Bounding the fetch at the server needs a portal, a portal needs a
+/// transaction, and a transaction that has fetched only part of a result set
+/// must not be committed: a suspended `INSERT ... RETURNING` has inserted the
+/// rows it produced and not the rest, and committing that would make the tool's
+/// row cap silently decide how much of a write survived.
+///
+/// So the transaction is always rolled back and `briefcred_db_query` is a
+/// **read**. This is stated in the tool's own description, so a model does not
+/// discover it by having a write vanish; a profile that needs to write should
+/// grant only `SELECT` and route writes through a command that owns its own
+/// transaction.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DbQueryArgs {
     /// The briefcred profile whose database credential to use.
     pub profile: String,
-    /// The SQL to run. One statement, executed as the minted role.
+    /// The SQL to run. One statement, executed as the minted role in a
+    /// transaction that is rolled back, so it must be a read.
     pub sql: String,
     /// The most rows to return. Defaults to 100 and is capped at 10000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,9 +261,10 @@ impl McpServer {
     /// Run one SQL statement as a freshly minted database role.
     #[tool(
         name = "briefcred_db_query",
-        description = "Run one SQL statement against the database a briefcred profile mints a \
-                       role for, and return the rows as JSON. The credential is created, used, \
-                       and destroyed inside briefcred and is never returned."
+        description = "Run one read-only SQL statement against the database a briefcred profile \
+                       mints a role for, and return the rows as JSON. The statement runs in a \
+                       transaction that is rolled back, so it cannot write. The credential is \
+                       created, used, and destroyed inside briefcred and is never returned."
     )]
     pub async fn db_query(
         &self,
@@ -348,7 +363,7 @@ impl McpServer {
             (user, password)
         };
 
-        let client = postgres::connect_as(&config, &user, &password)
+        let mut client = postgres::connect_as(&config, &user, &password)
             .await
             .map_err(|e| internal(e.to_string()))?;
 
@@ -365,46 +380,70 @@ impl McpServer {
             .await
             .map_err(|e| internal(describe_sql_error(&e)))?;
 
-        // `query_raw` and not `query`: `query` collects the whole result set
-        // into memory before this code sees a single row, so `max_rows` would
-        // bound only what is *returned* and not what a `SELECT *` on a large
-        // table costs the daemon. This reads one row at a time and stops.
+        // The row limit is enforced by the *server*, through a portal.
         //
+        // Neither `query` nor `query_raw` does that. `query` collects the whole
+        // result set before this code sees a row. `query_raw` looks like it
+        // streams, and from this side it does — but the `Execute` it sends
+        // carries no row limit, so the backend produces the entire result set
+        // and pushes it down the connection whatever this code does with the
+        // `RowStream`. Dropping the stream after five rows does not tell the
+        // server to stop — only closing the connection does, which is what
+        // eventually happens when `client` goes out of scope. So the cost is
+        // not the rows asked for but however many the backend got through
+        // before it was hung up on: measured at 5122 for a five-row request.
+        // That is a bounded *read* of an unbounded fetch, not a bounded fetch.
+        //
+        // `bind` plus `query_portal(limit)` sends `Execute` with a row count.
+        // The server sends at most that many and answers `PortalSuspended`. A
+        // hundred-million-row generator costs the rows actually asked for.
+        //
+        // A portal only exists inside a transaction, which is why one is opened
+        // here. It is **rolled back**, and that is a deliberate part of the
+        // tool's contract rather than a consequence of the mechanism: see the
+        // note on `DbQueryArgs`.
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|e| internal(describe_sql_error(&e)))?;
+
+        // One past the cap, so "there was more" is observed rather than
+        // guessed, and exactly one extra row is ever produced.
+        let limit = i32::try_from(max_rows.saturating_add(1))
+            .map_err(|_| internal("the row limit does not fit a portal fetch"))?;
         // Still the extended protocol rather than `simple_query`, so the
         // statement is one statement: the server refuses a second one after a
-        // semicolon, which is what keeps a tool that takes SQL from a model
-        // out of multi-statement territory.
+        // semicolon, which is what keeps a tool that takes SQL from a model out
+        // of multi-statement territory.
         let no_params: [&(dyn tokio_postgres::types::ToSql + Sync); 0] = [];
+        let portal = transaction
+            .bind(args.sql.as_str(), &no_params)
+            .await
+            .map_err(|e| sql_failure(&e))?;
+        let fetched = transaction
+            .query_portal(&portal, limit)
+            .await
+            .map_err(|e| sql_failure(&e))?;
 
-        let mut columns: Vec<serde_json::Value> = Vec::new();
-        let mut json_rows: Vec<Row> = Vec::new();
-        let mut truncated = false;
-        // Scoped, so the stream is dropped — and the unread portal with it —
-        // before anything else happens, rather than being held while the
-        // result is assembled.
-        {
-            let stream = client
-                .query_raw(args.sql.as_str(), no_params)
-                .await
-                .map_err(|e| sql_failure(&e))?;
-            let mut stream = std::pin::pin!(stream);
-            // Stopping *at* the cap rather than after it means one extra row is
-            // fetched and decoded to learn there was more, and no others are.
-            while let Some(row) = stream.try_next().await.map_err(|e| sql_failure(&e))? {
-                if json_rows.len() == max_rows {
-                    truncated = true;
-                    break;
-                }
-                if columns.is_empty() {
-                    columns = row
-                        .columns()
-                        .iter()
-                        .map(|c| serde_json::json!({ "name": c.name(), "type": c.type_().name() }))
-                        .collect();
-                }
-                json_rows.push(row_to_json(&row));
-            }
+        // Rolling back is what makes this tool read-only, so it happens whether
+        // the rows are used or not. A failure to roll back is not worth failing
+        // the call over: dropping the client closes the connection, which ends
+        // the transaction the same way.
+        if let Err(err) = transaction.rollback().await {
+            eprintln!("briefcred-daemon: an MCP query could not roll back: {err}");
         }
+
+        let truncated = fetched.len() > max_rows;
+        let columns: Vec<serde_json::Value> = fetched
+            .first()
+            .map(|row| {
+                row.columns()
+                    .iter()
+                    .map(|c| serde_json::json!({ "name": c.name(), "type": c.type_().name() }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let json_rows: Vec<Row> = fetched.iter().take(max_rows).map(row_to_json).collect();
 
         Ok(serde_json::json!({
             "columns": columns,

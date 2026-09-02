@@ -545,8 +545,14 @@ What is bounded:
 - One connection mints once, and the check and the mint happen under one lock,
   so two tool calls arriving together cannot each open a session and leave one
   of them with a live credential nothing closes.
-- Resource use is bounded at both ends of every tool. `max_rows` stops the
-  fetch rather than trimming a collected result set; `mcp_query_timeout_secs`
-  is enforced by the database as `statement_timeout`; and a command's output is
-  read through a cap that kills the child rather than buffering what it sends.
-  None of this makes a hostile prompt safe — it makes an expensive one bounded.
+- Resource use is bounded at both ends of every tool, and bounded at the
+  *server* rather than by the daemon reading less than it asked for. `max_rows`
+  is a portal row limit, so the database produces the rows requested and stops;
+  `mcp_query_timeout_secs` is enforced as `statement_timeout`; and a command's
+  output is read through a cap that kills the child rather than buffering what
+  it sends. None of this makes a hostile prompt safe — it makes an expensive
+  one bounded.
+- `briefcred_db_query` runs in a transaction that is rolled back, so a model
+  directing it cannot write whatever the minted role's grants allow. That is a
+  smaller grant than the role itself carries, and it is the tool's stated
+  contract rather than an accident of the portal it needs.
