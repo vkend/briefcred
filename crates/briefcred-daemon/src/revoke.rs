@@ -392,19 +392,30 @@ fn persist(path: &Path, entries: &[PendingRevoke]) -> Result<()> {
 /// The sleep between passes is the backoff of the least-tried entry still
 /// waiting, so a single stubborn entry does not hold up one that has only just
 /// arrived, and an empty queue waits on the notify rather than spinning.
+/// `paused` holds the loop off the queue *file* while a handoff is in progress.
+/// The daemon taking over opens the same file, and two processes rewriting it
+/// at once could lose an entry — one that the reconciler would eventually find,
+/// but only after the credential it names had been usable for the whole of its
+/// `ttl_secs`. The pause lasts as long as one handoff attempt, and is lifted
+/// again if the handoff does not happen.
 pub async fn drain_loop(
     queue: Arc<RevokeQueue>,
     revoker: Arc<dyn Revoker>,
     audit: crate::audit::AuditHandle,
     metrics: Arc<crate::metrics::Metrics>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        let retry = match queue.run_pass(revoker.as_ref(), &audit, &metrics).await {
-            Ok(retry) => retry,
-            Err(err) => {
-                eprintln!("briefcred-daemon: revoke queue: {err}");
-                Vec::new()
+        let retry = if paused.load(std::sync::atomic::Ordering::SeqCst) {
+            Vec::new()
+        } else {
+            match queue.run_pass(revoker.as_ref(), &audit, &metrics).await {
+                Ok(retry) => retry,
+                Err(err) => {
+                    eprintln!("briefcred-daemon: revoke queue: {err}");
+                    Vec::new()
+                }
             }
         };
         // Before the sleep, not after: the whole point is that nothing holds a
@@ -817,6 +828,7 @@ mod tests {
             Arc::clone(&revoker) as Arc<dyn Revoker>,
             audit(dir.path()),
             Arc::new(metrics()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown.subscribe(),
         ));
 
@@ -882,6 +894,7 @@ mod tests {
             Arc::clone(&revoker) as Arc<dyn Revoker>,
             audit(dir.path()),
             Arc::new(metrics()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown.subscribe(),
         ));
 
@@ -915,6 +928,7 @@ mod tests {
             Arc::new(AlwaysWorks::default()),
             audit(dir.path()),
             Arc::new(metrics()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown.subscribe(),
         ));
 

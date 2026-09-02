@@ -142,6 +142,7 @@ pub struct State {
     signer: Mutex<Option<Arc<crate::proxy::token::TokenSigner>>>,
     in_flight: InFlight,
     handed_off: Mutex<Option<u32>>,
+    handing_over: Arc<std::sync::atomic::AtomicBool>,
     drain: Duration,
     listener_fds: Vec<(crate::handoff::Slot, std::os::fd::RawFd)>,
 }
@@ -188,6 +189,12 @@ pub struct StateParts {
     pub proxy: Option<Arc<crate::proxy::issuer::ProxyIssuer>>,
     /// Where the token-signer key lives, for signing a handoff blob.
     pub keystore: Arc<dyn briefcred_core::keystore::KeyStore>,
+    /// Set while a handoff is under way, to hold the revoke queue off its file.
+    ///
+    /// Shared with [`crate::revoke::drain_loop`]: the daemon taking over opens
+    /// the same queue file, and two processes rewriting it at once could lose
+    /// an entry.
+    pub handing_over: Arc<std::sync::atomic::AtomicBool>,
     /// How long in-flight proxy work gets to finish after a handoff.
     pub drain: Duration,
     /// The listening descriptors, so a handoff can pass them on.
@@ -226,6 +233,7 @@ impl State {
             signer: Mutex::new(None),
             in_flight: InFlight::default(),
             handed_off: Mutex::new(None),
+            handing_over: parts.handing_over,
             drain: parts.drain,
             listener_fds: parts.listener_fds,
         }
@@ -935,6 +943,12 @@ async fn handle_handoff(request: Request, state: Arc<State>) -> Response {
         Ok(signer) => signer,
         Err(err) => return handoff_failed(&state, format!("{err}")),
     };
+    // Held off the queue file for the length of the attempt, and released again
+    // below if the handoff does not happen. The daemon taking over opens the
+    // same file while it starts.
+    state
+        .handing_over
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let build_state = Arc::clone(&state);
     let handed = crate::handoff::hand_over(
         std::path::Path::new(&socket),
@@ -986,6 +1000,9 @@ async fn handle_handoff(request: Request, state: Arc<State>) -> Response {
 /// The daemon keeps running: it still owns the sockets, and an upgrade that
 /// could not be completed must leave the machine working rather than empty.
 fn handoff_failed(state: &Arc<State>, message: String) -> Response {
+    state
+        .handing_over
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     state.metrics().record_handoff("failed");
     state.audit(&AuditEntry::DaemonHandoff {
         ts: OffsetDateTime::now_utc(),
@@ -1378,6 +1395,7 @@ mod tests {
             keystore: Arc::new(briefcred_core::keystore::FileKeyStore::new(
                 home.path().join("ca"),
             )),
+            handing_over: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain: Duration::from_secs(crate::handoff::DEFAULT_DRAIN_SECS),
             listener_fds: Vec::new(),
         }));

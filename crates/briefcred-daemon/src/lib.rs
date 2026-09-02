@@ -271,6 +271,7 @@ pub async fn run_with(startup: Startup) -> Result<()> {
     let reloaded = profiles.reload().await;
 
     let (shutdown, _) = tokio::sync::watch::channel(false);
+    let handing_over = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let listener_fds = crate::handoff::listener_fds(
         &listener,
         bound_metrics.as_ref().map(|(listener, _)| listener),
@@ -296,6 +297,7 @@ pub async fn run_with(startup: Startup) -> Result<()> {
         mcp_query_timeout: config.mcp_query_timeout(),
         proxy: issuer.clone(),
         keystore,
+        handing_over: Arc::clone(&handing_over),
         drain: config.handoff_drain(),
         listener_fds,
     }));
@@ -439,6 +441,7 @@ pub async fn run_with(startup: Startup) -> Result<()> {
         }),
         state.audit_handle(),
         Arc::clone(&metrics),
+        handing_over,
         state.shutdown_signal(),
     ));
     tokio::spawn(reconcile::reconcile_loop(
