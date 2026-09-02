@@ -173,6 +173,46 @@ impl fmt::Debug for MintedCredential {
     }
 }
 
+/// Everything a minter needs to sweep principals nothing is using any more.
+///
+/// Reconciliation is the answer to `SIGKILL`. A daemon killed mid-`exec` never
+/// runs its revoke queue, so the principal it minted survives it. Nothing in
+/// the daemon's own state can find that principal after a restart, but the
+/// backend can: every briefcred principal is named [`MINT_ID_PREFIX`]`*` and
+/// carries an expiry, so "expired and ours" is a complete description of what
+/// to clean up.
+pub struct ReconcileCtx {
+    /// A `config` block naming the backend to sweep.
+    pub config: serde_yaml::Value,
+    /// The master credential.
+    pub master: Zeroizing<String>,
+}
+
+impl fmt::Debug for ReconcileCtx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReconcileCtx")
+            .field("config", &"<omitted>")
+            .field("master", &"<redacted>")
+            .finish()
+    }
+}
+
+/// What one reconciliation sweep found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Principals the sweep removed, in the order it removed them.
+    pub revoked: Vec<MintId>,
+    /// Principals it found but could not remove, each with the reason.
+    pub failed: Vec<(MintId, String)>,
+}
+
+impl ReconcileReport {
+    /// Whether the sweep found nothing to do, which is the healthy steady state.
+    pub fn is_clean(&self) -> bool {
+        self.revoked.is_empty() && self.failed.is_empty()
+    }
+}
+
 /// What happened when a minter tried to revoke.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevokeOutcome {

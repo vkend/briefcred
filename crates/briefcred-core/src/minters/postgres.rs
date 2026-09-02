@@ -24,7 +24,9 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::traits::Minter;
-use crate::types::{MintCtx, MintId, MintedCredential, RevokeCtx, RevokeOutcome};
+use crate::types::{
+    MintCtx, MintId, MintedCredential, ReconcileCtx, ReconcileReport, RevokeCtx, RevokeOutcome,
+};
 
 /// The `kind` string profiles use to select this minter.
 pub const KIND: &str = "postgres-dynamic";
@@ -183,15 +185,79 @@ impl PostgresConfig {
 }
 
 /// Mints short-lived PostgreSQL login roles.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PostgresDynamicMinter;
+///
+/// Holds one master connection and reuses it across calls. In the helper
+/// process there is exactly one `(profile, kind)` pair, so the connection is
+/// long-lived and a burst of `briefcred exec` calls does not pay a TLS
+/// handshake each time. The connection is dropped and remade whenever it has
+/// closed or the `config` it was opened for has changed, so reuse can never
+/// send a statement to the wrong cluster.
+#[derive(Default)]
+pub struct PostgresDynamicMinter {
+    connection: tokio::sync::Mutex<Option<Connected>>,
+}
+
+/// A live master connection, and the configuration it was opened for.
+struct Connected {
+    config: PostgresConfig,
+    client: tokio_postgres::Client,
+}
+
+impl std::fmt::Debug for PostgresDynamicMinter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately does not report whether a connection is open: that
+        // would need the lock, and a `Debug` impl that can block is a trap.
+        f.debug_struct("PostgresDynamicMinter")
+            .field("kind", &KIND)
+            .finish()
+    }
+}
 
 impl PostgresDynamicMinter {
-    /// Construct the minter. It holds no state; Phase 3 adds a helper process
-    /// that keeps the master connection open across mints.
+    /// Construct the minter with no connection yet. The first call opens one.
     pub fn new() -> PostgresDynamicMinter {
-        PostgresDynamicMinter
+        PostgresDynamicMinter::default()
     }
+
+    /// Take the master connection, opening or reopening it as needed.
+    ///
+    /// Every statement goes through here, so "the connection dropped
+    /// overnight" is a reconnect rather than a failed mint. Reconnection is
+    /// deliberately driven by the connection being *closed* and never by a
+    /// statement failing: retrying a statement the server rejected would
+    /// re-run a `CREATE ROLE` that had already half-succeeded.
+    ///
+    /// Returns the whole guard rather than a borrow of the client because
+    /// `mint` needs `&mut Client` to open a transaction, and because holding
+    /// the lock for the length of the operation is what serialises two
+    /// concurrent mints onto one connection.
+    async fn connection(
+        &self,
+        config: &PostgresConfig,
+        master: &Zeroizing<String>,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<Connected>>> {
+        let mut slot = self.connection.lock().await;
+        let reusable = slot
+            .as_ref()
+            .is_some_and(|c| &c.config == config && !c.client.is_closed());
+        if !reusable {
+            *slot = Some(Connected {
+                config: config.clone(),
+                client: connect(config, master).await?,
+            });
+        }
+        Ok(slot)
+    }
+}
+
+/// Read the client out of a guard [`PostgresDynamicMinter::connection`] filled.
+macro_rules! client_of {
+    ($guard:expr) => {
+        &mut $guard
+            .as_mut()
+            .expect("connection() always leaves a connection behind")
+            .client
+    };
 }
 
 // Registered next to the implementation rather than in a central table, so a
@@ -221,7 +287,8 @@ impl Minter for PostgresDynamicMinter {
             .format(&Rfc3339)
             .map_err(|e| Error::Postgres(format!("cannot format VALID UNTIL: {e}")))?;
 
-        let mut client = connect(&config, &ctx.master).await?;
+        let mut guard = self.connection(&config, &ctx.master).await?;
+        let client = client_of!(guard);
         let tx = client
             .transaction()
             .await
@@ -292,10 +359,11 @@ impl Minter for PostgresDynamicMinter {
             Err(e) => return RevokeOutcome::failed(detail_with(&token_note, e.to_string())),
         };
 
-        let client = match connect(&config, &ctx.master).await {
-            Ok(client) => client,
+        let mut guard = match self.connection(&config, &ctx.master).await {
+            Ok(guard) => guard,
             Err(e) => return RevokeOutcome::failed(detail_with(&token_note, e.to_string())),
         };
+        let client = client_of!(guard);
 
         match client
             .query_opt(
@@ -340,7 +408,73 @@ impl Minter for PostgresDynamicMinter {
 
         RevokeOutcome::Revoked
     }
+
+    /// Remove every expired `briefcred_t_%` role the cluster still has.
+    ///
+    /// This is what makes a `SIGKILL` mid-`exec` survivable. The daemon's
+    /// revoke queue is the fast path; when the daemon is killed before it can
+    /// run, the role is still on the cluster and nothing in briefcred's own
+    /// state remembers it. The cluster does: the role is named with the
+    /// briefcred prefix and carries the `VALID UNTIL` its mint set, so
+    /// "prefixed and past its expiry" identifies exactly the roles that were
+    /// ours and are now useless.
+    ///
+    /// The expiry check is what keeps the sweep from removing a role that a
+    /// *live* exec on another machine, or in another daemon, is still using.
+    /// `rolvaliduntil IS NULL` is excluded for the same reason: a briefcred
+    /// mint always sets one, so a prefixed role without one was not made here.
+    async fn reconcile(&self, ctx: ReconcileCtx) -> Result<ReconcileReport> {
+        let config = PostgresConfig::from_value(&ctx.config)?;
+        let mut guard = self.connection(&config, &ctx.master).await?;
+        let client = client_of!(guard);
+
+        let rows = client
+            .query(STALE_ROLES_SQL, &[])
+            .await
+            .map_err(|e| Error::Postgres(describe(&e)))?;
+
+        let mut report = ReconcileReport::default();
+        for row in rows {
+            let name: String = row.get(0);
+            // A role that does not parse as a `MintId` is not one of ours
+            // however much its name looks like it, and briefcred does not drop
+            // roles it cannot prove it created.
+            let Ok(mint_id) = name.parse::<MintId>() else {
+                continue;
+            };
+            // No revoke token survives a daemon restart, so the sweep replays
+            // the profile's own template, which is the same fallback a revoke
+            // with a rejected token takes.
+            let plan = revoke_plan(&mint_id, &config.role_template)?;
+            let mut failure = None;
+            for step in plan {
+                if let Err(e) = client.batch_execute(step.sql()).await {
+                    // As in `revoke`: only a failed DROP ROLE means the role is
+                    // still there. The earlier steps are best effort.
+                    if matches!(step, RevokeStep::DropRole(_)) {
+                        failure = Some(format!("DROP ROLE failed: {}", describe(&e)));
+                    }
+                }
+            }
+            match failure {
+                Some(detail) => report.failed.push((mint_id, detail)),
+                None => report.revoked.push(mint_id),
+            }
+        }
+        Ok(report)
+    }
 }
+
+/// Every briefcred role whose `VALID UNTIL` has passed.
+///
+/// The underscores in the prefix are escaped: unescaped, `_` is a single-
+/// character wildcard in `LIKE`, and the pattern would match roles a different
+/// tool created.
+const STALE_ROLES_SQL: &str = "SELECT rolname FROM pg_roles \
+     WHERE rolname LIKE 'briefcred\\_t\\_%' \
+       AND rolvaliduntil IS NOT NULL \
+       AND rolvaliduntil < now() \
+     ORDER BY rolname";
 
 /// One statement in a revoke, in the order it must be issued.
 #[derive(Debug, Clone, PartialEq, Eq)]

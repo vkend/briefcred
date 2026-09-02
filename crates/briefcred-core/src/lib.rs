@@ -38,4 +38,6 @@ pub use profile::Profile;
 pub use registry::{MinterFactory, Registry};
 pub use source::SourceKind;
 pub use traits::{MasterSource, Minter};
-pub use types::{MintCtx, MintId, MintedCredential, RevokeCtx, RevokeOutcome};
+pub use types::{
+    MintCtx, MintId, MintedCredential, ReconcileCtx, ReconcileReport, RevokeCtx, RevokeOutcome,
+};

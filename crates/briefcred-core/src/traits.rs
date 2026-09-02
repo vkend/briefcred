@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use zeroize::Zeroizing;
 
 use crate::error::Result;
-use crate::types::{MintCtx, MintedCredential, RevokeCtx, RevokeOutcome};
+use crate::types::{
+    MintCtx, MintedCredential, ReconcileCtx, ReconcileReport, RevokeCtx, RevokeOutcome,
+};
 
 /// Where a master credential comes from.
 ///
@@ -41,6 +43,17 @@ pub trait Minter: Send + Sync {
 
     /// Remove a principal previously created by [`Minter::mint`].
     async fn revoke(&self, ctx: RevokeCtx) -> RevokeOutcome;
+
+    /// Remove principals this minter created that nothing is using any more.
+    ///
+    /// The default is "this backend cannot be swept", which is honest for a
+    /// minter whose credentials expire on their own and leave nothing behind.
+    /// A minter that creates a durable object — a role, a user, a key — must
+    /// override it, because otherwise a `SIGKILL` mid-`exec` leaks that object
+    /// permanently.
+    async fn reconcile(&self, _ctx: ReconcileCtx) -> Result<ReconcileReport> {
+        Ok(ReconcileReport::default())
+    }
 }
 
 impl std::fmt::Debug for dyn Minter {

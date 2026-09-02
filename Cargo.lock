@@ -278,6 +278,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "briefcred-helper-postgres"
+version = "0.1.0"
+dependencies = [
+ "briefcred-core",
+ "briefcred-proto",
+ "serde_json",
+ "serde_yaml",
+ "time",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "briefcred-hook"
 version = "0.1.0"
 

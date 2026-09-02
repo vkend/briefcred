@@ -303,6 +303,77 @@ pub fn encode_line<T: serde::Serialize>(value: &T) -> Result<String, serde_json:
     Ok(line)
 }
 
+/// What a helper process does with one call.
+///
+/// The trait lives here rather than in `briefcred-core` so that
+/// [`serve_stdio`] can be shared by every helper without `briefcred-core`
+/// having to know about the wire format, and without the wire crate having to
+/// know about minters. A helper crate implements this over whatever it wraps.
+#[allow(async_fn_in_trait)]
+pub trait StdioHandler {
+    /// Answer one call. Returning `Err` produces a JSON-RPC error response;
+    /// the loop keeps running either way.
+    async fn handle(&self, params: HelperParams) -> Result<HelperResult, HelperError>;
+}
+
+/// Run the newline-delimited JSON-RPC loop on the process's own stdio.
+///
+/// Returns when stdin reaches end of file or a [`METHOD_SHUTDOWN`] call is
+/// answered — both of which are the daemon saying it is finished with this
+/// helper. A malformed line is answered with an error and the loop continues,
+/// because one bad frame should not cost the daemon a live connection to the
+/// backend.
+///
+/// Only `stdout` carries protocol. Anything a helper wants to say to a human
+/// goes on `stderr`, which the daemon inherits, so a helper that prints a
+/// diagnostic cannot corrupt the stream.
+pub async fn serve_stdio<H, R, W>(handler: &H, reader: R, writer: &mut W) -> std::io::Result<()>
+where
+    H: StdioHandler,
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: HelperRequest = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(err) => {
+                // No `id` to answer with, so use 0 and say what was wrong.
+                let response = HelperResponse::err(
+                    0,
+                    CODE_INVALID_PARAMS,
+                    format!("unparsable request: {err}"),
+                );
+                writer.write_all(encode_line(&response)?.as_bytes()).await?;
+                writer.flush().await?;
+                continue;
+            }
+        };
+
+        let stopping = request.method == METHOD_SHUTDOWN;
+        let response = match handler.handle(request.params).await {
+            Ok(result) => HelperResponse::ok(request.id, result),
+            Err(error) => HelperResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id,
+                result: None,
+                error: Some(error),
+            },
+        };
+        writer.write_all(encode_line(&response)?.as_bytes()).await?;
+        writer.flush().await?;
+        if stopping {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +457,82 @@ mod tests {
         ] {
             assert!(METHODS.contains(&params.method()), "{:?}", params.method());
         }
+    }
+
+    /// Answers `shutdown`, and fails everything else, so the loop's control
+    /// flow can be tested without a backend.
+    struct StopsOnShutdown;
+
+    impl StdioHandler for StopsOnShutdown {
+        async fn handle(&self, params: HelperParams) -> Result<HelperResult, HelperError> {
+            match params {
+                HelperParams::Shutdown(_) => {
+                    Ok(HelperResult::Shutdown(ShutdownResult { stopping: true }))
+                }
+                other => Err(HelperError {
+                    code: CODE_METHOD_NOT_FOUND,
+                    message: format!("`{}` is not implemented here", other.method()),
+                }),
+            }
+        }
+    }
+
+    async fn run(input: &str) -> String {
+        let mut output: Vec<u8> = Vec::new();
+        serve_stdio(
+            &StopsOnShutdown,
+            tokio::io::BufReader::new(input.as_bytes()),
+            &mut output,
+        )
+        .await
+        .unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_loop_answers_shutdown_and_then_returns() {
+        let shutdown = encode_line(&HelperRequest::new(
+            1,
+            HelperParams::Shutdown(ShutdownParams {}),
+        ))
+        .unwrap();
+        let never_read =
+            encode_line(&HelperRequest::new(2, HelperParams::Mint(mint_params()))).unwrap();
+
+        let output = run(&format!("{shutdown}{never_read}")).await;
+        let replies: Vec<&str> = output.lines().collect();
+        assert_eq!(replies.len(), 1, "nothing after shutdown may be served");
+        let reply: HelperResponse = serde_json::from_str(replies[0]).unwrap();
+        assert_eq!(reply.id, 1);
+        assert!(reply.error.is_none(), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_line_is_answered_rather_than_ending_the_loop() {
+        let shutdown = encode_line(&HelperRequest::new(
+            9,
+            HelperParams::Shutdown(ShutdownParams {}),
+        ))
+        .unwrap();
+        let output = run(&format!("not json\n\n{shutdown}")).await;
+
+        let replies: Vec<&str> = output.lines().collect();
+        assert_eq!(replies.len(), 2, "{output}");
+        let bad: HelperResponse = serde_json::from_str(replies[0]).unwrap();
+        assert_eq!(bad.error.unwrap().code, CODE_INVALID_PARAMS);
+        let good: HelperResponse = serde_json::from_str(replies[1]).unwrap();
+        assert_eq!(good.id, 9);
+    }
+
+    #[tokio::test]
+    async fn a_handler_failure_becomes_an_error_response_on_the_same_id() {
+        let mint = encode_line(&HelperRequest::new(4, HelperParams::Mint(mint_params()))).unwrap();
+        let output = run(&mint).await;
+        let reply: HelperResponse = serde_json::from_str(output.trim_end()).unwrap();
+        assert_eq!(reply.id, 4);
+        assert_eq!(reply.error.unwrap().code, CODE_METHOD_NOT_FOUND);
+        // And the master it carried is not echoed back in the complaint.
+        assert!(!output.contains("master-secret"), "{output}");
     }
 
     #[test]
