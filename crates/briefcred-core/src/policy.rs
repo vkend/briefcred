@@ -3,7 +3,8 @@
 //! The proxy has to answer one question per request: may *this session* make
 //! *this request*. Everything briefcred knows about the request that is safe to
 //! decide on — the method, the scheme, the host, and the path — is put into a
-//! Cedar request, and the profile's own policy text decides.
+//! Cedar request, along with a [`RequestContext`] saying what the session has
+//! already done and what time it is, and the profile's own policy text decides.
 //!
 //! Three rules shape the whole module:
 //!
@@ -29,6 +30,7 @@ use cedar_policy::{
     Schema, ValidationMode, Validator,
 };
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 
@@ -51,7 +53,13 @@ action http;
 action GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS in [http]
   appliesTo {
     principal: [Session],
-    resource: [Http]
+    resource: [Http],
+    context: {
+      hour: Long,
+      weekday: Long,
+      resp_bytes_so_far: Long,
+      requests_so_far: Long,
+    }
   };
 "#;
 
@@ -128,6 +136,85 @@ pub struct HttpRequest<'a> {
     pub host: &'a str,
     /// The path, with the query string already stripped.
     pub path: &'a str,
+    /// What the session has done up to now, and what time it is.
+    pub context: RequestContext,
+}
+
+/// The Cedar `context` a request carries.
+///
+/// Everything here is about the *session* and the *clock* rather than about
+/// the request, which is what makes it worth having as a separate thing: the
+/// resource attributes say what is being asked for, and this says whether the
+/// session is still in a position to be asking.
+///
+/// All four are `Long` in the schema, because Cedar has no unsigned type and
+/// no clock of its own. A byte count that overflowed an `i64` would be nine
+/// exabytes through one proxy session, so the saturating conversion below is
+/// arithmetic hygiene rather than a case anyone will meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RequestContext {
+    /// Hour of the day in UTC, 0 to 23.
+    ///
+    /// UTC and not local time. A policy that meant "business hours" and got
+    /// them from whatever timezone the daemon happened to be started in would
+    /// be a policy that silently changed meaning when a laptop travelled.
+    pub hour: i64,
+    /// Day of the week, 0 for Monday through 6 for Sunday, in UTC.
+    pub weekday: i64,
+    /// Response bytes returned to this session before this request.
+    ///
+    /// Before, not including: the size of the response being decided on is not
+    /// known until it has been sent, so a budget written against this counts
+    /// what the session has already been given.
+    pub resp_bytes_so_far: i64,
+    /// Requests this session has made through the proxy before this one.
+    ///
+    /// So the first request of a session sees `0`, and
+    /// `context.requests_so_far < 100` permits exactly one hundred.
+    pub requests_so_far: i64,
+}
+
+impl RequestContext {
+    /// The context for a session that has made `requests` requests and been
+    /// sent `resp_bytes` bytes, at `now`.
+    pub fn new(now: OffsetDateTime, requests: u64, resp_bytes: u64) -> RequestContext {
+        RequestContext {
+            hour: i64::from(now.hour()),
+            // `time` numbers Monday from one; the schema numbers it from zero,
+            // because `0..6` is what somebody writing `context.weekday <= 4`
+            // for "weekdays" expects.
+            weekday: i64::from(now.weekday().number_from_monday()) - 1,
+            resp_bytes_so_far: clamp_to_long(resp_bytes),
+            requests_so_far: clamp_to_long(requests),
+        }
+    }
+
+    /// The four attributes, as Cedar restricted expressions.
+    fn attrs(&self) -> HashMap<String, RestrictedExpression> {
+        HashMap::from([
+            (
+                "hour".to_string(),
+                RestrictedExpression::new_long(self.hour),
+            ),
+            (
+                "weekday".to_string(),
+                RestrictedExpression::new_long(self.weekday),
+            ),
+            (
+                "resp_bytes_so_far".to_string(),
+                RestrictedExpression::new_long(self.resp_bytes_so_far),
+            ),
+            (
+                "requests_so_far".to_string(),
+                RestrictedExpression::new_long(self.requests_so_far),
+            ),
+        ])
+    }
+}
+
+/// A counter as the `Long` Cedar can hold, saturating rather than wrapping.
+fn clamp_to_long(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 /// A profile's compiled policy.
@@ -215,14 +302,10 @@ impl CompiledPolicy {
         )
         .ok()?;
 
-        let cedar_request = cedar_policy::Request::new(
-            principal,
-            action,
-            resource,
-            Context::empty(),
-            Some(schema()),
-        )
-        .ok()?;
+        let context = Context::from_pairs(request.context.attrs()).ok()?;
+        let cedar_request =
+            cedar_policy::Request::new(principal, action, resource, context, Some(schema()))
+                .ok()?;
         let response = Authorizer::new().is_authorized(&cedar_request, &self.policies, &entities);
         Some(response.decision() == Decision::Allow)
     }
@@ -276,6 +359,20 @@ permit(
             scheme: "https",
             host,
             path,
+            context: RequestContext::default(),
+        }
+    }
+
+    /// The same request, with a context a test has set up.
+    fn in_context<'a>(
+        method: &'a str,
+        host: &'a str,
+        path: &'a str,
+        context: RequestContext,
+    ) -> HttpRequest<'a> {
+        HttpRequest {
+            context,
+            ..request(method, host, path)
         }
     }
 
@@ -411,10 +508,8 @@ when { resource.scheme == "https" };
             Outcome::Allow
         );
         let plain = HttpRequest {
-            method: "GET",
             scheme: "http",
-            host: "a.test",
-            path: "/",
+            ..request("GET", "a.test", "/")
         };
         assert_eq!(
             policy.decide("s1", &plain, PolicyMode::Enforce),
@@ -485,6 +580,120 @@ when { resource.scheme == "https" };
         assert_eq!(PolicyMode::default(), PolicyMode::Enforce);
         assert_eq!(PolicyMode::Enforce.as_str(), "enforce");
         assert_eq!(PolicyMode::Observe.as_str(), "observe");
+    }
+
+    #[test]
+    fn a_policy_may_hold_a_request_to_a_window_of_the_day() {
+        let source = r#"
+permit(principal, action in [Action::"http"], resource)
+when { context.hour >= 9 && context.hour < 18 };
+"#;
+        let policy = CompiledPolicy::parse(source).unwrap();
+        let at = |hour: i64| {
+            let context = RequestContext {
+                hour,
+                ..RequestContext::default()
+            };
+            policy.decide(
+                "s1",
+                &in_context("GET", "a.test", "/", context),
+                PolicyMode::Enforce,
+            )
+        };
+        assert_eq!(at(9), Outcome::Allow);
+        assert_eq!(at(17), Outcome::Allow);
+        assert_eq!(at(18), Outcome::Deny);
+        assert_eq!(at(3), Outcome::Deny);
+    }
+
+    #[test]
+    fn a_policy_may_hold_a_session_to_a_byte_budget() {
+        let source = r#"
+permit(principal, action in [Action::"http"], resource)
+when { context.resp_bytes_so_far < 1048576 };
+"#;
+        let policy = CompiledPolicy::parse(source).unwrap();
+        let after = |bytes: i64| {
+            let context = RequestContext {
+                resp_bytes_so_far: bytes,
+                ..RequestContext::default()
+            };
+            policy.decide(
+                "s1",
+                &in_context("GET", "a.test", "/", context),
+                PolicyMode::Enforce,
+            )
+        };
+        assert_eq!(after(0), Outcome::Allow);
+        assert_eq!(after(1_048_575), Outcome::Allow);
+        assert_eq!(after(1_048_576), Outcome::Deny);
+    }
+
+    #[test]
+    fn a_policy_counting_requests_permits_exactly_the_number_it_names() {
+        let source = r#"
+permit(principal, action in [Action::"http"], resource)
+when { context.requests_so_far < 3 };
+"#;
+        let policy = CompiledPolicy::parse(source).unwrap();
+        let outcomes: Vec<Outcome> = (0..5)
+            .map(|n| {
+                let context = RequestContext {
+                    requests_so_far: n,
+                    ..RequestContext::default()
+                };
+                policy.decide(
+                    "s1",
+                    &in_context("GET", "a.test", "/", context),
+                    PolicyMode::Enforce,
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Allow,
+                Outcome::Allow,
+                Outcome::Allow,
+                Outcome::Deny,
+                Outcome::Deny
+            ],
+            "`requests_so_far` counts what came before, so `< 3` is three requests"
+        );
+    }
+
+    #[test]
+    fn a_policy_naming_a_context_attribute_the_schema_lacks_is_rejected_at_parse() {
+        let source = r#"permit(principal, action in [Action::"http"], resource) when { context.minute == 0 };"#;
+        let err = CompiledPolicy::parse(source).unwrap_err();
+        assert!(err.to_string().contains("Cedar schema"), "{err}");
+    }
+
+    #[test]
+    fn the_context_numbers_the_week_from_monday_and_the_day_from_midnight() {
+        // 2026-09-02 is a Wednesday.
+        let wednesday = time::macros::datetime!(2026-09-02 14:30:00 UTC);
+        let context = RequestContext::new(wednesday, 7, 4096);
+        assert_eq!(context.hour, 14);
+        assert_eq!(context.weekday, 2, "Monday is 0, so Wednesday is 2");
+        assert_eq!(context.requests_so_far, 7);
+        assert_eq!(context.resp_bytes_so_far, 4096);
+
+        let monday = time::macros::datetime!(2026-08-31 00:00:00 UTC);
+        assert_eq!(RequestContext::new(monday, 0, 0).weekday, 0);
+        assert_eq!(RequestContext::new(monday, 0, 0).hour, 0);
+        let sunday = time::macros::datetime!(2026-09-06 23:00:00 UTC);
+        assert_eq!(RequestContext::new(sunday, 0, 0).weekday, 6);
+        assert_eq!(RequestContext::new(sunday, 0, 0).hour, 23);
+    }
+
+    #[test]
+    fn a_counter_too_large_for_cedar_saturates_rather_than_wrapping() {
+        // A negative byte count would make `context.resp_bytes_so_far < N`
+        // true again, which is the one way a budget could fail open.
+        let context = RequestContext::new(OffsetDateTime::UNIX_EPOCH, u64::MAX, u64::MAX);
+        assert_eq!(context.resp_bytes_so_far, i64::MAX);
+        assert_eq!(context.requests_so_far, i64::MAX);
     }
 
     #[test]
