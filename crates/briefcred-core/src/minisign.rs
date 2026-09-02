@@ -14,13 +14,24 @@
 //!   algorithm identifiers, the (unused, password-less) key-derivation
 //!   parameters, and `key_id[8] || secret_key[64] || checksum[32]`.
 //! - A **signature** is four lines: an untrusted comment, base64 of
-//!   `"Ed" || key_id[8] || signature[64]`, a *trusted* comment, and base64 of
-//!   a second signature over `signature[64] || trusted_comment`.
+//!   `alg[2] || key_id[8] || signature[64]`, a *trusted* comment, and base64 of
+//!   a second signature over `signature[64] || trusted_comment`. The algorithm
+//!   tag says what the signature is over: `"Ed"` the file, `"ED"` its
+//!   BLAKE2b-512 digest.
 //!
 //! The trusted comment is the point of the second signature. The first line's
 //! comment is attacker-controlled — nothing signs it — so anything that must
 //! survive the trip, a file name or a version, goes in the trusted comment,
 //! which the global signature covers.
+//!
+//! **What briefcred accepts, and what it writes.** It verifies both minisign
+//! signature forms: the legacy `Ed`, over the file's bytes, and the prehashed
+//! `ED`, over BLAKE2b-512 of the file, which is what stock `minisign -S` has
+//! written by default since 0.10. It only ever *writes* `Ed`, so a briefcred
+//! signature verifies under every minisign release. Secret keys are read in
+//! minisign's password-less form, including the all-zero checksum that
+//! `minisign -G -W` writes in place of a real one; a key with a real checksum
+//! has it checked.
 //!
 //! briefcred writes password-less secret keys, because the thing signing a
 //! profile in a release pipeline has no human to prompt. That is a real
@@ -31,7 +42,7 @@ use std::fmt;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use blake2::digest::consts::U32;
+use blake2::digest::consts::{U32, U64};
 use blake2::{Blake2b, Digest as _};
 use ed25519_dalek::{Signature as DalekSignature, Signer as _, SigningKey, Verifier as _};
 use zeroize::Zeroizing;
@@ -40,10 +51,20 @@ use crate::error::{Error, Result};
 
 /// The legacy (non-prehashed) minisign signature algorithm.
 ///
-/// briefcred signs the file's bytes rather than a hash of them. Profiles are
-/// kilobytes, so the prehashed variant buys nothing, and the legacy form is
-/// what every minisign release since 0.1 can verify.
+/// What briefcred *produces*. Profiles are kilobytes, so the prehashed variant
+/// buys nothing, and the legacy form is what every minisign release since 0.1
+/// can verify. Public-key and secret-key files always carry this tag, whichever
+/// form a signature made with them uses.
 pub const SIG_ALG: [u8; 2] = *b"Ed";
+
+/// The prehashed minisign signature algorithm.
+///
+/// What briefcred *accepts* as well, because it is what stock `minisign -S`
+/// writes: since 0.10 the default is prehashed, so refusing it would mean no
+/// signature made by the reference implementation's default invocation could
+/// ever be used. The signature is over BLAKE2b-512 of the file rather than over
+/// the file, and the trusted comment carries a trailing `hashed` marker.
+pub const SIG_ALG_PREHASHED: [u8; 2] = *b"ED";
 
 /// The checksum algorithm identifier in a secret-key file: BLAKE2b.
 const CKSUM_ALG: [u8; 2] = *b"B2";
@@ -278,8 +299,14 @@ impl SecretKey {
             signing: SigningKey::from_bytes(&seed),
         };
         // The checksum catches a truncated or hand-edited file before a
-        // signature made with the wrong key goes out the door.
-        if keynum[72..] != secret.keynum_sk()[72..] {
+        // signature made with the wrong key goes out the door — when there is
+        // one. `minisign -G -W` writes thirty-two zero bytes here instead of a
+        // checksum for a password-less key, so an all-zero field means
+        // "unchecked" rather than "wrong", and refusing it would mean no key
+        // the reference implementation generates could ever sign a profile.
+        // The public-half check below still catches a damaged key either way.
+        let unchecked = keynum[72..].iter().all(|byte| *byte == 0);
+        if !unchecked && keynum[72..] != secret.keynum_sk()[72..] {
             return Err(bad(
                 "secret key checksum does not match; the file is damaged",
             ));
@@ -342,6 +369,7 @@ impl SecretKey {
 #[derive(Debug, Clone)]
 pub struct Signature {
     key_id: KeyId,
+    prehashed: bool,
     signature: [u8; 64],
     global: [u8; 64],
     trusted_comment: String,
@@ -356,6 +384,12 @@ impl Signature {
     /// The trusted comment, which is only trustworthy after [`Signature::verify`].
     pub fn trusted_comment(&self) -> &str {
         &self.trusted_comment
+    }
+
+    /// Whether the signature is over BLAKE2b-512 of the file rather than the
+    /// file itself. True for anything stock `minisign -S` wrote.
+    pub fn is_prehashed(&self) -> bool {
+        self.prehashed
     }
 
     /// Parse the four lines of a `.minisig` file.
@@ -384,11 +418,15 @@ impl Signature {
                 raw.len()
             )));
         }
-        if raw[..2] != SIG_ALG {
+        let prehashed = if raw[..2] == SIG_ALG {
+            false
+        } else if raw[..2] == SIG_ALG_PREHASHED {
+            true
+        } else {
             return Err(bad(
-                "signature is not a legacy Ed25519 minisign signature (bad algorithm tag)",
+                "signature is not an Ed25519 minisign signature (bad algorithm tag)",
             ));
-        }
+        };
         let trusted_comment = trusted
             .strip_prefix(TRUSTED_COMMENT_PREFIX)
             .ok_or_else(|| bad("the third line is not a `trusted comment:` line"))?
@@ -411,6 +449,7 @@ impl Signature {
         global_bytes.copy_from_slice(&global_raw);
         Ok(Signature {
             key_id: KeyId(key_id),
+            prehashed,
             signature,
             global: global_bytes,
             trusted_comment,
@@ -423,6 +462,12 @@ impl Signature {
     /// signature verifies but whose global signature does not has had its
     /// trusted comment rewritten, and the comment is the part callers are
     /// entitled to believe.
+    ///
+    /// A prehashed (`ED`) signature is checked against BLAKE2b-512 of the
+    /// content, which is what the algorithm tag in the file says it is over.
+    /// The tag chooses the message; it cannot be used to make an unsigned file
+    /// verify, because the signature still has to match whichever message the
+    /// tag names.
     pub fn verify(&self, content: &[u8], key: &PublicKey) -> Result<()> {
         if self.key_id != key.key_id {
             return Err(bad(format!(
@@ -430,8 +475,16 @@ impl Signature {
                 self.key_id, key.key_id
             )));
         }
+        let signed_message: Vec<u8> = if self.prehashed {
+            Blake2b::<U64>::digest(content).to_vec()
+        } else {
+            content.to_vec()
+        };
         key.key
-            .verify(content, &DalekSignature::from_bytes(&self.signature))
+            .verify(
+                &signed_message,
+                &DalekSignature::from_bytes(&self.signature),
+            )
             .map_err(|_| bad("signature does not match the file"))?;
         let mut global_input = Vec::with_capacity(64 + self.trusted_comment.len());
         global_input.extend_from_slice(&self.signature);
@@ -737,6 +790,160 @@ mod tests {
         let (secret, _) = SecretKey::generate().unwrap();
         let err = secret.sign(b"x", "a\nb").unwrap_err();
         assert!(err.to_string().contains("single line"), "{err}");
+    }
+
+    /// The reference implementation, when this machine has it.
+    ///
+    /// Every test below that needs it skips with a printed reason rather than
+    /// failing, so a checkout without minisign still runs green — but on a
+    /// machine that has it, these are the tests that decide whether the
+    /// interop claim in this module's header is true.
+    fn minisign_binary() -> Option<std::path::PathBuf> {
+        let output = std::process::Command::new("which")
+            .arg("minisign")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            println!("skipping: minisign is not installed");
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Some(std::path::PathBuf::from(path))
+    }
+
+    #[test]
+    fn minisign_verifies_what_briefcred_signs() {
+        let Some(binary) = minisign_binary() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (secret, public) = SecretKey::generate().unwrap();
+        let content = b"name: alpha\n";
+        std::fs::write(dir.path().join("alpha.yaml"), content).unwrap();
+        std::fs::write(
+            dir.path().join("alpha.yaml.minisig"),
+            secret.sign(content, "file:alpha.yaml").unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("k.pub"), public.to_file()).unwrap();
+
+        let output = std::process::Command::new(&binary)
+            .current_dir(dir.path())
+            .args(["-V", "-p", "k.pub", "-m", "alpha.yaml"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "minisign must verify a briefcred signature:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn briefcred_verifies_what_stock_minisign_signs() {
+        let Some(binary) = minisign_binary() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"name: alpha\n";
+        std::fs::write(dir.path().join("alpha.yaml"), content).unwrap();
+        // `-W` for a password-less key, and no `-H`: this is the default
+        // invocation, which since minisign 0.10 produces a *prehashed* `ED`
+        // signature. Refusing that would mean refusing the reference
+        // implementation's ordinary output.
+        let generated = std::process::Command::new(&binary)
+            .current_dir(dir.path())
+            .args(["-G", "-W", "-p", "k.pub", "-s", "k.key"])
+            .output()
+            .unwrap();
+        assert!(generated.status.success(), "minisign -G -W must succeed");
+        let signed = std::process::Command::new(&binary)
+            .current_dir(dir.path())
+            .args(["-S", "-s", "k.key", "-m", "alpha.yaml"])
+            .output()
+            .unwrap();
+        assert!(signed.status.success(), "minisign -S must succeed");
+
+        let signature_text =
+            std::fs::read_to_string(dir.path().join("alpha.yaml.minisig")).unwrap();
+        let parsed = Signature::parse(&signature_text).unwrap();
+        assert!(
+            parsed.is_prehashed(),
+            "stock minisign -S writes a prehashed signature; got {signature_text}"
+        );
+        let public =
+            PublicKey::parse_file(&std::fs::read_to_string(dir.path().join("k.pub")).unwrap())
+                .unwrap();
+        parsed
+            .verify(content, &public)
+            .expect("briefcred must verify a stock minisign signature");
+
+        // And it is a real check, not a rubber stamp: an edited file fails.
+        assert!(parsed.verify(b"name: alphb\n", &public).is_err());
+    }
+
+    #[test]
+    fn briefcred_signs_with_a_key_minisign_generated() {
+        let Some(binary) = minisign_binary() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let generated = std::process::Command::new(&binary)
+            .current_dir(dir.path())
+            .args(["-G", "-W", "-p", "k.pub", "-s", "k.key"])
+            .output()
+            .unwrap();
+        assert!(generated.status.success(), "minisign -G -W must succeed");
+
+        // minisign writes thirty-two zero bytes where a password-protected key
+        // would carry a checksum. briefcred has to read that as "unchecked".
+        let secret =
+            SecretKey::parse_file(&std::fs::read_to_string(dir.path().join("k.key")).unwrap())
+                .expect("a password-less minisign key must be usable");
+        let public =
+            PublicKey::parse_file(&std::fs::read_to_string(dir.path().join("k.pub")).unwrap())
+                .unwrap();
+        assert_eq!(secret.key_id(), public.key_id());
+        assert_eq!(secret.public().to_line(), public.to_line());
+
+        // Round the loop: sign with the minisign-generated key, verify with
+        // minisign's own public key file.
+        let content = b"name: alpha\n";
+        std::fs::write(dir.path().join("alpha.yaml"), content).unwrap();
+        std::fs::write(
+            dir.path().join("alpha.yaml.minisig"),
+            secret.sign(content, "file:alpha.yaml").unwrap(),
+        )
+        .unwrap();
+        let output = std::process::Command::new(&binary)
+            .current_dir(dir.path())
+            .args(["-V", "-p", "k.pub", "-m", "alpha.yaml"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "minisign must verify what its own key signed through briefcred:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn a_prehashed_tag_cannot_make_an_unsigned_file_verify() {
+        // The algorithm tag chooses which message the signature is over, so it
+        // is worth stating that flipping it does not turn a valid signature
+        // into one for a different message.
+        let (secret, public) = SecretKey::generate().unwrap();
+        let content = b"name: alpha\n";
+        let text = secret.sign(content, "c").unwrap();
+        let mut parsed = Signature::parse(&text).unwrap();
+        assert!(!parsed.prehashed);
+        parsed.prehashed = true;
+        assert!(
+            parsed.verify(content, &public).is_err(),
+            "an `Ed` signature must not verify as an `ED` one"
+        );
     }
 
     #[test]
