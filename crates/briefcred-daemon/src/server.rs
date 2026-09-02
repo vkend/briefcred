@@ -69,6 +69,7 @@ pub struct State {
     helper_dirs: Vec<PathBuf>,
     revokes: Arc<RevokeQueue>,
     raw_args: bool,
+    mcp_query_timeout: Duration,
 }
 
 /// Everything [`State::new`] needs, as a struct.
@@ -103,6 +104,8 @@ pub struct StateParts {
     pub revokes: Arc<RevokeQueue>,
     /// Whether `ExecStart` rows carry raw arguments as well as digests.
     pub raw_args: bool,
+    /// How long a `briefcred_db_query` statement may run.
+    pub mcp_query_timeout: Duration,
 }
 
 impl State {
@@ -124,6 +127,7 @@ impl State {
             helper_dirs: parts.helper_dirs,
             revokes: parts.revokes,
             raw_args: parts.raw_args,
+            mcp_query_timeout: parts.mcp_query_timeout,
         }
     }
 
@@ -140,6 +144,11 @@ impl State {
     /// Where helper binaries are looked for.
     pub fn helper_dirs(&self) -> &[PathBuf] {
         &self.helper_dirs
+    }
+
+    /// How long a `briefcred_db_query` statement may run.
+    pub fn mcp_query_timeout(&self) -> Duration {
+        self.mcp_query_timeout
     }
 
     /// The on-disk layout, for the trust environment.
@@ -993,6 +1002,7 @@ mod tests {
                     .unwrap(),
             ),
             raw_args: false,
+            mcp_query_timeout: Duration::from_secs(30),
         }));
         (home, state, prompts)
     }

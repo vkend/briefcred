@@ -42,6 +42,13 @@ pub struct AuditConfig {
     pub raw_args: bool,
 }
 
+/// How long a `briefcred_db_query` statement may run when nothing says.
+///
+/// Thirty seconds: long enough for an aggregate over a real table, short
+/// enough that a runaway query does not hold a minted role open past the
+/// point anyone is waiting for it.
+pub const DEFAULT_MCP_QUERY_TIMEOUT_SECS: u64 = 30;
+
 /// The daemon's resolved configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -62,6 +69,14 @@ pub struct Config {
     /// The sweep also runs once at startup, which is the tick that matters:
     /// it is what cleans up after a `SIGKILL`.
     pub reconcile_interval_secs: u64,
+    /// Seconds a `briefcred_db_query` statement may run before the server
+    /// cancels it.
+    ///
+    /// Set as `statement_timeout` on the connection, so the *database*
+    /// enforces it rather than the daemon waiting the query out. It bounds a
+    /// query a model asked for, which is why it exists at all: the row cap
+    /// bounds what comes back, and this bounds what it costs to find out.
+    pub mcp_query_timeout_secs: u64,
     /// What the audit log records beyond the defaults.
     pub audit: AuditConfig,
     /// Where master credentials are read from.
@@ -86,6 +101,7 @@ impl Default for Config {
             metrics_enabled: true,
             session_idle_secs: DEFAULT_SESSION_IDLE_SECS,
             reconcile_interval_secs: DEFAULT_RECONCILE_INTERVAL_SECS,
+            mcp_query_timeout_secs: DEFAULT_MCP_QUERY_TIMEOUT_SECS,
             audit: AuditConfig::default(),
             master_source: None,
             ca: CaConfig::default(),
@@ -113,6 +129,12 @@ impl Config {
     /// without a file on disk.
     pub fn from_toml_str(text: &str) -> std::result::Result<Config, String> {
         let config: Config = toml::from_str(text).map_err(|err| err.message().to_string())?;
+        if config.mcp_query_timeout_secs == 0 {
+            return Err(
+                "mcp_query_timeout_secs must be at least 1; 0 would let a query run forever"
+                    .to_string(),
+            );
+        }
         if config.retention_days == 0 {
             return Err(
                 "retention_days must be at least 1; 0 would delete today's own audit log"
@@ -149,6 +171,11 @@ impl Config {
         Duration::from_secs(self.session_idle_secs)
     }
 
+    /// The MCP statement timeout as a [`Duration`].
+    pub fn mcp_query_timeout(&self) -> Duration {
+        Duration::from_secs(self.mcp_query_timeout_secs)
+    }
+
     /// The master source to open, resolving the platform default.
     pub fn master_source(&self, platform: briefcred_core::paths::Platform) -> SourceKind {
         self.master_source
@@ -172,6 +199,22 @@ mod tests {
         assert_eq!(config.reconcile_interval_secs, 300);
         assert_eq!(config.reconcile_interval(), Duration::from_secs(300));
         assert!(!config.audit.raw_args, "raw args must be opted into");
+        assert_eq!(
+            config.mcp_query_timeout_secs,
+            DEFAULT_MCP_QUERY_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn a_query_timeout_of_zero_is_refused_because_it_would_mean_forever() {
+        let err = Config::from_toml_str("mcp_query_timeout_secs = 0\n").unwrap_err();
+        assert!(err.contains("mcp_query_timeout_secs"), "{err}");
+        assert_eq!(
+            Config::from_toml_str("mcp_query_timeout_secs = 5\n")
+                .unwrap()
+                .mcp_query_timeout(),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]

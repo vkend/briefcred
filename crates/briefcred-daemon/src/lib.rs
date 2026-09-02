@@ -111,6 +111,7 @@ pub async fn run() -> Result<()> {
         helper_dirs: helper_dirs.clone(),
         revokes: Arc::clone(&revokes),
         raw_args: config.audit.raw_args,
+        mcp_query_timeout: config.mcp_query_timeout(),
     }));
 
     // Sweep before the first row is written, so a log left behind by a much
