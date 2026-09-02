@@ -11,6 +11,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// "something is wrong".
 pub const EXIT_NOT_RUNNING: u8 = 3;
 
+/// The exit code for "the profile's `exec` policy refused this command".
+pub const EXIT_DENIED: u8 = 4;
+
+/// The exit code for "the unlock gate said no".
+///
+/// Its own code because a cancelled Touch ID prompt is a user decision, and a
+/// script that retries on a generic failure should not retry on this.
+pub const EXIT_LOCKED: u8 = 5;
+
 /// Everything the CLI can fail with.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -55,6 +64,24 @@ pub enum Error {
     #[error("cannot find the briefcred-daemon binary at {0}")]
     DaemonBinaryMissing(PathBuf),
 
+    /// The daemon refused the request for a reason the user can act on.
+    #[error("{0}")]
+    Refused(String),
+
+    /// The profile's `exec` policy refused the command.
+    #[error("{0}")]
+    Denied(String),
+
+    /// The unlock gate refused.
+    #[error("{message}")]
+    Locked {
+        /// Machine-readable reason: `cancelled`, `failed`, `no_aqua_session`,
+        /// or `unsupported`.
+        reason: String,
+        /// What the user should do about it.
+        message: String,
+    },
+
     /// Something in `briefcred-core` failed: the layout, the key store, or
     /// the certificate authority.
     #[error(transparent)]
@@ -75,6 +102,8 @@ impl Error {
     pub fn exit_code(&self) -> u8 {
         match self {
             Error::NotRunning => EXIT_NOT_RUNNING,
+            Error::Denied(_) => EXIT_DENIED,
+            Error::Locked { .. } => EXIT_LOCKED,
             _ => 1,
         }
     }

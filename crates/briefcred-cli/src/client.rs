@@ -12,21 +12,44 @@ use tokio::net::UnixStream;
 
 use crate::error::{Error, Result};
 
-/// Send one request and read one response.
-pub async fn request(sock: &Path, request: Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(sock)
-        .await
-        .map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                Error::NotRunning
-            }
-            _ => Error::io("connect to", sock, err),
-        })?;
+/// One open connection to the daemon, for a command that sends several
+/// requests.
+///
+/// `briefcred exec` sends four — open, exec, done, close — and they have to be
+/// the same session's, so a connection per request would work but would make
+/// four connects where one will do. More importantly, holding the connection
+/// open for the length of the child's run is what lets the daemon notice that
+/// a wrapper died: the socket closes with the process.
+pub struct Connection {
+    stream: UnixStream,
+}
 
-    write_frame(&mut stream, &request).await?;
-    read_frame(&mut stream)
-        .await?
-        .ok_or_else(|| Error::Unexpected("nothing before closing the connection".into()))
+impl Connection {
+    /// Connect to the daemon's socket.
+    pub async fn open(sock: &Path) -> Result<Connection> {
+        let stream = UnixStream::connect(sock)
+            .await
+            .map_err(|err| match err.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                    Error::NotRunning
+                }
+                _ => Error::io("connect to", sock, err),
+            })?;
+        Ok(Connection { stream })
+    }
+
+    /// Send one request and read its answer.
+    pub async fn send(&mut self, request: Request) -> Result<Response> {
+        write_frame(&mut self.stream, &request).await?;
+        read_frame(&mut self.stream)
+            .await?
+            .ok_or_else(|| Error::Unexpected("nothing before closing the connection".into()))
+    }
+}
+
+/// Send one request on a connection of its own and read one response.
+pub async fn request(sock: &Path, request: Request) -> Result<Response> {
+    Connection::open(sock).await?.send(request).await
 }
 
 /// Build an [`Request::OpenSession`] that reports this process's own session.

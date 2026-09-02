@@ -19,10 +19,15 @@ path = "src/main.rs"
 briefcred-core.workspace = true
 briefcred-proto.workspace = true
 clap.workspace = true
+dialoguer.workspace = true
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "time"] }
+toml.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

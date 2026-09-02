@@ -17,7 +17,7 @@ fn main() -> std::process::ExitCode {
     };
 
     match runtime.block_on(briefcred_cli::cli::run(cli)) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(code) => std::process::ExitCode::from(code),
         Err(err) => {
             eprintln!("briefcred: {err}");
             std::process::ExitCode::from(err.exit_code())

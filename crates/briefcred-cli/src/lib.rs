@@ -7,14 +7,17 @@
 
 #![deny(unsafe_code)]
 
+pub mod audit;
+pub mod bootstrap;
 pub mod ca;
 pub mod cli;
 pub mod client;
 pub mod error;
+pub mod exec;
 pub mod install;
 pub mod lifecycle;
 pub mod service;
 pub mod trust;
 
-pub use cli::{Cli, Command, DaemonAction};
+pub use cli::{Cli, Command, DaemonAction, ProfileAction};
 pub use error::{Error, Result};

@@ -27,6 +27,18 @@ use crate::profile::{parse_env_template, EnvSegment, Profile};
 /// `env_passthrough` adds to this list; nothing removes from it.
 pub const DEFAULT_PASSTHROUGH: [&str; 5] = ["PATH", "HOME", "TERM", "LANG", "TMPDIR"];
 
+/// The `argv0` `briefcred get` sends, standing for "there is no subprocess".
+///
+/// It contains a space, so it can never be the name of a program, and it is
+/// exempt from `exec.allow_argv0`.
+///
+/// That exemption is not a hole. `exec.allow_argv0` constrains what *briefcred*
+/// is willing to spawn with a credential attached; `briefcred get` hands the
+/// credential to the caller, who was always free to run whatever they liked
+/// with it. Pretending otherwise by making `get` pick an allowed program would
+/// be theatre. `THREAT_MODEL.md` says the same thing at more length.
+pub const GET_PSEUDO_ARGV0: &str = "briefcred get";
+
 /// Why a command is not allowed to run under a profile.
 ///
 /// Every variant names the offending value, because "denied" without the
@@ -86,7 +98,7 @@ pub enum CommandDenied {
 /// An empty `allow_argv0` or `allow_args` means "any", which is the documented
 /// default for a profile that has not thought about it yet.
 pub fn check_command(profile: &Profile, argv0: &str, args: &[String]) -> Result<(), CommandDenied> {
-    if !profile.exec.allow_argv0.is_empty() {
+    if !profile.exec.allow_argv0.is_empty() && argv0 != GET_PSEUDO_ARGV0 {
         let base = basename(argv0);
         let permitted = profile
             .exec
@@ -288,6 +300,20 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn the_get_pseudo_command_is_exempt_from_the_argv0_allowlist() {
+        // `get` spawns nothing, so there is no program for the allowlist to be
+        // about. It is still subject to `allow_args`, which it satisfies by
+        // passing none.
+        let p = profile("name: dev\nexec:\n  allow_argv0: [psql]\n  allow_args: ['^-c$']\n");
+        assert_eq!(check_command(&p, GET_PSEUDO_ARGV0, &[]), Ok(()));
+        // And the exemption does not extend to anything it could be confused
+        // with.
+        assert!(check_command(&p, "briefcred", &[]).is_err());
+        assert!(check_command(&p, "briefcred-get", &[]).is_err());
+        assert!(check_command(&p, GET_PSEUDO_ARGV0, &args(&["--all"])).is_err());
     }
 
     #[test]

@@ -26,6 +26,7 @@ async-trait = "0.1"
 base64 = "0.22"
 block2 = "0.6"
 clap = { version = "4", features = ["derive"] }
+dialoguer = { version = "0.12", default-features = false, features = ["password"] }
 getrandom = "0.3"
 hex = "0.4"
 http-body-util = "0.1"

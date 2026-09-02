@@ -8,7 +8,7 @@ use briefcred_proto::Response;
 use clap::{Parser, Subcommand};
 
 use crate::error::{Error, Result};
-use crate::{ca, client, install, lifecycle, trust};
+use crate::{audit, bootstrap, ca, client, exec, install, lifecycle, trust};
 
 /// A local, biometric-gated credential broker for AI agents and tooling.
 #[derive(Debug, Parser)]
@@ -45,6 +45,72 @@ pub enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Run a command with freshly minted, short-lived credentials.
+    ///
+    /// The command runs with a cleared environment: it gets what the profile
+    /// grants it, plus `PATH`, `HOME`, `TERM`, `LANG`, `TMPDIR`, and whatever
+    /// the profile's `env_passthrough` names. Its exit code becomes this
+    /// command's.
+    Exec {
+        /// The profile to run under.
+        #[arg(long)]
+        profile: String,
+        /// Comma-separated credential names. Defaults to all of them.
+        #[arg(long = "cred")]
+        credentials: Option<String>,
+        /// The program and its arguments.
+        #[arg(last = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Print one field of one minted credential.
+    ///
+    /// Refuses to write to a terminal unless `--force`: a short-lived
+    /// credential in a scrollback buffer is a long-lived one.
+    Get {
+        /// The profile to mint under.
+        #[arg(long)]
+        profile: String,
+        /// The credential to mint.
+        #[arg(long = "cred")]
+        credential: String,
+        /// The field to print, for example `PGPASSWORD`.
+        #[arg(long)]
+        field: String,
+        /// Print to a terminal anyway.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List the profiles the daemon has loaded.
+    Profiles,
+    /// Report whether briefcred is working, and what is missing if not.
+    Health,
+    /// Print audit rows.
+    Audit {
+        /// Only rows from the last `30m`, `24h`, `7d`, and so on.
+        #[arg(long)]
+        since: Option<String>,
+        /// Print the rows as they are stored, one JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create and inspect profiles.
+    Profile {
+        /// What to do with profiles.
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+}
+
+/// The `briefcred profile` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ProfileAction {
+    /// Interactively write a profile and store its master credential.
+    Bootstrap,
+    /// Print one profile as the daemon parsed it.
+    Show {
+        /// The profile's name.
+        name: String,
+    },
 }
 
 /// The `briefcred ca` subcommands.
@@ -75,8 +141,12 @@ pub enum DaemonAction {
     Restart,
 }
 
-/// Execute one parsed command.
-pub async fn run(cli: Cli) -> Result<()> {
+/// Execute one parsed command, returning the process exit code.
+///
+/// A code rather than `()` because `briefcred exec` exits with its child's
+/// status: a wrapper that swallowed a non-zero exit would break every script
+/// that used it.
+pub async fn run(cli: Cli) -> Result<u8> {
     let paths = Paths::discover()?;
     match cli.command {
         Command::Install { dry_run, trust_ca } => {
@@ -84,15 +154,231 @@ pub async fn run(cli: Cli) -> Result<()> {
             let options = install::InstallOptions { dry_run, trust_ca };
             let report = install::install(&paths, &binary, options, keystore(&paths)?.as_ref())?;
             print_install(&report, dry_run);
-            Ok(())
+            Ok(0)
         }
         Command::Uninstall => {
             let removal = install::uninstall(&paths)?;
             print_uninstall(&removal);
+            Ok(0)
+        }
+        Command::Ca { action } => run_ca(&paths, action).map(|()| 0),
+        Command::Daemon { action } => run_daemon(&paths, action).await.map(|()| 0),
+        Command::Exec {
+            profile,
+            credentials,
+            command,
+        } => {
+            let credentials = credentials
+                .as_deref()
+                .map(exec::parse_credentials)
+                .transpose()?;
+            let (argv0, args) = command.split_first().expect("clap requires at least one");
+            let code = exec::run(
+                paths.sock(),
+                exec::ExecRequest {
+                    profile: &profile,
+                    credentials,
+                    argv0,
+                    args,
+                },
+            )
+            .await?;
+            // The child's exit code is this command's, so a script wrapping
+            // `briefcred exec` behaves as if briefcred were not there.
+            Ok(code)
+        }
+        Command::Get {
+            profile,
+            credential,
+            field,
+            force,
+        } => {
+            let value = exec::get(
+                paths.sock(),
+                &profile,
+                &credential,
+                &field,
+                force,
+                stdout_is_tty(),
+            )
+            .await?;
+            // No trailing newline: the value is meant to be captured, and
+            // `$(briefcred get ...)` strips one but a file redirect does not.
+            print!("{value}");
+            Ok(0)
+        }
+        Command::Profiles => {
+            print_profiles(
+                &client::request(paths.sock(), briefcred_proto::Request::ListProfiles).await?,
+            );
+            Ok(0)
+        }
+        Command::Health => {
+            print_health(&paths).await;
+            Ok(0)
+        }
+        Command::Audit { since, json } => {
+            let window = since.as_deref().map(audit::parse_since).transpose()?;
+            for row in audit::read_since(&paths.audit_dir(), window)? {
+                if json {
+                    println!("{row}");
+                } else {
+                    println!("{}", audit::render(&row));
+                }
+            }
+            Ok(0)
+        }
+        Command::Profile { action } => run_profile(&paths, action).await.map(|()| 0),
+    }
+}
+
+/// Whether stdout is a terminal.
+///
+/// The one place the CLI asks: `briefcred get` refuses one, and nothing else
+/// changes its behaviour based on it.
+fn stdout_is_tty() -> bool {
+    // SAFETY-free: `isatty` takes an integer, touches no memory, and cannot
+    // fail in a way that matters here.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::isatty(libc::STDOUT_FILENO) == 1
+    }
+}
+
+async fn run_profile(paths: &Paths, action: ProfileAction) -> Result<()> {
+    match action {
+        ProfileAction::Bootstrap => {
+            let source_kind = master_source_kind(paths)?;
+            let done = bootstrap::run(paths, paths.sock(), source_kind).await?;
+            println!("briefcred profile bootstrap");
+            println!("  wrote      {}", done.path.display());
+            println!("  master     `{}` in {}", done.source_key, done.location);
+            println!(
+                "
+the daemon reloads profiles by itself; 'briefcred profiles' will show it"
+            );
             Ok(())
         }
-        Command::Ca { action } => run_ca(&paths, action),
-        Command::Daemon { action } => run_daemon(&paths, action).await,
+        ProfileAction::Show { name } => {
+            let reply =
+                client::request(paths.sock(), briefcred_proto::Request::ShowProfile { name })
+                    .await?;
+            match reply {
+                Response::Profile { profile } => {
+                    print_profiles(&Response::Profiles {
+                        profiles: vec![profile],
+                    });
+                    Ok(())
+                }
+                Response::Error { message } => Err(Error::Refused(message)),
+                other => Err(Error::Unexpected(format!("{other:?}"))),
+            }
+        }
+    }
+}
+
+/// Which master source the daemon is configured to use.
+fn master_source_kind(paths: &Paths) -> Result<briefcred_core::SourceKind> {
+    #[derive(serde::Deserialize)]
+    struct JustTheSource {
+        master_source: Option<briefcred_core::SourceKind>,
+    }
+    let text = std::fs::read_to_string(paths.daemon_toml()).unwrap_or_default();
+    // The CLI reads only the one key it needs rather than the daemon's whole
+    // schema: a `daemon.toml` with a key this binary is too old to know about
+    // must not stop somebody bootstrapping a profile.
+    let parsed: JustTheSource = toml::from_str(&text).unwrap_or(JustTheSource {
+        master_source: None,
+    });
+    Ok(parsed
+        .master_source
+        .unwrap_or_else(|| briefcred_core::SourceKind::platform_default(paths.platform())))
+}
+
+fn print_profiles(reply: &Response) {
+    let Response::Profiles { profiles } = reply else {
+        return;
+    };
+    if profiles.is_empty() {
+        println!("no profiles; run 'briefcred profile bootstrap' to write one");
+        return;
+    }
+    println!(
+        "{:<20}{:<12}{:<8}{}",
+        "PROFILE", "UNLOCK", "CACHE", "CREDENTIALS"
+    );
+    for profile in profiles {
+        let credentials = if profile.credentials.is_empty() {
+            "-".to_string()
+        } else {
+            profile
+                .credentials
+                .iter()
+                .map(|c| format!("{} ({}, {}s)", c.name, c.kind, c.ttl_secs))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "{:<20}{:<12}{:<8}{credentials}",
+            profile.name,
+            profile.unlock_policy,
+            format!("{}s", profile.unlock_cache_secs)
+        );
+    }
+}
+
+/// Report what is working and, for anything that is not, what to run.
+///
+/// Every line is a check somebody has actually been stuck on: the daemon not
+/// running, the CA not trusted, no profiles yet.
+async fn print_health(paths: &Paths) {
+    println!("briefcred health");
+    match client::status(paths.sock()).await {
+        Ok(Response::Status {
+            version,
+            uptime_secs,
+            audit_path,
+            ..
+        }) => {
+            println!(
+                "  daemon     running, {version}, up {}",
+                human_uptime(uptime_secs)
+            );
+            println!("  audit      {}", audit_path.display());
+        }
+        Ok(other) => println!("  daemon     answered unexpectedly: {other:?}"),
+        Err(err) => println!("  daemon     {err}"),
+    }
+
+    match client::request(paths.sock(), briefcred_proto::Request::ListProfiles).await {
+        Ok(Response::Profiles { profiles }) if profiles.is_empty() => {
+            println!("  profiles   none; run 'briefcred profile bootstrap'");
+        }
+        Ok(Response::Profiles { profiles }) => {
+            println!("  profiles   {} loaded", profiles.len());
+        }
+        _ => println!("  profiles   unknown; the daemon is not answering"),
+    }
+
+    if paths.ca_cert().exists() {
+        match trust::is_trusted(paths) {
+            Some(true) => println!("  ca         present and trusted"),
+            Some(false) => {
+                println!("  ca         present, not trusted; run 'briefcred install --trust-ca'")
+            }
+            None => println!("  ca         present, trust state unknown"),
+        }
+    } else {
+        println!("  ca         missing; run 'briefcred install --trust-ca'");
+    }
+
+    let queue = paths.state_dir().join("revoke-queue.jsonl");
+    let outstanding = std::fs::read_to_string(&queue)
+        .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or_default();
+    match outstanding {
+        0 => println!("  revokes    none outstanding"),
+        n => println!("  revokes    {n} outstanding in {}", queue.display()),
     }
 }
 
@@ -386,9 +672,88 @@ mod tests {
             vec!["briefcred", "daemon", "start"],
             vec!["briefcred", "daemon", "stop"],
             vec!["briefcred", "daemon", "restart"],
+            vec!["briefcred", "exec", "--profile=db-ro", "--", "psql"],
+            vec![
+                "briefcred",
+                "exec",
+                "--profile",
+                "db-ro",
+                "--cred",
+                "db,warehouse",
+                "--",
+                "psql",
+                "-c",
+                "SELECT 1",
+            ],
+            vec![
+                "briefcred",
+                "get",
+                "--profile",
+                "db-ro",
+                "--cred",
+                "db",
+                "--field",
+                "PGPASSWORD",
+            ],
+            vec![
+                "briefcred",
+                "get",
+                "--profile",
+                "db-ro",
+                "--cred",
+                "db",
+                "--field",
+                "PGPASSWORD",
+                "--force",
+            ],
+            vec!["briefcred", "profiles"],
+            vec!["briefcred", "health"],
+            vec!["briefcred", "audit"],
+            vec!["briefcred", "audit", "--since", "24h", "--json"],
+            vec!["briefcred", "profile", "bootstrap"],
+            vec!["briefcred", "profile", "show", "db-ro"],
         ] {
             Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
+    }
+
+    /// Everything after `--` belongs to the child, including things that look
+    /// like briefcred's own flags. Without this an agent's `psql --profile x`
+    /// would be silently reinterpreted.
+    #[test]
+    fn the_child_command_swallows_flags_that_look_like_briefcreds_own() {
+        let cli = Cli::try_parse_from([
+            "briefcred",
+            "exec",
+            "--profile",
+            "db-ro",
+            "--",
+            "psql",
+            "--profile",
+            "--force",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Exec {
+            profile, command, ..
+        } = cli.command
+        else {
+            panic!("expected an exec");
+        };
+        assert_eq!(profile, "db-ro");
+        assert_eq!(command, vec!["psql", "--profile", "--force", "--json"]);
+    }
+
+    #[test]
+    fn an_exec_with_no_command_is_rejected() {
+        assert!(Cli::try_parse_from(["briefcred", "exec", "--profile", "db-ro"]).is_err());
+        assert!(Cli::try_parse_from(["briefcred", "exec", "--profile", "db-ro", "--"]).is_err());
+    }
+
+    #[test]
+    fn get_requires_every_part_of_the_address_it_is_given() {
+        assert!(Cli::try_parse_from(["briefcred", "get", "--profile", "p"]).is_err());
+        assert!(Cli::try_parse_from(["briefcred", "get", "--cred", "c", "--field", "f"]).is_err());
     }
 
     #[test]
