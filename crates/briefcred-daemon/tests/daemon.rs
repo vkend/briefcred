@@ -619,6 +619,29 @@ async fn a_broken_profile_is_audited_and_the_good_ones_survive() {
     );
     let mut stream = daemon.connect().await;
 
+    // Wait for the good profile to actually be loaded before breaking
+    // anything. `connect` only proves the socket is accepting, and the whole
+    // claim under test is that the *previous* set survives a bad file — which
+    // is vacuous, and worse, wrong, if the bad file lands before there is a
+    // previous set. A daemon that loses the race loads nothing at all, every
+    // reload after it fails too, and the test sees zero profiles and a
+    // perfectly good `ProfileLoadError` row: a failure that looks like the bug
+    // this test is for and is not.
+    let mut loaded = false;
+    for _ in 0..600 {
+        if let Response::Profiles { profiles } = call(&mut stream, Request::ListProfiles).await {
+            if profiles.iter().any(|p| p.name == "dev") {
+                loaded = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        loaded,
+        "the daemon never loaded the good profile to begin with"
+    );
+
     write_profile(
         daemon.home.path(),
         "broken.yaml",
