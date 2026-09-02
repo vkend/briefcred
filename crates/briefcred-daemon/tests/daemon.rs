@@ -448,6 +448,7 @@ async fn the_daemon_lists_a_profile_opens_a_session_and_closes_it() {
         Request::OpenSession {
             profile: "dev".into(),
             client_headless: false,
+            session_pubkey: None,
         },
     )
     .await
@@ -517,6 +518,7 @@ async fn opening_a_session_for_an_unknown_profile_says_which_one() {
         Request::OpenSession {
             profile: "absent".into(),
             client_headless: false,
+            session_pubkey: None,
         },
     )
     .await
@@ -542,6 +544,7 @@ async fn a_missing_master_fails_the_open_and_names_where_it_looked() {
         Request::OpenSession {
             profile: "dev".into(),
             client_headless: false,
+            session_pubkey: None,
         },
     )
     .await
@@ -647,6 +650,7 @@ async fn a_session_still_open_at_shutdown_is_closed_and_audited() {
         Request::OpenSession {
             profile: "dev".into(),
             client_headless: false,
+            session_pubkey: None,
         },
     )
     .await
@@ -687,6 +691,7 @@ async fn an_idle_session_is_evicted_and_audited() {
         Request::OpenSession {
             profile: "dev".into(),
             client_headless: false,
+            session_pubkey: None,
         },
     )
     .await
@@ -770,6 +775,7 @@ async fn a_headless_daemon_refuses_a_guarded_profile_and_reads_no_master() {
         Request::OpenSession {
             profile: "guarded".into(),
             client_headless: false,
+            session_pubkey: None,
         },
     )
     .await
@@ -818,6 +824,7 @@ async fn a_client_that_declares_itself_headless_is_refused_by_a_daemon_that_is_n
         Request::OpenSession {
             profile: "guarded".into(),
             client_headless: true,
+            session_pubkey: None,
         },
     )
     .await
@@ -865,6 +872,7 @@ async fn an_unattended_profile_still_opens_for_a_headless_client() {
         Request::OpenSession {
             profile: "dev".into(),
             client_headless: true,
+            session_pubkey: None,
         },
     )
     .await
@@ -938,6 +946,7 @@ async fn the_daemon_mints_an_ssh_certificate_itself_and_revokes_it_into_the_krl(
         Request::OpenSession {
             profile: "bastion".into(),
             client_headless: false,
+            session_pubkey: None,
         },
     )
     .await

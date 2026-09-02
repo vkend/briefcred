@@ -344,9 +344,17 @@ async fn handle_open_session(request: Request, state: Arc<State>) -> Response {
     let Request::OpenSession {
         profile: name,
         client_headless,
+        session_pubkey,
     } = request
     else {
         return mismatched(&request);
+    };
+    // A key the daemon cannot parse is refused rather than dropped: a client
+    // that meant to bind its tokens and silently did not would believe it had
+    // a guarantee it does not have.
+    let pubkey = match decode_session_pubkey(session_pubkey.as_deref()) {
+        Ok(pubkey) => pubkey,
+        Err(message) => return Response::Error { message },
     };
     let Some(profile) = state.profiles.get(&name).await else {
         return Response::Error {
@@ -364,6 +372,7 @@ async fn handle_open_session(request: Request, state: Arc<State>) -> Response {
             &profile,
             state.master_source.as_ref(),
             state.helper_dirs.clone(),
+            pubkey,
         )
         .await
     {
@@ -714,6 +723,28 @@ async fn handle_heap_scan(request: Request, _state: Arc<State>) -> Response {
     }
 }
 
+/// Decode the base64 session public key a client offered.
+///
+/// `Ok(None)` is a client that offered none, which is normal. `Err` is one that
+/// offered something that is not a 32-byte Ed25519 key.
+fn decode_session_pubkey(encoded: Option<&str>) -> std::result::Result<Option<[u8; 32]>, String> {
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let raw = <base64::engine::general_purpose::GeneralPurpose as base64::Engine>::decode(
+        &base64::engine::general_purpose::STANDARD,
+        encoded,
+    )
+    .map_err(|_| "`session_pubkey` is not base64".to_string())?;
+    let key: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+        format!(
+            "`session_pubkey` is {} bytes; an Ed25519 public key is 32",
+            raw.len()
+        )
+    })?;
+    Ok(Some(key))
+}
+
 /// Reduce a loaded profile to the shape a client is allowed to see.
 fn summarise(profile: &briefcred_core::Profile) -> ProfileSummary {
     ProfileSummary {
@@ -1017,6 +1048,7 @@ mod tests {
             Request::OpenSession {
                 profile: "dev".into(),
                 client_headless: true,
+                session_pubkey: None,
             },
             Arc::clone(&state),
         )
@@ -1043,6 +1075,7 @@ mod tests {
             Request::OpenSession {
                 profile: "dev".into(),
                 client_headless: false,
+                session_pubkey: None,
             },
             Arc::clone(&state),
         )
@@ -1057,6 +1090,7 @@ mod tests {
             Request::OpenSession {
                 profile: "dev".into(),
                 client_headless: true,
+                session_pubkey: None,
             },
             Arc::clone(&state),
         )
@@ -1076,6 +1110,7 @@ mod tests {
             Request::OpenSession {
                 profile: "dev".into(),
                 client_headless: true,
+                session_pubkey: None,
             },
             Arc::clone(&state),
         )

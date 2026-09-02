@@ -99,6 +99,7 @@ async fn a_master_is_gone_from_the_daemon_once_its_session_is_closed() {
         .request(Request::OpenSession {
             profile: "marked".into(),
             client_headless: true,
+            session_pubkey: None,
         })
         .await
         .expect("open session")

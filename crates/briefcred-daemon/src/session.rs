@@ -59,6 +59,13 @@ pub struct Session {
     /// nets under a minted credential, after the queue and before the
     /// reconciler.
     pub mints: BTreeMap<MintId, PendingRevoke>,
+    /// The public half of the client's per-session key, when it sent one.
+    ///
+    /// Raw 32 Ed25519 bytes. Every synthetic token the proxy signs for this
+    /// session carries a thumbprint of it, and a `DPoP` proof on a proxied
+    /// request is checked against it. `None` is a client that cannot make
+    /// proofs, which is most of them; the proxy then accepts the token bare.
+    pub pubkey: Option<[u8; 32]>,
     /// The helper processes this session started, one per minter kind.
     ///
     /// An `Arc` so a handler can hold it across the awaits of a mint without
@@ -76,6 +83,7 @@ impl std::fmt::Debug for Session {
             .field("last_used", &self.last_used)
             .field("masters", &self.masters.keys().collect::<Vec<_>>())
             .field("mints", &self.mints.keys().collect::<Vec<_>>())
+            .field("bound_to_a_session_key", &self.pubkey.is_some())
             .finish()
     }
 }
@@ -154,6 +162,7 @@ impl SessionStore {
         profile: &Profile,
         source: &dyn MasterSource,
         helper_dirs: Vec<std::path::PathBuf>,
+        pubkey: Option<[u8; 32]>,
     ) -> Result<(String, time::OffsetDateTime), SessionError> {
         let mut masters = BTreeMap::new();
         for spec in &profile.credentials {
@@ -176,6 +185,7 @@ impl SessionStore {
             last_used: now,
             masters,
             mints: BTreeMap::new(),
+            pubkey,
             helpers: Arc::new(MinterSet::new(helper_dirs)),
         };
         let id = session.id.clone();
@@ -399,7 +409,10 @@ credentials:
 ",
         );
 
-        let (id, _) = store.open(&profile, &source(), Vec::new()).await.unwrap();
+        let (id, _) = store
+            .open(&profile, &source(), Vec::new(), None)
+            .await
+            .unwrap();
         assert!(store.contains(&id).await);
         assert_eq!(store.profile_of(&id).await.as_deref(), Some("dev"));
     }
@@ -436,7 +449,10 @@ credentials:
         );
         let source = CountingSource::default();
         let store = store(TestClock::new(), Duration::from_secs(1800));
-        store.open(&profile, &source, Vec::new()).await.unwrap();
+        store
+            .open(&profile, &source, Vec::new(), None)
+            .await
+            .unwrap();
         assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -454,7 +470,7 @@ credentials:
 ",
         );
         let err = store
-            .open(&profile, &source(), Vec::new())
+            .open(&profile, &source(), Vec::new(), None)
             .await
             .unwrap_err();
         assert!(matches!(err, SessionError::Master(_)), "{err}");
@@ -468,7 +484,7 @@ credentials:
         let mut ids = std::collections::BTreeSet::new();
         for _ in 0..64 {
             let (id, _) = store
-                .open(&one_credential(), &source(), Vec::new())
+                .open(&one_credential(), &source(), Vec::new(), None)
                 .await
                 .unwrap();
             assert_eq!(id.len(), SESSION_ID_BYTES * 2, "{id}");
@@ -481,7 +497,7 @@ credentials:
     async fn closing_a_session_removes_it_at_once() {
         let store = store(TestClock::new(), Duration::from_secs(1800));
         let (id, _) = store
-            .open(&one_credential(), &source(), Vec::new())
+            .open(&one_credential(), &source(), Vec::new(), None)
             .await
             .unwrap();
 
@@ -502,7 +518,7 @@ credentials:
         let clock = TestClock::new();
         let store = store(clock.clone(), Duration::from_secs(1800));
         let (id, _) = store
-            .open(&one_credential(), &source(), Vec::new())
+            .open(&one_credential(), &source(), Vec::new(), None)
             .await
             .unwrap();
 
@@ -527,7 +543,7 @@ credentials:
         let clock = TestClock::new();
         let store = store(clock.clone(), Duration::from_secs(1800));
         let (id, _) = store
-            .open(&one_credential(), &source(), Vec::new())
+            .open(&one_credential(), &source(), Vec::new(), None)
             .await
             .unwrap();
 
@@ -547,12 +563,12 @@ credentials:
         let clock = TestClock::new();
         let store = store(clock.clone(), Duration::from_secs(1800));
         let (stale, _) = store
-            .open(&one_credential(), &source(), Vec::new())
+            .open(&one_credential(), &source(), Vec::new(), None)
             .await
             .unwrap();
         clock.advance(Duration::from_secs(1000));
         let (fresh, _) = store
-            .open(&one_credential(), &source(), Vec::new())
+            .open(&one_credential(), &source(), Vec::new(), None)
             .await
             .unwrap();
         clock.advance(Duration::from_secs(900));
@@ -568,7 +584,7 @@ credentials:
         let clock = TestClock::new();
         let store = store(clock.clone(), Duration::from_secs(60));
         let (id, _) = store
-            .open(&one_credential(), &source(), Vec::new())
+            .open(&one_credential(), &source(), Vec::new(), None)
             .await
             .unwrap();
         clock.advance(Duration::from_secs(60));
@@ -584,7 +600,7 @@ credentials:
         let clock = TestClock::new();
         let store = store(clock.clone(), Duration::from_secs(1800));
         let (id, opened_expiry) = store
-            .open(&one_credential(), &source(), Vec::new())
+            .open(&one_credential(), &source(), Vec::new(), None)
             .await
             .unwrap();
 
@@ -601,7 +617,7 @@ credentials:
         let store = store(TestClock::new(), Duration::from_secs(1800));
         for _ in 0..3 {
             store
-                .open(&one_credential(), &source(), Vec::new())
+                .open(&one_credential(), &source(), Vec::new(), None)
                 .await
                 .unwrap();
         }
@@ -614,7 +630,7 @@ credentials:
     async fn a_session_never_debug_prints_the_masters_it_holds() {
         let store = store(TestClock::new(), Duration::from_secs(1800));
         store
-            .open(&one_credential(), &source(), Vec::new())
+            .open(&one_credential(), &source(), Vec::new(), None)
             .await
             .unwrap();
 
@@ -641,7 +657,7 @@ credentials:
 
         let store = store(TestClock::new(), Duration::from_secs(1800));
         let (id, _) = store
-            .open(&profile("name: dev\n"), &Explodes, Vec::new())
+            .open(&profile("name: dev\n"), &Explodes, Vec::new(), None)
             .await
             .unwrap();
         assert!(store.contains(&id).await);

@@ -36,6 +36,13 @@ pub enum Error {
     #[error("a briefcred daemon is already listening on {0}")]
     AlreadyRunning(PathBuf),
 
+    /// The HTTP proxy could not be set up or could not serve a connection.
+    ///
+    /// Carries what went wrong with a certificate, a listener, or an upstream
+    /// — never a header, a body, or a credential.
+    #[error("proxy: {0}")]
+    Proxy(String),
+
     /// The on-disk layout could not be resolved.
     #[error(transparent)]
     Layout(#[from] briefcred_core::Error),

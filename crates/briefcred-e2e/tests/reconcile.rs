@@ -69,6 +69,7 @@ async fn mint_and_abandon(daemon: &Daemon) -> String {
         .send(Request::OpenSession {
             profile: "db-ro".into(),
             client_headless: true,
+            session_pubkey: None,
         })
         .await
         .expect("open session")
@@ -205,6 +206,7 @@ async fn a_normal_exec_revokes_through_the_queue_without_the_reconciler() {
         .send(Request::OpenSession {
             profile: "db-ro".into(),
             client_headless: true,
+            session_pubkey: None,
         })
         .await
         .expect("open session")
@@ -321,6 +323,7 @@ async fn one_real_mint_and_revoke_appear_in_the_metrics_scrape() {
         .send(Request::OpenSession {
             profile: "db-ro".into(),
             client_headless: true,
+            session_pubkey: None,
         })
         .await
         .expect("open session")
@@ -406,6 +409,7 @@ async fn a_get_style_exec_done_leaves_the_credential_usable_for_its_ttl() {
         .send(Request::OpenSession {
             profile: "db-ro".into(),
             client_headless: true,
+            session_pubkey: None,
         })
         .await
         .expect("open session")
@@ -489,6 +493,7 @@ async fn a_session_closed_without_an_exec_done_still_revokes_what_it_minted() {
         .send(Request::OpenSession {
             profile: "db-ro".into(),
             client_headless: true,
+            session_pubkey: None,
         })
         .await
         .expect("open session")

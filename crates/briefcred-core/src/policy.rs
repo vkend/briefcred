@@ -281,7 +281,10 @@ permit(
 
     #[test]
     fn the_built_in_schema_parses() {
-        assert_eq!(schema().action_groups().count() > 0, true);
+        assert!(
+            schema().action_groups().count() > 0,
+            "the `http` action group must exist"
+        );
     }
 
     #[test]

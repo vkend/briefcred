@@ -34,6 +34,7 @@ use briefcred_proto::{Request, Response};
 
 use crate::client::Connection;
 use crate::error::{Error, Result};
+use crate::session_key::SessionKey;
 
 /// What `briefcred exec` was asked to do.
 pub struct ExecRequest<'a> {
@@ -54,11 +55,15 @@ pub struct ExecRequest<'a> {
 pub async fn run(sock: &Path, request: ExecRequest<'_>) -> Result<u8> {
     let mut connection = Connection::open(sock).await?;
 
+    // Held for the whole session, and dropped with it: the daemon binds every
+    // synthetic token it signs to this key's thumbprint.
+    let session_key = SessionKey::generate();
+
     // Never hand-built: `client::open_session` is the only thing that answers
     // the headless question, and answering it wrongly is how a prompt ends up
     // on somebody else's screen.
     let session_id = match connection
-        .send(crate::client::open_session(request.profile))
+        .send(crate::client::open_session(request.profile, &session_key))
         .await?
     {
         Response::SessionOpened { session_id, .. } => session_id,
@@ -209,8 +214,9 @@ pub async fn get(
     }
 
     let mut connection = Connection::open(sock).await?;
+    let session_key = SessionKey::generate();
     let session_id = match connection
-        .send(crate::client::open_session(profile))
+        .send(crate::client::open_session(profile, &session_key))
         .await?
     {
         Response::SessionOpened { session_id, .. } => session_id,

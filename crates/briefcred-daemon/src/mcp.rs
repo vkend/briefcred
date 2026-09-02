@@ -562,6 +562,10 @@ impl McpServer {
                 profile,
                 self.inner.state.master_source().as_ref(),
                 self.inner.state.helper_dirs().to_vec(),
+                // The MCP server is in the daemon: there is no separate client
+                // to hold a session key, and nothing it serves goes through the
+                // proxy.
+                None,
             )
             .await
             .map_err(|e| internal(e.to_string()))?;

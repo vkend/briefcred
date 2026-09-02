@@ -11,6 +11,7 @@ use briefcred_proto::{read_frame, write_frame, Request, Response};
 use tokio::net::UnixStream;
 
 use crate::error::{Error, Result};
+use crate::session_key::SessionKey;
 
 /// One open connection to the daemon, for a command that sends several
 /// requests.
@@ -52,16 +53,24 @@ pub async fn request(sock: &Path, request: Request) -> Result<Response> {
     Connection::open(sock).await?.send(request).await
 }
 
-/// Build an [`Request::OpenSession`] that reports this process's own session.
+/// Build an [`Request::OpenSession`] that reports this process's own session
+/// and offers the public half of `key`.
 ///
-/// The daemon cannot answer this for us: it lives in launchd's session, and
-/// only the shell the user actually typed into knows whether that shell is an
-/// SSH login. Declaring it here is what lets the daemon refuse with "you have
-/// no screen" instead of showing a prompt on somebody else's.
-pub fn open_session(profile: impl Into<String>) -> Request {
+/// The daemon cannot answer the headless question for us: it lives in
+/// launchd's session, and only the shell the user actually typed into knows
+/// whether that shell is an SSH login. Declaring it here is what lets the
+/// daemon refuse with "you have no screen" instead of showing a prompt on
+/// somebody else's.
+///
+/// `key` is generated fresh per session by the caller, which holds the private
+/// half for as long as the session lives. See
+/// [`crate::session_key::SessionKey`] for what the binding does and does not
+/// buy.
+pub fn open_session(profile: impl Into<String>, key: &SessionKey) -> Request {
     Request::OpenSession {
         profile: profile.into(),
         client_headless: briefcred_core::session_env::is_headless(),
+        session_pubkey: Some(key.public_key_base64()),
     }
 }
 

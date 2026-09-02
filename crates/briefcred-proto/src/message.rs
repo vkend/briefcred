@@ -52,6 +52,21 @@ pub enum Request {
         /// briefcred cannot stop one that is already inside every boundary it
         /// has. What it buys is an honest client getting an accurate refusal.
         client_headless: bool,
+        /// The public half of a per-session Ed25519 key, base64 standard.
+        ///
+        /// Raw 32 bytes, encoded. The client generates the pair when it opens
+        /// the session and keeps the private half; the daemon puts a
+        /// thumbprint of this into every synthetic token it signs for the
+        /// session, so a client that can sign a `DPoP` proof can demonstrate
+        /// that the token is being used by whoever it was issued to.
+        ///
+        /// `None` is a client that cannot make proofs, which is most of them:
+        /// the token is then a bearer credential, and `THREAT_MODEL.md` says
+        /// so. It has a serde default so an older client still opens a session
+        /// — unlike `client_headless`, an absent answer here is the weaker
+        /// option and also the honest one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_pubkey: Option<String>,
     },
     /// Close a session, zeroising its master credentials at once.
     CloseSession {

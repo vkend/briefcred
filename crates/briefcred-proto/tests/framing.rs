@@ -50,6 +50,7 @@ async fn every_request_and_response_round_trips() {
         Request::OpenSession {
             profile: "analytics".into(),
             client_headless: false,
+            session_pubkey: None,
         },
         Request::CloseSession {
             session_id: "s-1".into(),
@@ -221,6 +222,7 @@ fn a_request_names_its_own_variant_for_the_dispatch_table() {
         Request::OpenSession {
             profile: "x".into(),
             client_headless: true,
+            session_pubkey: None,
         }
         .name(),
         "open_session"
@@ -247,6 +249,7 @@ fn the_name_list_covers_every_request_variant_exactly_once() {
         Request::OpenSession {
             profile: "x".into(),
             client_headless: false,
+            session_pubkey: None,
         },
         Request::CloseSession {
             session_id: "x".into(),
@@ -335,6 +338,7 @@ fn open_session_without_the_headless_flag_does_not_deserialise() {
         Request::OpenSession {
             profile: "dev".into(),
             client_headless: true,
+            session_pubkey: None,
         }
     );
 }

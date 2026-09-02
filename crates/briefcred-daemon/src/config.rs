@@ -20,6 +20,13 @@ pub const DEFAULT_RETENTION_DAYS: u32 = 90;
 /// The Prometheus port used when the file says nothing.
 pub const DEFAULT_METRICS_PORT: u16 = 9317;
 
+/// The HTTP proxy port used when the file says nothing.
+///
+/// One past the metrics port, so the two briefcred listens on are adjacent and
+/// an operator who has allowed one through a local firewall knows where the
+/// other is.
+pub const DEFAULT_PROXY_PORT: u16 = 9318;
+
 /// How often the reconciler sweeps when the file says nothing.
 pub const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = crate::reconcile::DEFAULT_INTERVAL_SECS;
 
@@ -62,6 +69,24 @@ pub struct Config {
     pub metrics_port: u16,
     /// Whether to serve the Prometheus endpoint at all.
     pub metrics_enabled: bool,
+    /// The loopback port the HTTP proxy listens on.
+    ///
+    /// Zero asks the operating system for a free port, which is how the
+    /// integration tests avoid colliding with a real daemon. Loopback only:
+    /// the proxy holds every master a session opened, so a listener anything
+    /// off the machine could reach would be handing them out.
+    pub proxy_port: u16,
+    /// Whether to run the HTTP proxy at all.
+    pub proxy_enabled: bool,
+    /// A PEM bundle of extra certificate authorities the proxy trusts upstream.
+    ///
+    /// **For tests.** The proxy verifies upstream certificates against the
+    /// system trust store, and this adds roots to it — a root here is one the
+    /// proxy will believe for every host it connects to. It exists so the test
+    /// suite can stand up an in-process HTTPS upstream signed by a throwaway
+    /// CA; a production `daemon.toml` has no business setting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_roots: Option<std::path::PathBuf>,
     /// Seconds a session may go untouched before it is evicted and wiped.
     pub session_idle_secs: u64,
     /// Seconds between reconciliation sweeps.
@@ -99,6 +124,9 @@ impl Default for Config {
             retention_days: DEFAULT_RETENTION_DAYS,
             metrics_port: DEFAULT_METRICS_PORT,
             metrics_enabled: true,
+            proxy_port: DEFAULT_PROXY_PORT,
+            proxy_enabled: true,
+            upstream_roots: None,
             session_idle_secs: DEFAULT_SESSION_IDLE_SECS,
             reconcile_interval_secs: DEFAULT_RECONCILE_INTERVAL_SECS,
             mcp_query_timeout_secs: DEFAULT_MCP_QUERY_TIMEOUT_SECS,
@@ -193,6 +221,9 @@ mod tests {
         assert_eq!(config.retention_days, 90);
         assert_eq!(config.metrics_port, 9317);
         assert!(config.metrics_enabled);
+        assert_eq!(config.proxy_port, 9318);
+        assert!(config.proxy_enabled);
+        assert_eq!(config.upstream_roots, None);
         assert_eq!(config.session_idle_secs, 1800);
         assert_eq!(config.session_idle(), Duration::from_secs(1800));
         assert_eq!(config.master_source, None);
@@ -264,6 +295,22 @@ mod tests {
         let config = Config::from_toml_str("[ca]\nkeystore = \"file\"\n").unwrap();
         assert_eq!(config.ca.keystore, Some(briefcred_core::KeystoreKind::File));
         assert_eq!(Config::from_toml_str("").unwrap().ca.keystore, None);
+    }
+
+    #[test]
+    fn the_proxy_can_be_moved_or_turned_off() {
+        let config = Config::from_toml_str("proxy_port = 0\nproxy_enabled = false\n").unwrap();
+        assert_eq!(config.proxy_port, 0);
+        assert!(!config.proxy_enabled);
+    }
+
+    #[test]
+    fn the_test_only_upstream_root_override_is_part_of_the_schema() {
+        let config = Config::from_toml_str("upstream_roots = \"/tmp/roots.pem\"\n").unwrap();
+        assert_eq!(
+            config.upstream_roots.as_deref(),
+            Some(std::path::Path::new("/tmp/roots.pem"))
+        );
     }
 
     #[test]
