@@ -131,6 +131,7 @@ impl Daemon {
         if !binary.is_file() {
             return Err(format!("no daemon binary at {}", binary.display()));
         }
+        self.check_helpers()?;
 
         let log = std::fs::File::create(self.home.path().join("logs").join("daemon.log"))
             .map_err(|e| e.to_string())?;
@@ -158,6 +159,31 @@ impl Daemon {
             "the daemon did not answer within {}s\n{}",
             READY_TIMEOUT.as_secs(),
             self.log()
+        ))
+    }
+
+    /// Refuse to start when a helper the daemon will need is not built.
+    ///
+    /// `cargo test` does not build a package's binaries unless a test target
+    /// asks for them, so `cargo test -p briefcred-e2e` on a clean checkout
+    /// leaves the helpers absent. The daemon then starts perfectly well and
+    /// every mint fails, which surfaces as "the credential did not mint" — a
+    /// message about the wrong thing entirely. Saying so here costs one
+    /// `is_file` and turns half an hour into a sentence. `just test` builds the
+    /// workspace first and never reaches this.
+    fn check_helpers(&self) -> Result<(), String> {
+        let missing: Vec<&str> = ["briefcred-helper-postgres-dynamic"]
+            .into_iter()
+            .filter(|name| !self.binaries.join(name).is_file())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{} is not built in {}; run `cargo build --workspace` (or `just test`, \
+             which does it for you) before running the end-to-end tests",
+            missing.join(", "),
+            self.binaries.display()
         ))
     }
 

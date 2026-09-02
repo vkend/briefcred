@@ -6,7 +6,16 @@ check:
     cargo clippy --all-targets -- -D warnings
 
 # The whole workspace: unit tests and end-to-end tests.
+#
+# The build is a separate step on purpose. The end-to-end tests spawn real
+# binaries — the daemon, and the `briefcred-helper-*` a mint goes through — and
+# `cargo test` does not build a package's binaries unless something being
+# tested asks for them, so on a clean checkout the helpers are simply absent
+# and a test that mints fails for a reason that looks nothing like the cause.
+# `cargo build --workspace` first costs nothing on a warm tree and makes a cold
+# one behave the same as a warm one.
 test:
+    cargo build --workspace
     cargo test --workspace
 
 # Rewrite formatting in place.
