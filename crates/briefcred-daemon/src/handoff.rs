@@ -79,6 +79,17 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(60);
 /// allocate the machine.
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
+/// How far out of date a blob may be and still be adopted, in seconds.
+///
+/// A blob is built for one handoff and sent immediately, so a fresh one is
+/// seconds old at most. The check bounds replay: a blob captured off a socket —
+/// or a daemon left waiting on a takeover path somebody kept — cannot be
+/// presented to a later daemon as if it were current. Two minutes, because the
+/// only clock either side has is the wall clock, and a handoff that failed
+/// because the machine resynchronised NTP mid-upgrade would be a worse
+/// outcome than the replay window this closes.
+pub const MAX_BLOB_AGE_SECS: i64 = 120;
+
 /// The domain separator mixed into the ECDH output.
 ///
 /// Hashed together with both public keys so a shared secret derived for this
@@ -320,6 +331,15 @@ pub struct Blob {
     pub from_pid: u32,
     /// The ephemeral X25519 public key the masters were sealed with, base64.
     pub sender_pubkey: String,
+    /// The recipient's ephemeral public key, echoed back from its hello.
+    ///
+    /// Inside the signature, so the blob names the daemon it was built for. The
+    /// masters could not be decrypted by anybody else in any case — the key
+    /// agreement already sees to that — but without this a receiver has no way
+    /// to tell "a blob addressed to me" from "a blob addressed to somebody
+    /// else, replayed at me", and would spend its work finding out by failing
+    /// to decrypt. Checked before a single master is opened.
+    pub recipient_pubkey: String,
     /// When the blob was built, in Unix seconds.
     pub issued_at: i64,
 }
@@ -456,6 +476,28 @@ impl Blob {
         unbase64(&self.sender_pubkey)
             .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
             .ok_or_else(|| Error::Handoff("the sender's ephemeral key is not 32 bytes".into()))
+    }
+
+    /// Refuse a blob that was not built, just now, for `recipient`.
+    ///
+    /// Both halves are inside the signature, so neither can be edited by
+    /// anything that cannot sign — which makes this a check on the *signer*
+    /// having meant this handoff, rather than on the bytes having arrived
+    /// intact.
+    pub fn check_addressed_to(&self, recipient: &[u8; 32], now: i64) -> Result<()> {
+        if self.recipient_pubkey != base64(recipient) {
+            return Err(Error::Handoff(
+                "the handoff blob was built for a different daemon".into(),
+            ));
+        }
+        let age = now.saturating_sub(self.issued_at);
+        if !(-MAX_BLOB_AGE_SECS..=MAX_BLOB_AGE_SECS).contains(&age) {
+            return Err(Error::Handoff(format!(
+                "the handoff blob is {age} s old, and this daemon accepts at most \
+                 {MAX_BLOB_AGE_SECS} s"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -685,6 +727,10 @@ impl Takeover {
             })??;
 
         let blob = Blob::open(&envelope, signer)?;
+        blob.check_addressed_to(
+            &self.opener.public_key(),
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )?;
         if fds.len() != blob.listeners.len() {
             return Err(Error::Handoff(format!(
                 "the handoff carried {} descriptor(s) for {} listener(s)",
@@ -824,6 +870,7 @@ where
         listeners: slots,
         from_pid: std::process::id(),
         sender_pubkey: base64(&sealer.public_key()),
+        recipient_pubkey: base64(&recipient),
         issued_at: time::OffsetDateTime::now_utc().unix_timestamp(),
     };
     send_state(&mut stream, &blob.seal(signer)?, &fds).await?;
@@ -1110,6 +1157,7 @@ mod tests {
             listeners: vec![Slot::Ipc, Slot::Proxy],
             from_pid: 4242,
             sender_pubkey: base64(&[7u8; 32]),
+            recipient_pubkey: base64(&[9u8; 32]),
             issued_at: 1_699_999_999,
         }
     }
@@ -1128,6 +1176,36 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("\"db\""), "{rendered}");
+    }
+
+    #[test]
+    fn a_blob_is_refused_unless_it_names_this_daemon() {
+        let blob = blob();
+        let now = blob.issued_at;
+        blob.check_addressed_to(&[9u8; 32], now)
+            .expect("the daemon it was built for");
+
+        let err = blob.check_addressed_to(&[8u8; 32], now).unwrap_err();
+        assert!(err.to_string().contains("a different daemon"), "{err}");
+    }
+
+    #[test]
+    fn a_stale_blob_is_refused_rather_than_replayed() {
+        let blob = blob();
+        let recipient = [9u8; 32];
+        blob.check_addressed_to(&recipient, blob.issued_at + MAX_BLOB_AGE_SECS)
+            .expect("inside the window");
+
+        let err = blob
+            .check_addressed_to(&recipient, blob.issued_at + MAX_BLOB_AGE_SECS + 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("old"), "{err}");
+
+        // Far in the future is refused too: a blob whose `issued_at` is ahead
+        // of this daemon's clock is one whose freshness nothing has checked.
+        assert!(blob
+            .check_addressed_to(&recipient, blob.issued_at - MAX_BLOB_AGE_SECS - 1)
+            .is_err());
     }
 
     #[test]
