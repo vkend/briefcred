@@ -72,6 +72,8 @@ pub struct Server {
     /// TCP connections it has accepted, which is what multiplexing is measured
     /// by: one connection carrying many streams, rather than many connections.
     pub accepts: Arc<AtomicU64>,
+    /// Connections currently open, so a test can watch one close.
+    pub live: Arc<AtomicU64>,
     /// The `Authorization` each call reached it carrying.
     pub seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     #[allow(dead_code)]
@@ -107,10 +109,12 @@ pub async fn start(leaf: &briefcred_core::ca::Leaf) -> Server {
         .unwrap();
     let port = listener.local_addr().unwrap().port();
     let accepts = Arc::new(AtomicU64::new(0));
+    let live = Arc::new(AtomicU64::new(0));
     let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let counted = Arc::clone(&accepts);
+    let open_now = Arc::clone(&live);
     let recorded = Arc::clone(&seen);
     let accepting = tokio::spawn(async move {
         loop {
@@ -118,8 +122,10 @@ pub async fn start(leaf: &briefcred_core::ca::Leaf) -> Server {
                 return;
             };
             counted.fetch_add(1, Ordering::Relaxed);
+            open_now.fetch_add(1, Ordering::Relaxed);
             let acceptor = acceptor.clone();
             let recorded = Arc::clone(&recorded);
+            let open = Arc::clone(&open_now);
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
@@ -143,6 +149,7 @@ pub async fn start(leaf: &briefcred_core::ca::Leaf) -> Server {
                     hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
                         .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
                         .await;
+                open.fetch_sub(1, Ordering::Relaxed);
             });
         }
     });
@@ -150,6 +157,7 @@ pub async fn start(leaf: &briefcred_core::ca::Leaf) -> Server {
     Server {
         port,
         accepts,
+        live,
         seen,
         accepting,
     }
@@ -175,6 +183,10 @@ async fn dispatch(
                 .await
         }
         "BiDi" => grpc.streaming(tower::service_fn(bidi), request).await,
+        "Forever" => {
+            grpc.server_streaming(tower::service_fn(forever), request)
+                .await
+        }
         "Failing" => grpc.unary(tower::service_fn(failing), request).await,
         _ => grpc.unary(tower::service_fn(unimplemented), request).await,
     }
@@ -208,6 +220,18 @@ async fn server_stream(
             .map(move |n| Ok(Echo::new(&format!("{text} {n}"))))
             .collect::<Vec<_>>(),
     );
+    Ok(tonic::Response::new(Box::pin(stream) as Responses))
+}
+
+/// A server stream that never ends on its own.
+///
+/// So a stream that ends at all ended because briefcred ended it, which is the
+/// only way to test that a revoked grant stops a gRPC call.
+async fn forever(_: tonic::Request<Echo>) -> Result<tonic::Response<Responses>, Status> {
+    let stream = futures_util::stream::unfold(0usize, |n| async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Some((Ok(Echo::new(&format!("tick {n}"))), n + 1))
+    });
     Ok(tonic::Response::new(Box::pin(stream) as Responses))
 }
 
@@ -355,16 +379,30 @@ pub async fn call_unary(transport: &Transport, method: &str, text: &str) -> Resu
 
 /// One server-streaming call, collected.
 pub async fn call_server_stream(transport: &Transport, text: &str) -> Result<Vec<String>, Status> {
+    let mut stream = open_server_stream(transport, "ServerStream", text).await?;
+    let mut received = Vec::new();
+    while let Some(message) = stream.next().await {
+        received.push(message?.text);
+    }
+    Ok(received)
+}
+
+/// Open a server-streaming call and hand back the stream, unread.
+///
+/// Separate from collecting it because a stream that never ends cannot be
+/// collected: the revocation test has to hold the stream open and watch for the
+/// moment it stops.
+pub async fn open_server_stream(
+    transport: &Transport,
+    method: &str,
+    text: &str,
+) -> Result<tonic::Streaming<Echo>, Status> {
     let mut grpc = client(transport);
     grpc.ready().await.map_err(unreachable)?;
     let response = grpc
-        .server_streaming(
-            tonic::Request::new(Echo::new(text)),
-            path("ServerStream"),
-            codec(),
-        )
+        .server_streaming(tonic::Request::new(Echo::new(text)), path(method), codec())
         .await?;
-    collect(response.into_inner()).await
+    Ok(response.into_inner())
 }
 
 /// One client-streaming call.

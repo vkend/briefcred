@@ -2254,3 +2254,194 @@ async fn the_proxy_stays_within_its_latency_budget_over_two_hundred_calls() {
     );
     println!("gRPC unary: direct {direct_each:?}, proxied {proxied_each:?}");
 }
+
+/// A listener that accepts nothing, so a connection to it hangs.
+///
+/// `listen(1)` with nothing ever calling `accept`: the TCP handshake completes
+/// into the backlog and the TLS handshake then waits for a server that is not
+/// there. An unroutable address would be refused or time out in the kernel,
+/// which is a different failure from the one under test.
+fn blackhole() -> (std::net::TcpListener, u16) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
+}
+
+#[tokio::test]
+async fn a_blackholed_upstream_does_not_delay_a_dial_to_a_healthy_one() {
+    let fixture = start_with(&grpc_profile()).await;
+    let (_held, dead_port) = blackhole();
+
+    // One call to the host that never answers, left running. Its dial holds
+    // that host's cache slot until the connect timeout, which is ten seconds —
+    // far longer than this test waits.
+    let stalled = {
+        let client = ProxyClient {
+            proxy_addr: fixture.client.proxy_addr.clone(),
+            briefcred_ca: fixture.client.briefcred_ca.clone(),
+            upstream_port: fixture.client.upstream_port,
+            ws_port: fixture.client.ws_port,
+            grpc_port: dead_port,
+        };
+        let token = fixture.token.clone();
+        tokio::spawn(async move {
+            let transport = grpc::through_the_proxy(&client, dead_port, &token).await;
+            grpc::call_unary(&transport, "Unary", "stuck").await
+        })
+    };
+
+    // Let the stalled dial get under way and take its slot.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let healthy =
+        grpc::through_the_proxy(&fixture.client, fixture.upstream.grpc.port, &fixture.token).await;
+    let started = std::time::Instant::now();
+    let answered = grpc::call_unary(&healthy, "Unary", "fine")
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+    let took = started.elapsed();
+
+    assert_eq!(answered.text, "echo: fine");
+    assert!(
+        took < Duration::from_millis(500),
+        "a healthy host waited {took:?} behind a blackholed one; \
+         the dial lock must be per destination"
+    );
+    stalled.abort();
+}
+
+#[tokio::test]
+async fn a_grpc_stream_ends_when_its_grant_is_revoked() {
+    let fixture = start_with(&grpc_profile()).await;
+    let transport =
+        grpc::through_the_proxy(&fixture.client, fixture.upstream.grpc.port, &fixture.token).await;
+
+    // `Forever` never ends on its own, so a stream that ends at all was ended
+    // by briefcred rather than by the server.
+    let mut stream = grpc::open_server_stream(&transport, "Forever", "go")
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+    use futures_util::StreamExt as _;
+    assert!(
+        stream.next().await.is_some(),
+        "the stream must be delivering before its grant is taken away"
+    );
+
+    fixture
+        .daemon
+        .request(Request::ExecDone {
+            session_id: fixture.session_id.clone(),
+            mint_ids: mint_ids(&fixture.daemon).await,
+            exit_code: Some(0),
+            duration_ms: 1,
+            hold_until_expiry: false,
+        })
+        .await
+        .unwrap();
+
+    // Within the one-second liveness poll, plus room for a loaded machine.
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        while stream.next().await.is_some() {}
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "a revoked grant must end its gRPC stream:\n{}",
+        fixture.daemon.log()
+    );
+
+    assert!(
+        stream_row_written(&fixture.daemon).await,
+        "no proxy_stream row:\n{}",
+        fixture.daemon.log()
+    );
+    let rows = fixture.daemon.audit_rows();
+    let row = rows
+        .iter()
+        .find(|row| row["event"] == "proxy_stream")
+        .expect("a proxy_stream row");
+    assert_eq!(row["kind"], "h2-stream");
+    assert_eq!(
+        row["events_or_frames"], 0,
+        "nothing inside a gRPC body is parsed, so nothing is counted"
+    );
+    assert!(row["bytes_down"].as_u64().unwrap() > 0);
+    assert!(row["connection_id"].is_string());
+}
+
+#[tokio::test]
+async fn a_closed_session_gives_up_its_upstream_connection() {
+    let fixture = start_with(&grpc_profile()).await;
+    let transport =
+        grpc::through_the_proxy(&fixture.client, fixture.upstream.grpc.port, &fixture.token).await;
+    grpc::call_unary(&transport, "Unary", "one")
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+    assert_eq!(
+        fixture
+            .upstream
+            .grpc
+            .live
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one upstream connection is open"
+    );
+
+    fixture
+        .daemon
+        .request(Request::CloseSession {
+            session_id: fixture.session_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let closed = briefcred_e2e::daemon_harness::wait_until(Duration::from_secs(10), || async {
+        fixture
+            .upstream
+            .grpc
+            .live
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+    })
+    .await;
+    assert!(
+        closed,
+        "a closed session must not leave a connection open at the vendor:\n{}",
+        fixture.daemon.log()
+    );
+}
+
+#[tokio::test]
+async fn a_grpc_call_to_an_upstream_without_http2_is_refused_with_a_reason() {
+    let fixture = start_with(&grpc_profile()).await;
+    // The plain HTTPS upstream offers no ALPN at all, so the proxy negotiates
+    // HTTP/1.1 with it — which cannot carry a gRPC call's trailers.
+    let transport =
+        grpc::through_the_proxy(&fixture.client, fixture.upstream.port, &fixture.token).await;
+
+    let refused = grpc::call_unary(&transport, "Unary", "one")
+        .await
+        .expect_err("an HTTP/1.1 upstream cannot serve gRPC");
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused}");
+
+    assert!(
+        fixture.upstream.seen.lock().unwrap().is_empty(),
+        "the request must not be downgraded and sent anyway"
+    );
+    assert!(
+        fixture
+            .daemon
+            .log()
+            .contains("does not support HTTP/2 (required for gRPC)"),
+        "the daemon must say why:\n{}",
+        fixture.daemon.log()
+    );
+
+    assert!(proxy_row_written(&fixture.daemon).await);
+    let rows = fixture.daemon.audit_rows();
+    let row = rows
+        .iter()
+        .find(|row| row["event"] == "proxy_request")
+        .expect("a proxy_request row");
+    assert_eq!(row["decision"], "upstream_error");
+}
