@@ -8,6 +8,16 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Fixed
 
+- **`proxy: always` works on a profile with no credentials.** The proxy refuses
+  a request with no token, so a profile whose only value was its Cedar policy
+  pointed its subprocess at a proxy that answered `407` to everything. `exec`
+  now issues a policy-only token for such a profile and publishes it as
+  `BRIEFCRED_PROXY_TOKEN`. It names no credential, substitutes nothing, and
+  exists so the request can be attributed to a session and decided by its
+  policy. Hop-by-hop `Proxy-Authorization` and `Proxy-Connection` headers are
+  now stripped before the swap rather than after, so a token presented the way
+  a client naturally presents one to a proxy is not mistaken for a leak.
+
 - **A handoff proves presence and checks its socket path.** `briefcred daemon
   upgrade` exported every resident master to whatever socket the caller named,
   with no unlock prompt. It now runs the unlock gate at the strictest
@@ -838,6 +848,16 @@ All notable changes to briefcred are recorded here. The format follows
   binary.
 
 ### Fixed
+
+- **`proxy: always` works on a profile with no credentials.** The proxy refuses
+  a request with no token, so a profile whose only value was its Cedar policy
+  pointed its subprocess at a proxy that answered `407` to everything. `exec`
+  now issues a policy-only token for such a profile and publishes it as
+  `BRIEFCRED_PROXY_TOKEN`. It names no credential, substitutes nothing, and
+  exists so the request can be attributed to a session and decided by its
+  policy. Hop-by-hop `Proxy-Authorization` and `Proxy-Connection` headers are
+  now stripped before the swap rather than after, so a token presented the way
+  a client naturally presents one to a proxy is not mistaken for a leak.
 
 - **A handoff proves presence and checks its socket path.** `briefcred daemon
   upgrade` exported every resident master to whatever socket the caller named,

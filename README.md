@@ -1039,6 +1039,22 @@ proxy: always
 That points a subprocess at the proxy with a Cedar allowlist and no credentials
 at all, which is a usable egress control on its own.
 
+A request with no token is refused, because a token is how the proxy knows whose
+session — and so whose policy, quota and audit trail — a request belongs to. So
+for a `proxy: always` profile that declares no `http-*` credential, `exec` issues
+a **policy-only** token and publishes it as `BRIEFCRED_PROXY_TOKEN` alongside the
+three proxy variables:
+
+```sh
+briefcred exec --profile=egress -- \
+  curl -H "Proxy-Authorization: Bearer $BRIEFCRED_PROXY_TOKEN" https://example.com
+```
+
+The token names no credential. There is no master behind it, nothing is
+substituted into any header, and it authorises nothing beyond "this request
+belongs to this session" — which is all the policy needs to decide it. It is
+retired when the command exits, like every other grant.
+
 ### Streaming: server-sent events and WebSocket
 
 Both go through the proxy, and both go through the same checks first. A

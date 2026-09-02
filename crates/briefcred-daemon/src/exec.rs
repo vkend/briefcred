@@ -265,11 +265,50 @@ pub async fn mint_only(
         }
     }
 
+    // A `proxy: always` profile with no HTTP credential has nothing to mint and
+    // still has to be able to reach the proxy: the proxy refuses a request with
+    // no token, because a token is how it knows whose policy and whose quota to
+    // apply. So one is issued that names no credential at all. It authorises
+    // nothing — there is no master behind it and the swap is a no-op — and it
+    // exists so that "route this subprocess through briefcred's egress control"
+    // is a thing a profile can actually say.
+    let mut policy_token = None;
+    if profile.policy_only_proxy() {
+        match proxy {
+            Some(grant) => {
+                let (token, entry) = issue_policy_only(profile, grant)?;
+                rows.push(AuditEntry::Mint {
+                    ts: OffsetDateTime::now_utc(),
+                    mint_id: entry.mint_id.clone(),
+                    profile: profile.name.clone(),
+                    credential: briefcred_core::profile::POLICY_ONLY_CREDENTIAL.to_string(),
+                    kind: briefcred_core::profile::POLICY_ONLY_KIND.to_string(),
+                    ttl_secs: POLICY_TOKEN_TTL_SECS,
+                });
+                pending.push(entry);
+                policy_token = Some(token);
+            }
+            // Said rather than silently skipped: the profile asked for the
+            // proxy, and a run that quietly did not get one would look like a
+            // policy that permitted everything.
+            None => {
+                return Err(ExecError::NoProxyGrant {
+                    credential: briefcred_core::profile::POLICY_ONLY_CREDENTIAL.to_string(),
+                })
+            }
+        }
+    }
+
     let env = compose_env(profile, trust, &fields, &BTreeMap::new())?;
-    let env: BTreeMap<String, SecretString> = env
+    let mut env: BTreeMap<String, SecretString> = env
         .into_iter()
         .map(|(k, v)| (k, SecretString::from(v)))
         .collect();
+    if let Some(token) = policy_token {
+        // After `compose_env`, so a profile cannot shadow it with its own `env`
+        // block and leave the subprocess pointed at a proxy it cannot use.
+        env.insert(PROXY_TOKEN_ENV.to_string(), SecretString::from(token));
+    }
 
     Ok(Minted {
         mints: summaries,
@@ -278,6 +317,67 @@ pub async fn mint_only(
         pending,
         rows,
     })
+}
+
+/// The variable a policy-only proxy grant's token is published in.
+///
+/// Not a credential, so it is not published as one: there is no `minted.…`
+/// field to interpolate and no profile `env` entry to write. A subprocess that
+/// needs to present it — `curl -H "Proxy-Authorization: Bearer $…"` — reads it
+/// from the environment by this name.
+pub const PROXY_TOKEN_ENV: &str = "BRIEFCRED_PROXY_TOKEN";
+
+/// How long a policy-only token lives.
+///
+/// It is bounded by the session first: the proxy refuses a token whose session
+/// is gone, and `exec` retires the grant as soon as the command exits. The TTL
+/// is the outer bound for a session that outlives one, and an hour is the same
+/// order as the credential TTLs profiles actually write.
+const POLICY_TOKEN_TTL_SECS: u64 = 3600;
+
+/// Issue the token for a `proxy: always` profile that mints nothing.
+///
+/// It names [`POLICY_ONLY_CREDENTIAL`], which no profile may declare, so the
+/// swap can never find a master for it and no header is ever rewritten. What it
+/// carries is the session — and with it the policy, the quota and the audit
+/// trail the request will be decided against.
+///
+/// [`POLICY_ONLY_CREDENTIAL`]: briefcred_core::profile::POLICY_ONLY_CREDENTIAL
+fn issue_policy_only(
+    profile: &Profile,
+    grant: ProxyGrant<'_>,
+) -> Result<(Zeroizing<String>, PendingRevoke), ExecError> {
+    let credential = briefcred_core::profile::POLICY_ONLY_CREDENTIAL;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let issued = grant
+        .issuer
+        .issue(
+            grant.session_id,
+            grant.session_pubkey,
+            credential,
+            POLICY_TOKEN_TTL_SECS,
+            now,
+        )
+        .map_err(|_| ExecError::NoProxyGrant {
+            credential: credential.to_string(),
+        })?;
+    Ok((
+        issued.token.clone(),
+        PendingRevoke {
+            mint_id: MintId::generate(),
+            kind: briefcred_core::profile::POLICY_ONLY_KIND.to_string(),
+            profile: profile.name.clone(),
+            credential: credential.to_string(),
+            source_key: String::new(),
+            config: serde_json::Value::Null,
+            // The session, as every proxy grant records it: it is what the
+            // revoke names when it retires the token.
+            revoke_token: grant.session_id.to_string(),
+            expires_at_unix_ms: issued.expires_at.saturating_mul(1_000),
+            attempts: 0,
+            not_before_unix_ms: 0,
+        },
+    ))
 }
 
 /// What one credential's mint produced: its summary, its field values, and the

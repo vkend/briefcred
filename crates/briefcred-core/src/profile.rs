@@ -127,6 +127,20 @@ pub struct Quota {
     pub total: Option<u64>,
 }
 
+/// The credential name a policy-only proxy grant is issued against.
+///
+/// Not a credential, and it cannot be mistaken for one: the leading `@` is not
+/// a character a profile's `credentials` may use, so no profile can declare a
+/// credential by this name and no swap can ever find a master for it.
+pub const POLICY_ONLY_CREDENTIAL: &str = "@policy";
+
+/// The `kind` recorded for a policy-only grant.
+///
+/// Not a registered minter kind — nothing can be declared with it and nothing
+/// builds from it — but the revoke path recognises it as proxy-hosted, so a
+/// policy grant is retired the same way every other synthetic token is.
+pub const POLICY_ONLY_KIND: &str = "@policy";
+
 /// When `briefcred exec` sets `HTTPS_PROXY` and friends for a profile.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -454,6 +468,19 @@ impl Profile {
         self.proxy == ProxyMode::Always || self.has_http_credentials()
     }
 
+    /// Whether this profile's proxy use is the policy and nothing else.
+    ///
+    /// `proxy: always` on a profile with no HTTP credential is an egress
+    /// control: there is no header to rewrite and nothing to substitute, and
+    /// the only thing the proxy does for such a request is decide whether it
+    /// may go. It still needs a token, because a token is how the proxy knows
+    /// whose session — and therefore whose policy and whose quota — a request
+    /// belongs to, so `exec` issues one naming
+    /// [`POLICY_ONLY_CREDENTIAL`].
+    pub fn policy_only_proxy(&self) -> bool {
+        self.proxy == ProxyMode::Always && !self.has_http_credentials()
+    }
+
     /// Check every invariant the type system does not already enforce and
     /// that does not need the minter registry.
     fn validate_schema(&self) -> Result<()> {
@@ -465,6 +492,15 @@ impl Profile {
         for spec in &self.credentials {
             if spec.name.trim().is_empty() {
                 return Err(Error::profile("credential `name` must not be empty"));
+            }
+            // Reserved for the policy-only proxy grant, which is issued against
+            // a name no profile may claim so that it can never resolve to a
+            // real credential's master.
+            if spec.name.starts_with('@') {
+                return Err(Error::profile(format!(
+                    "credential `{}` may not start with `@`, which is reserved",
+                    spec.name
+                )));
             }
             if spec.kind.trim().is_empty() {
                 return Err(Error::profile(format!(

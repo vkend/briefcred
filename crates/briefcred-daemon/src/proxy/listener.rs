@@ -620,10 +620,18 @@ async fn forward(
         }
     };
 
+    // Before the swap, not after. These are hop-by-hop headers addressed to the
+    // proxy, which is this process, so an upstream has no business seeing
+    // either — and the swap's sweep for a leftover token would otherwise refuse
+    // a perfectly good request whose token arrived in `Proxy-Authorization`,
+    // which is where a client presenting one to a proxy naturally puts it.
+    parts.headers.remove(hyper::header::PROXY_AUTHORIZATION);
+    parts.headers.remove("proxy-connection");
+
     if let Err(err) = swap::apply(
         &mut parts.headers,
         &session.credentials,
-        Some(&session.authorized),
+        session.authorized.as_ref(),
     ) {
         eprintln!("briefcred-daemon: proxy will not forward to `{host}`: {err}");
         return attempt.refuse(
@@ -635,10 +643,6 @@ async fn forward(
     // A proof is for briefcred, not for the vendor, and forwarding it would
     // tell an upstream which session made the call.
     parts.headers.remove("dpop");
-    // Hop-by-hop headers addressed to the proxy, which is this process. An
-    // upstream has no business seeing either.
-    parts.headers.remove(hyper::header::PROXY_AUTHORIZATION);
-    parts.headers.remove("proxy-connection");
 
     // Origin-form, because an absolute URI is a proxy's spelling and not a
     // server's. An HTTP/2 upstream needs the authority back and gets it in
@@ -1238,7 +1242,13 @@ impl tokio::io::AsyncWrite for UpstreamStream {
 struct ResolvedSession {
     profile: briefcred_core::Profile,
     credentials: Vec<Credential>,
-    authorized: Credential,
+    /// The credential the token named, when it named one.
+    ///
+    /// `None` for a policy-only grant on a `proxy: always` profile: there is no
+    /// credential behind that token, so there is no header to rewrite and the
+    /// swap is a no-op. The request is still decided by the profile's policy,
+    /// charged to its quota, and audited.
+    authorized: Option<Credential>,
     pubkey: Option<[u8; 32]>,
     mint_id: MintId,
     /// The session's token bucket, when its profile sets a `quota`.
@@ -1297,7 +1307,16 @@ async fn resolve_session(
             master: Zeroizing::clone(master),
         });
     }
-    let authorized = credentials.iter().find(|c| c.name == credential)?.clone();
+    let policy_only = credential == briefcred_core::profile::POLICY_ONLY_CREDENTIAL
+        && profile.policy_only_proxy();
+    let authorized = match credentials.iter().find(|c| c.name == credential) {
+        Some(found) => Some(found.clone()),
+        // A token naming no credential is good only on a profile that is using
+        // the proxy for its policy alone. Anywhere else it is a token for a
+        // credential the profile no longer declares, which is a refusal.
+        None if policy_only => None,
+        None => return None,
+    };
 
     Some(Box::new(ResolvedSession {
         profile,

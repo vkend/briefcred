@@ -129,8 +129,12 @@ impl Registry {
     /// helper: a [`Hosting::Proxy`] kind has no minter to run and no process to
     /// start, so trying either would fail with a message about a missing helper
     /// binary that does not and should not exist.
+    /// The policy-only grant is one of them, and it is not a registered kind:
+    /// a profile may not declare it, so it has no factory, but a token issued
+    /// against it is retired by exactly the same path as any other proxy
+    /// grant — the daemon deciding to stop honouring a statement it signed.
     pub fn is_proxy(&self, kind: &str) -> bool {
-        self.hosting(kind) == Some(Hosting::Proxy)
+        kind == crate::profile::POLICY_ONLY_KIND || self.hosting(kind) == Some(Hosting::Proxy)
     }
 
     /// Build the minter for `kind` from `config`, after validating it.
