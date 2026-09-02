@@ -48,6 +48,7 @@ async fn every_request_and_response_round_trips() {
         },
         Request::OpenSession {
             profile: "analytics".into(),
+            client_headless: false,
         },
         Request::CloseSession {
             session_id: "s-1".into(),
@@ -171,7 +172,8 @@ fn a_request_names_its_own_variant_for_the_dispatch_table() {
     );
     assert_eq!(
         Request::OpenSession {
-            profile: "x".into()
+            profile: "x".into(),
+            client_headless: true,
         }
         .name(),
         "open_session"
@@ -197,6 +199,7 @@ fn the_name_list_covers_every_request_variant_exactly_once() {
         Request::ShowProfile { name: "x".into() },
         Request::OpenSession {
             profile: "x".into(),
+            client_headless: false,
         },
         Request::CloseSession {
             session_id: "x".into(),
@@ -217,4 +220,21 @@ fn a_profile_summary_carries_key_names_and_never_a_secret() {
     assert!(json.contains("analytics-db"), "{json}");
     assert!(!json.contains("password"), "{json}");
     assert!(!json.contains("config"), "{json}");
+}
+
+/// The daemon's refusal depends on this flag, so a client that omits it must
+/// fail loudly rather than be read as declaring it has a screen.
+#[test]
+fn open_session_without_the_headless_flag_does_not_deserialise() {
+    let missing = br#"{"request":"open_session","profile":"dev"}"#;
+    assert!(decode_frame::<Request>(missing).is_err());
+
+    let present = br#"{"request":"open_session","profile":"dev","client_headless":true}"#;
+    assert_eq!(
+        decode_frame::<Request>(present).unwrap(),
+        Request::OpenSession {
+            profile: "dev".into(),
+            client_headless: true,
+        }
+    );
 }

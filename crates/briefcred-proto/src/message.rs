@@ -34,6 +34,21 @@ pub enum Request {
     OpenSession {
         /// The profile to open a session for.
         profile: String,
+        /// Whether the *client* has no graphical session to be prompted in.
+        ///
+        /// The daemon cannot see this. It is started by launchd and sits in
+        /// launchd's session; the client may be an SSH login on a machine
+        /// whose console user is sitting in front of a screen. Only the client
+        /// knows which it is, so it says, and the daemon refuses if either
+        /// this or its own check reports headless.
+        ///
+        /// Deliberately has no serde default. A client that has not thought
+        /// about the question must fail to serialise rather than quietly
+        /// declare "I have a screen", which is the weaker of the two answers.
+        /// It is a declaration and not a proof: a same-uid caller can lie, and
+        /// briefcred cannot stop one that is already inside every boundary it
+        /// has. What it buys is an honest client getting an accurate refusal.
+        client_headless: bool,
     },
     /// Close a session, zeroising its master credentials at once.
     CloseSession {

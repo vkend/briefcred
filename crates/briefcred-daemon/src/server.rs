@@ -248,7 +248,11 @@ async fn handle_show_profile(request: Request, state: Arc<State>) -> Response {
 /// the unlock gate has said yes, so a refused prompt leaves no master in the
 /// daemon's memory at all.
 async fn handle_open_session(request: Request, state: Arc<State>) -> Response {
-    let Request::OpenSession { profile: name } = request else {
+    let Request::OpenSession {
+        profile: name,
+        client_headless,
+    } = request
+    else {
         return mismatched(&request);
     };
     let Some(profile) = state.profiles.get(&name).await else {
@@ -256,6 +260,28 @@ async fn handle_open_session(request: Request, state: Arc<State>) -> Response {
             message: SessionError::NoSuchProfile(name).to_string(),
         };
     };
+
+    // Before the cache, not after. A cached unlock is a record that somebody
+    // was once at a screen, which says nothing about whether *this* caller has
+    // one — so consulting the cache first would let an SSH shell ride a
+    // desktop unlock for the rest of the window. Either side reporting
+    // headless is enough: the client can see an SSH login the daemon cannot,
+    // and the daemon can see a background launchd session the client cannot.
+    if profile.unlock.policy != briefcred_core::profile::UnlockPolicy::None
+        && (client_headless || crate::unlock::is_headless())
+    {
+        let err = crate::unlock::UnlockError::NoAquaSession;
+        state.audit(&AuditEntry::UnlockDenied {
+            ts: OffsetDateTime::now_utc(),
+            profile: name,
+            policy: policy_name(profile.unlock.policy).to_string(),
+            reason: err.reason().to_string(),
+        });
+        return Response::Locked {
+            reason: err.reason().to_string(),
+            message: err.to_string(),
+        };
+    }
 
     let window = profile.unlock.cache_for();
     if !state.unlock_cache.is_fresh(&name, window).await {
@@ -514,6 +540,150 @@ fn own_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::SystemClock;
+    use crate::unlock::UnlockError;
+    use briefcred_core::profile::UnlockPolicy;
+    use briefcred_core::source::MemorySource;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A gate that records every time it is asked, so a test can assert that
+    /// it was *not* asked — which is the whole point of refusing a headless
+    /// client before the gate rather than inside it.
+    #[derive(Debug, Default)]
+    struct CountingGate {
+        prompts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl UnlockGate for CountingGate {
+        async fn unlock(&self, policy: UnlockPolicy, _reason: &str) -> Result<(), UnlockError> {
+            // Honours the trait's contract that `None` succeeds without
+            // prompting, so the count means "a human was actually asked".
+            if policy == UnlockPolicy::None {
+                return Ok(());
+            }
+            self.prompts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A `State` wired to temp directories and a gate the test can inspect.
+    async fn test_state(profile_yaml: &str) -> (tempfile::TempDir, Arc<State>, Arc<AtomicUsize>) {
+        let home = tempfile::tempdir().unwrap();
+        let profiles_dir = home.path().join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("p.yaml"), profile_yaml).unwrap();
+
+        let audit = AuditLog::open(&home.path().join("audit"), 90).unwrap();
+        let metrics = Arc::new(Metrics::new(audit.write_errors_handle()));
+        let profiles = Arc::new(ProfileStore::new(
+            profiles_dir,
+            briefcred_core::Registry::discover(),
+        ));
+        profiles.reload().await;
+
+        let clock = Arc::new(SystemClock::new());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let state = Arc::new(State::new(
+            audit,
+            metrics,
+            None,
+            shutdown,
+            profiles,
+            Arc::new(SessionStore::new(clock.clone(), Duration::from_secs(1800))),
+            Arc::new(CountingGate {
+                prompts: Arc::clone(&prompts),
+            }),
+            crate::unlock::UnlockCache::new(clock),
+            Arc::new(MemorySource::new([(
+                "db".to_string(),
+                "master".to_string(),
+            )])),
+        ));
+        (home, state, prompts)
+    }
+
+    const GUARDED: &str = "name: dev\ncredentials:\n  - name: db\n    kind: postgres-dynamic\n    config:\n      host: 127.0.0.1\n      dbname: app\n      user: m\n      sslmode: disable\n      role_template: {}\n";
+
+    #[tokio::test]
+    async fn a_headless_client_is_refused_without_the_gate_being_asked() {
+        let (_home, state, prompts) = test_state(GUARDED).await;
+
+        let response = handle_open_session(
+            Request::OpenSession {
+                profile: "dev".into(),
+                client_headless: true,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+
+        assert!(
+            matches!(&response, Response::Locked { reason, .. } if reason == "no_aqua_session"),
+            "{response:?}"
+        );
+        assert_eq!(
+            prompts.load(Ordering::SeqCst),
+            0,
+            "the gate must not be consulted for a client with no screen"
+        );
+        assert!(state.sessions.is_empty().await, "nothing may be opened");
+    }
+
+    #[tokio::test]
+    async fn a_warm_cache_does_not_rescue_a_headless_client() {
+        let (_home, state, prompts) = test_state(GUARDED).await;
+
+        // A local caller opens a session, warming the cache.
+        let first = handle_open_session(
+            Request::OpenSession {
+                profile: "dev".into(),
+                client_headless: false,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(matches!(first, Response::SessionOpened { .. }), "{first:?}");
+        assert_eq!(prompts.load(Ordering::SeqCst), 1);
+
+        // A headless caller must still be refused, even though the cache is
+        // warm. The cache records that somebody was once at a screen; it says
+        // nothing about whether this caller has one.
+        let second = handle_open_session(
+            Request::OpenSession {
+                profile: "dev".into(),
+                client_headless: true,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(
+            matches!(&second, Response::Locked { reason, .. } if reason == "no_aqua_session"),
+            "{second:?}"
+        );
+        assert_eq!(state.sessions.len().await, 1, "only the first may exist");
+    }
+
+    #[tokio::test]
+    async fn an_unattended_profile_opens_for_a_headless_client_without_a_prompt() {
+        let (_home, state, prompts) = test_state("name: dev\nunlock:\n  policy: none\n").await;
+
+        let response = handle_open_session(
+            Request::OpenSession {
+                profile: "dev".into(),
+                client_headless: true,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+
+        assert!(
+            matches!(response, Response::SessionOpened { .. }),
+            "{response:?}"
+        );
+        assert_eq!(prompts.load(Ordering::SeqCst), 0, "`none` prompts nobody");
+    }
 
     #[test]
     fn the_table_covers_every_request_the_protocol_defines() {

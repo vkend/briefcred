@@ -28,12 +28,10 @@ use tokio::sync::Mutex;
 
 use crate::clock::Clock;
 
-/// Set to `1` to force [`UnlockError::NoAquaSession`] from the system gate.
-///
-/// The tests cannot create or destroy a window server, so this is how the
-/// headless path is exercised. It only ever makes the gate stricter, so a
-/// hostile process gains nothing by setting it.
-pub const FORCE_NO_AQUA_ENV: &str = "BRIEFCRED_FORCE_NO_AQUA";
+// Detection lives in `briefcred-core` because the CLI has to answer the same
+// question about itself: only the client can tell an SSH login from a local
+// one, and the daemon only ever sees launchd's session.
+pub use briefcred_core::session_env::{is_headless, FORCE_NO_AQUA_ENV};
 
 /// Why an unlock did not succeed.
 ///
@@ -109,67 +107,11 @@ impl UnlockGate for SystemUnlockGate {
         if policy == UnlockPolicy::None {
             return Ok(());
         }
-        if no_aqua_session() {
+        if is_headless() {
             return Err(UnlockError::NoAquaSession);
         }
         platform_unlock(policy, reason).await
     }
-}
-
-/// Whether this process has no graphical session to draw a prompt in.
-///
-/// Checked before the prompt rather than after: `LAContext` over SSH reports a
-/// generic failure that is indistinguishable from a wrong password, and
-/// telling the user "authentication failed" when the real problem is "you are
-/// on SSH" wastes an afternoon.
-pub fn no_aqua_session() -> bool {
-    if std::env::var(FORCE_NO_AQUA_ENV).as_deref() == Ok("1") {
-        return true;
-    }
-    // An SSH login has no window server of its own even when the console user
-    // is logged in graphically, and the prompt would be drawn on their screen
-    // rather than the remote user's — which is worse than refusing.
-    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
-        return true;
-    }
-    !has_graphic_access()
-}
-
-/// `SessionGetInfo` from `Security/AuthSession.h`: does the caller's security
-/// session have a graphical subsystem to draw a prompt on?
-///
-/// This is the authoritative answer, and it is right in cases the environment
-/// is not: a `launchd` agent in a background session has no `SSH_CONNECTION`
-/// set and still cannot show a window.
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-fn has_graphic_access() -> bool {
-    /// `callerSecuritySession`: the session this process belongs to.
-    const CALLER_SECURITY_SESSION: u32 = u32::MAX;
-    /// `sessionHasGraphicAccess`.
-    const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
-    /// `errSessionSuccess`.
-    const SESSION_SUCCESS: i32 = 0;
-
-    #[link(name = "Security", kind = "framework")]
-    extern "C" {
-        fn SessionGetInfo(session: u32, session_id: *mut u32, attributes: *mut u32) -> i32;
-    }
-
-    let mut id: u32 = 0;
-    let mut attributes: u32 = 0;
-    // SAFETY: both out-parameters are live, correctly typed, and initialised;
-    // the function writes at most one value to each and returns a status.
-    let status = unsafe { SessionGetInfo(CALLER_SECURITY_SESSION, &mut id, &mut attributes) };
-    // A session we cannot interrogate is one we must not assume has a screen.
-    status == SESSION_SUCCESS && attributes & SESSION_HAS_GRAPHIC_ACCESS != 0
-}
-
-/// Off macOS there is no session concept to consult; the policy check in
-/// [`SystemUnlockGate`] refuses anything but `none` anyway.
-#[cfg(not(target_os = "macos"))]
-fn has_graphic_access() -> bool {
-    true
 }
 
 /// Run the platform's own prompt.
@@ -352,6 +294,7 @@ impl UnlockCache {
 mod tests {
     use super::*;
     use crate::clock::TestClock;
+    use briefcred_core::session_env::testing::ForceNoAqua;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A gate that counts prompts and returns a fixed answer, so a test can
@@ -392,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn the_none_policy_is_honoured_even_with_no_graphical_session() {
         let _guard = ForceNoAqua::set();
-        assert!(no_aqua_session());
+        assert!(is_headless());
         assert_eq!(
             SystemUnlockGate::new()
                 .unlock(UnlockPolicy::None, "test")
@@ -509,35 +452,6 @@ mod tests {
             2,
             "a refusal must not cache"
         );
-    }
-
-    /// `BRIEFCRED_FORCE_NO_AQUA` is process-wide, so the tests that use it are
-    /// serialised behind one mutex and always restore the previous value.
-    struct ForceNoAqua {
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl ForceNoAqua {
-        fn set() -> ForceNoAqua {
-            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // SAFETY: the mutex makes this the only thread in the process
-            // touching the environment for the guard's lifetime.
-            #[allow(unsafe_code)]
-            unsafe {
-                std::env::set_var(FORCE_NO_AQUA_ENV, "1")
-            };
-            ForceNoAqua { _lock: lock }
-        }
-    }
-
-    impl Drop for ForceNoAqua {
-        fn drop(&mut self) {
-            #[allow(unsafe_code)]
-            unsafe {
-                std::env::remove_var(FORCE_NO_AQUA_ENV)
-            };
-        }
     }
 
     /// Ignored because it puts a real Touch ID sheet on the developer's

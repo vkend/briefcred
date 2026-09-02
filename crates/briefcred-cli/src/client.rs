@@ -29,6 +29,19 @@ pub async fn request(sock: &Path, request: Request) -> Result<Response> {
         .ok_or_else(|| Error::Unexpected("nothing before closing the connection".into()))
 }
 
+/// Build an [`Request::OpenSession`] that reports this process's own session.
+///
+/// The daemon cannot answer this for us: it lives in launchd's session, and
+/// only the shell the user actually typed into knows whether that shell is an
+/// SSH login. Declaring it here is what lets the daemon refuse with "you have
+/// no screen" instead of showing a prompt on somebody else's.
+pub fn open_session(profile: impl Into<String>) -> Request {
+    Request::OpenSession {
+        profile: profile.into(),
+        client_headless: briefcred_core::session_env::is_headless(),
+    }
+}
+
 /// Ask for [`Response::Status`], rejecting any other reply.
 pub async fn status(sock: &Path) -> Result<Response> {
     match request(sock, Request::Status).await? {

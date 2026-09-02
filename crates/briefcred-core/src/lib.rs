@@ -10,7 +10,12 @@
 //! 2. Audit records carry metadata only — never headers, bodies, query
 //!    strings, or secrets.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid`: `session_env` needs one `extern "C"` call into
+// the Security framework to ask whether this process has a graphical session,
+// and there is no safe binding for it. Every other module is unsafe-free, and
+// `deny` still fails the build on any `unsafe` that is not explicitly allowed
+// and justified at the site.
+#![deny(unsafe_code)]
 
 pub mod audit;
 pub mod ca;
@@ -20,6 +25,7 @@ pub mod minters;
 pub mod paths;
 pub mod profile;
 pub mod registry;
+pub mod session_env;
 pub mod source;
 pub mod traits;
 pub mod types;

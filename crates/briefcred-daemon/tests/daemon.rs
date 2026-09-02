@@ -436,6 +436,7 @@ async fn the_daemon_lists_a_profile_opens_a_session_and_closes_it() {
         &mut stream,
         Request::OpenSession {
             profile: "dev".into(),
+            client_headless: false,
         },
     )
     .await
@@ -504,6 +505,7 @@ async fn opening_a_session_for_an_unknown_profile_says_which_one() {
         &mut stream,
         Request::OpenSession {
             profile: "absent".into(),
+            client_headless: false,
         },
     )
     .await
@@ -528,6 +530,7 @@ async fn a_missing_master_fails_the_open_and_names_where_it_looked() {
         &mut stream,
         Request::OpenSession {
             profile: "dev".into(),
+            client_headless: false,
         },
     )
     .await
@@ -625,6 +628,7 @@ async fn a_session_still_open_at_shutdown_is_closed_and_audited() {
         &mut stream,
         Request::OpenSession {
             profile: "dev".into(),
+            client_headless: false,
         },
     )
     .await
@@ -664,6 +668,7 @@ async fn an_idle_session_is_evicted_and_audited() {
         &mut stream,
         Request::OpenSession {
             profile: "dev".into(),
+            client_headless: false,
         },
     )
     .await
@@ -746,6 +751,7 @@ async fn a_headless_daemon_refuses_a_guarded_profile_and_reads_no_master() {
         &mut stream,
         Request::OpenSession {
             profile: "guarded".into(),
+            client_headless: false,
         },
     )
     .await
@@ -773,4 +779,81 @@ async fn a_headless_daemon_refuses_a_guarded_profile_and_reads_no_master() {
             .any(|r| matches!(r, AuditEntry::SessionOpen { .. })),
         "a refused unlock must open no session"
     );
+}
+
+#[tokio::test]
+async fn a_client_that_declares_itself_headless_is_refused_by_a_daemon_that_is_not() {
+    // The daemon here has a graphical session; the client says it does not.
+    // That is the SSH case the daemon cannot see for itself, and it is the
+    // whole reason `client_headless` crosses the wire.
+    let mut daemon = Daemon::start_with(
+        "metrics_enabled = false\nmaster_source = \"file\"\n",
+        |home| {
+            write_profile(home, "guarded.yaml", GUARDED_PROFILE);
+            write_master(home, "app-db", "the-master-password");
+        },
+    );
+    let mut stream = daemon.connect().await;
+
+    let Response::Locked { reason, message } = call(
+        &mut stream,
+        Request::OpenSession {
+            profile: "guarded".into(),
+            client_headless: true,
+        },
+    )
+    .await
+    else {
+        panic!("a client with no screen must be refused");
+    };
+    assert_eq!(reason, "no_aqua_session");
+    assert!(message.contains("unlock.policy: none"), "{message}");
+
+    call(&mut stream, Request::Shutdown).await;
+    assert!(daemon.wait());
+
+    let rows = audit_rows(&daemon.audit_dir());
+    assert!(
+        rows.iter().any(|r| matches!(
+            r,
+            AuditEntry::UnlockDenied { profile, reason, .. }
+                if profile == "guarded" && reason == "no_aqua_session"
+        )),
+        "no UnlockDenied row in {rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| matches!(r, AuditEntry::SessionOpen { .. })),
+        "a refused client must open no session"
+    );
+}
+
+#[tokio::test]
+async fn an_unattended_profile_still_opens_for_a_headless_client() {
+    // The documented escape hatch has to keep working, or every unattended
+    // profile breaks the moment it is run from cron or over SSH.
+    let mut daemon = Daemon::start_with(
+        "metrics_enabled = false\nmaster_source = \"file\"\n",
+        |home| {
+            write_profile(home, "dev.yaml", UNATTENDED_PROFILE);
+            write_master(home, "app-db", "the-master-password");
+        },
+    );
+    let mut stream = daemon.connect().await;
+
+    let Response::SessionOpened { .. } = call(
+        &mut stream,
+        Request::OpenSession {
+            profile: "dev".into(),
+            client_headless: true,
+        },
+    )
+    .await
+    else {
+        panic!("`unlock.policy: none` must open regardless of the client's session");
+    };
+
+    call(&mut stream, Request::Shutdown).await;
+    assert!(daemon.wait());
 }
