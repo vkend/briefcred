@@ -30,6 +30,33 @@ fn profile(policy_mode: &str) -> String {
     quota_profile(policy_mode, "")
 }
 
+/// A profile that also permits the two streaming paths.
+///
+/// `enforce`, deliberately. A WebSocket handshake is a `GET` and the policy
+/// decides it as one, so a profile that permits `/ws` by name is what proves
+/// the handshake went through the policy rather than around it.
+fn stream_profile() -> String {
+    format!(
+        "\
+name: openai
+unlock:
+  policy: none
+credentials:
+  - name: openai
+    kind: http-bearer
+    ttl_secs: 300
+policy_mode: enforce
+policy: |
+  permit(principal, action == Action::\"GET\", resource)
+  when {{ resource.host == \"{UPSTREAM_HOST}\" &&
+    [\"/v1/models\", \"/events\", \"/events-sized\", \"/forever\", \"/ws\"]
+      .contains(resource.path) }};
+env:
+  OPENAI_API_KEY: ${{minted.openai.TOKEN}}
+"
+    )
+}
+
 /// The same, with a `quota:` block spliced in.
 ///
 /// `quota` is the whole YAML block or the empty string, rather than a rate and
@@ -68,16 +95,33 @@ struct Seen {
 struct Upstream {
     ca_pem: String,
     port: u16,
+    /// The WebSocket server's own port, which is a separate listener.
+    ws_port: u16,
     seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    /// When the event stream sent its hundredth event, for the buffering test.
+    last_event_sent: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// What each WebSocket handshake reached the upstream carrying.
+    ws_seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     /// The accept loop, so a test can take the upstream away mid-run.
     accepting: tokio::task::JoinHandle<()>,
+    /// The WebSocket accept loop, kept so it lives as long as the fixture.
+    #[allow(dead_code)]
+    ws_accepting: tokio::task::JoinHandle<()>,
 }
+
+/// How many events `/events` sends, and the gap between them.
+const SSE_EVENTS: usize = 100;
+
+/// The gap between events, long enough that a buffering proxy is obvious.
+const SSE_GAP: Duration = Duration::from_millis(10);
 
 /// Start an in-process HTTPS server on loopback.
 ///
 /// `/v1/models` answers `200` with a small body; `/big` answers with four
 /// mebibytes sent in two halves with a pause between them, which is how the
-/// streaming test tells "passed through" from "buffered whole".
+/// streaming test tells "passed through" from "buffered whole". `/events` is an
+/// event stream of a hundred events ten milliseconds apart, and `/forever` one
+/// that never ends on its own, which is what a revoked-mid-stream test needs.
 async fn start_upstream() -> Upstream {
     use futures_util::StreamExt as _;
     use http_body_util::{BodyExt, StreamBody};
@@ -106,9 +150,13 @@ async fn start_upstream() -> Upstream {
         .unwrap();
     let port = listener.local_addr().unwrap().port();
     let seen: Arc<std::sync::Mutex<Vec<Seen>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let last_event_sent: Arc<std::sync::Mutex<Option<std::time::Instant>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let (ws_port, ws_seen, ws_accepting) = start_ws_upstream(acceptor.clone()).await;
     let recorded = Arc::clone(&seen);
+    let stamped = Arc::clone(&last_event_sent);
     let accepting = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -116,12 +164,14 @@ async fn start_upstream() -> Upstream {
             };
             let acceptor = acceptor.clone();
             let recorded = Arc::clone(&recorded);
+            let stamped = Arc::clone(&stamped);
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
                 };
                 let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                     let recorded = Arc::clone(&recorded);
+                    let stamped = Arc::clone(&stamped);
                     async move {
                         let header = |name: &str| {
                             request
@@ -136,6 +186,65 @@ async fn start_upstream() -> Upstream {
                             dpop: header("dpop"),
                             path: path.clone(),
                         });
+
+                        // An event stream an upstream chose to give a length.
+                        // Legal, and wrong for the client: the proxy's copy
+                        // ends when the upstream stops, not at a byte count
+                        // this server decided in advance.
+                        if path == "/events-sized" {
+                            let events: String = (1..=SSE_EVENTS)
+                                .map(|n| format!("data: event {n}\n\n"))
+                                .collect();
+                            let response = hyper::Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .header("content-length", events.len().to_string())
+                                .body(
+                                    http_body_util::Full::new(Bytes::from(events))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .unwrap();
+                            return Ok::<_, std::convert::Infallible>(response);
+                        }
+
+                        // An event stream, which is the one response with a
+                        // content type the proxy reads and acts on.
+                        if path == "/events" || path == "/forever" {
+                            let forever = path == "/forever";
+                            let stamped = Arc::clone(&stamped);
+                            let events = futures_util::stream::unfold(0usize, move |n| {
+                                let stamped = Arc::clone(&stamped);
+                                async move {
+                                    if !forever && n > SSE_EVENTS {
+                                        return None;
+                                    }
+                                    tokio::time::sleep(SSE_GAP).await;
+                                    // The first thing on the wire is a
+                                    // keep-alive comment, which the client must
+                                    // receive and the proxy must not count.
+                                    let chunk = if n == 0 {
+                                        ": keep-alive\n\n".to_string()
+                                    } else {
+                                        format!("data: event {n}\n\n")
+                                    };
+                                    if !forever && n == SSE_EVENTS {
+                                        *stamped.lock().unwrap() = Some(std::time::Instant::now());
+                                    }
+                                    Some((
+                                        Ok::<_, std::convert::Infallible>(Frame::data(
+                                            Bytes::from(chunk),
+                                        )),
+                                        n + 1,
+                                    ))
+                                }
+                            });
+                            let response = hyper::Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .header("cache-control", "no-cache")
+                                .body(BodyExt::boxed(StreamBody::new(events)))
+                                .unwrap();
+                            return Ok::<_, std::convert::Infallible>(response);
+                        }
 
                         let body = if path == "/big" {
                             let chunk = Bytes::from(vec![b'x'; 2 * 1024 * 1024]);
@@ -168,9 +277,83 @@ async fn start_upstream() -> Upstream {
     Upstream {
         ca_pem: ca.cert_pem().to_string(),
         port,
+        ws_port,
         seen,
+        last_event_sent,
+        ws_seen,
         accepting,
+        ws_accepting,
     }
+}
+
+/// A real WebSocket server on its own port, behind the same certificate.
+///
+/// Its own listener rather than a route on the HTTPS server, because a
+/// WebSocket server is not an HTTP server that happens to answer `101`: this
+/// one does the handshake itself and then speaks frames, which is what makes it
+/// a fair test of a proxy that has to do the same handshake in the middle.
+///
+/// Echoes every data frame back and closes when the client closes. The
+/// `Authorization` each handshake carried is recorded, so a test can prove the
+/// upstream saw the real key and never the synthetic token.
+async fn start_ws_upstream(
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> (
+    u16,
+    Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use futures_util::{SinkExt as _, StreamExt as _};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let recorded = Arc::clone(&seen);
+    let accepting = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                // The error half is tungstenite's own and never produced here;
+                // this callback only looks and waves the response through.
+                #[allow(clippy::result_large_err)]
+                let observe = |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                               response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    recorded.lock().unwrap().push(
+                        request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    Ok(response)
+                };
+                let Ok(mut socket) = tokio_tungstenite::accept_hdr_async(tls, observe).await else {
+                    return;
+                };
+                while let Some(Ok(message)) = socket.next().await {
+                    if message.is_close() {
+                        break;
+                    }
+                    if socket.send(message).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = socket.close(None).await;
+            });
+        }
+    });
+    (port, seen, accepting)
 }
 
 // ------------------------------------------------------------------ the client
@@ -180,6 +363,7 @@ struct ProxyClient {
     proxy_addr: String,
     briefcred_ca: String,
     upstream_port: u16,
+    ws_port: u16,
 }
 
 impl ProxyClient {
@@ -225,56 +409,7 @@ impl ProxyClient {
         headers: &[(&str, String)],
         want_header: Option<&str>,
     ) -> Result<(u16, Vec<u8>, (Duration, Option<String>)), String> {
-        let mut stream = TcpStream::connect(&self.proxy_addr)
-            .await
-            .map_err(|e| e.to_string())?;
-        let authority = format!("{UPSTREAM_HOST}:{}", self.upstream_port);
-        stream
-            .write_all(
-                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // The status line and the blank line that ends the headers. Read a byte
-        // at a time so nothing of the TLS that follows is consumed.
-        let mut head = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            let read = stream.read(&mut byte).await.map_err(|e| e.to_string())?;
-            if read == 0 {
-                return Err(format!(
-                    "the proxy closed the tunnel: {}",
-                    String::from_utf8_lossy(&head)
-                ));
-            }
-            head.push(byte[0]);
-            if head.ends_with(b"\r\n\r\n") {
-                break;
-            }
-        }
-        let head = String::from_utf8_lossy(&head).to_string();
-        if !head.starts_with("HTTP/1.1 200") {
-            return Err(format!("CONNECT was refused: {head}"));
-        }
-
-        let mut roots = rustls::RootCertStore::empty();
-        for certificate in rustls_pemfile::certs(&mut self.briefcred_ca.as_bytes()) {
-            roots.add(certificate.map_err(|e| e.to_string())?).unwrap();
-        }
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let name = rustls_pki_types::ServerName::try_from(UPSTREAM_HOST).unwrap();
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
-            .connect(name, stream)
-            .await
-            .map_err(|e| format!("the proxy's certificate did not verify: {e}"))?;
-
+        let tls = self.tunnel(self.upstream_port).await?;
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
                 .await
@@ -328,6 +463,185 @@ impl ProxyClient {
             bytes,
             (first_byte_at.unwrap_or(started.elapsed()), seen_header),
         ))
+    }
+
+    /// `CONNECT` to `port`, then terminate TLS against briefcred's own CA.
+    ///
+    /// Exactly what a wrapped subprocess does, and the first half of every
+    /// method here: the tunnel is opened the same way whether what goes through
+    /// it is one request, an event stream, or a WebSocket handshake.
+    async fn tunnel(
+        &self,
+        port: u16,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+        let mut stream = TcpStream::connect(&self.proxy_addr)
+            .await
+            .map_err(|e| e.to_string())?;
+        let authority = format!("{UPSTREAM_HOST}:{port}");
+        stream
+            .write_all(
+                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // The status line and the blank line that ends the headers. Read a byte
+        // at a time so nothing of the TLS that follows is consumed.
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            let read = stream.read(&mut byte).await.map_err(|e| e.to_string())?;
+            if read == 0 {
+                return Err(format!(
+                    "the proxy closed the tunnel: {}",
+                    String::from_utf8_lossy(&head)
+                ));
+            }
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&head).to_string();
+        if !head.starts_with("HTTP/1.1 200") {
+            return Err(format!("CONNECT was refused: {head}"));
+        }
+
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in rustls_pemfile::certs(&mut self.briefcred_ca.as_bytes()) {
+            roots.add(certificate.map_err(|e| e.to_string())?).unwrap();
+        }
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let name = rustls_pki_types::ServerName::try_from(UPSTREAM_HOST).unwrap();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(name, stream)
+            .await
+            .map_err(|e| format!("the proxy's certificate did not verify: {e}"))
+    }
+
+    /// Open an event stream and read it to its end.
+    ///
+    /// Every chunk is timestamped as it arrives, which is the only way to say
+    /// anything about *when* the client got an event rather than only that it
+    /// eventually did.
+    async fn events(&self, path: &str, headers: &[(&str, String)]) -> Result<SseRun, String> {
+        use http_body_util::BodyExt as _;
+
+        let tls = self.tunnel(self.upstream_port).await?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
+                .await
+                .map_err(|e| e.to_string())?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let mut builder = hyper::Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("host", UPSTREAM_HOST)
+            .header("accept", "text/event-stream");
+        for (name, value) in headers {
+            builder = builder.header(*name, value);
+        }
+        let request = builder
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut run = SseRun {
+            status: response.status().as_u16(),
+            content_length: response
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            content_type: response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            body: Vec::new(),
+            first_event_at: None,
+            ended_at: started,
+        };
+
+        let mut body = response.into_body();
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else { break };
+            let Some(data) = frame.data_ref() else {
+                continue;
+            };
+            run.body.extend_from_slice(data);
+            if run.first_event_at.is_none() && run.body.windows(5).any(|w| w == b"data:") {
+                run.first_event_at = Some(std::time::Instant::now());
+            }
+        }
+        run.ended_at = std::time::Instant::now();
+        Ok(run)
+    }
+
+    /// Complete a WebSocket handshake through the proxy.
+    ///
+    /// `tokio-tungstenite` does the handshake and the framing, so what is under
+    /// test is the proxy in the middle rather than this test's own idea of the
+    /// protocol.
+    async fn websocket(
+        &self,
+        path: &str,
+        headers: &[(&str, String)],
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        String,
+    > {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+        let tls = self.tunnel(self.ws_port).await?;
+        let mut request = format!("ws://{UPSTREAM_HOST}{path}")
+            .into_client_request()
+            .map_err(|e| e.to_string())?;
+        for (name, value) in headers {
+            request.headers_mut().insert(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                hyper::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let (socket, _) = tokio_tungstenite::client_async(request, tls)
+            .await
+            .map_err(|e| format!("the websocket handshake failed: {e}"))?;
+        Ok(socket)
+    }
+}
+
+/// One event stream, as the client experienced it.
+struct SseRun {
+    status: u16,
+    content_length: Option<String>,
+    content_type: Option<String>,
+    body: Vec<u8>,
+    /// When the first `data:` reached the client.
+    first_event_at: Option<std::time::Instant>,
+    /// When the stream closed.
+    ended_at: std::time::Instant,
+}
+
+impl SseRun {
+    /// Events in the body, counted the way the proxy counts them.
+    fn events(&self) -> usize {
+        String::from_utf8_lossy(&self.body)
+            .split("\n\n")
+            .filter(|block| block.lines().any(|line| line.starts_with("data:")))
+            .count()
     }
 }
 
@@ -426,6 +740,7 @@ async fn start_with(profile_yaml: &str) -> Fixture {
         proxy_addr,
         briefcred_ca,
         upstream_port: upstream.port,
+        ws_port: upstream.ws_port,
     };
     Fixture {
         daemon,
@@ -767,6 +1082,346 @@ async fn a_large_response_is_streamed_rather_than_buffered() {
     );
 }
 
+// ------------------------------------------------------------- the streams
+
+#[tokio::test]
+async fn an_event_stream_reaches_the_client_as_it_is_produced() {
+    let fixture = start_with(&stream_profile()).await;
+    let run = fixture
+        .client
+        .events("/events", &bearer(&fixture.token))
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+
+    assert_eq!(run.status, 200, "{}", fixture.daemon.log());
+    assert_eq!(run.events(), SSE_EVENTS, "every event must arrive");
+    assert!(
+        String::from_utf8_lossy(&run.body).contains(": keep-alive"),
+        "the keep-alive comment must be forwarded untouched"
+    );
+
+    // The assertion this test exists for. The upstream stamps the moment it
+    // sends its hundredth event; the client stamps the moment it receives its
+    // first. A proxy that collected the body before answering could only ever
+    // produce the first of those before the second.
+    let first_at = run.first_event_at.expect("an event reached the client");
+    let last_sent = fixture
+        .upstream
+        .last_event_sent
+        .lock()
+        .unwrap()
+        .expect("the upstream finished sending");
+    assert!(
+        first_at < last_sent,
+        "the client's first event arrived after the upstream sent its last; \
+         the response was buffered"
+    );
+}
+
+#[tokio::test]
+async fn an_event_stream_carries_no_content_length() {
+    // `/events-sized` is an upstream that put a `Content-Length` on an event
+    // stream, so this fails if the proxy passes the header through rather than
+    // dropping it: a length would make the client wait for a byte count that a
+    // stream ending when its upstream ends can never keep to.
+    let fixture = start_with(&stream_profile()).await;
+    let run = fixture
+        .client
+        .events("/events-sized", &bearer(&fixture.token))
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+
+    assert_eq!(run.status, 200, "{}", fixture.daemon.log());
+    assert_eq!(
+        run.content_length, None,
+        "the upstream's own length must not be forwarded"
+    );
+    assert_eq!(run.content_type.as_deref(), Some("text/event-stream"));
+    assert_eq!(run.events(), SSE_EVENTS, "the whole stream must arrive");
+
+    // And the same on a stream that never had a length in the first place.
+    let run = fixture
+        .client
+        .events("/events", &bearer(&fixture.token))
+        .await
+        .unwrap();
+    assert_eq!(run.content_length, None);
+}
+
+#[tokio::test]
+async fn an_event_stream_is_audited_with_the_events_it_carried() {
+    let fixture = start_with(&stream_profile()).await;
+    let run = fixture
+        .client
+        .events("/events", &bearer(&fixture.token))
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+    assert_eq!(run.events(), SSE_EVENTS);
+
+    assert!(
+        stream_row_written(&fixture.daemon).await,
+        "no proxy_stream row:\n{}",
+        fixture.daemon.log()
+    );
+    let rows = fixture.daemon.audit_rows();
+    let row = rows.iter().find(|r| r["event"] == "proxy_stream").unwrap();
+    assert_eq!(row["kind"], "sse");
+    assert_eq!(row["host"], UPSTREAM_HOST);
+    assert_eq!(row["path"], "/events");
+    assert_eq!(
+        row["events_or_frames"], SSE_EVENTS as u64,
+        "the keep-alive comment is not an event, and every event is"
+    );
+    assert!(row["bytes_down"].as_u64().unwrap() > 0);
+    assert!(row["mint_id"].as_str().unwrap().starts_with("briefcred_t_"));
+
+    // The request row for the response that opened it is there too.
+    assert!(
+        rows.iter()
+            .any(|r| r["event"] == "proxy_request" && r["path"] == "/events"),
+        "the response that started the stream must be audited as a request too"
+    );
+
+    let whole = serde_json::to_string(&rows).unwrap();
+    assert!(
+        !whole.contains(REAL_KEY),
+        "the audit log holds the real key"
+    );
+    assert!(!whole.contains("event 7"), "the audit log holds event data");
+
+    let scrape = scrape(&fixture.daemon).await;
+    assert!(
+        scrape.contains("briefcred_proxy_streams_total{kind=\"sse\"} 1"),
+        "{scrape}"
+    );
+    assert!(
+        scrape.contains("briefcred_proxy_stream_duration_seconds_count{kind=\"sse\"} 1"),
+        "{scrape}"
+    );
+}
+
+#[tokio::test]
+async fn an_event_stream_ends_when_its_grant_is_revoked() {
+    let fixture = start_with(&stream_profile()).await;
+    let mint_ids = mint_ids(&fixture.daemon).await;
+
+    // `/forever` never ends on its own, so a stream that ends at all ended
+    // because briefcred ended it.
+    let streaming = {
+        let client = ProxyClient {
+            proxy_addr: fixture.client.proxy_addr.clone(),
+            briefcred_ca: fixture.client.briefcred_ca.clone(),
+            upstream_port: fixture.client.upstream_port,
+            ws_port: fixture.client.ws_port,
+        };
+        let token = fixture.token.clone();
+        tokio::spawn(async move { client.events("/forever", &bearer(&token)).await })
+    };
+
+    // Let the stream get going before taking its grant away.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fixture
+        .daemon
+        .request(Request::ExecDone {
+            session_id: fixture.session_id.clone(),
+            mint_ids,
+            exit_code: Some(0),
+            duration_ms: 1,
+            hold_until_expiry: false,
+        })
+        .await
+        .unwrap();
+
+    // The liveness poll runs once a second, so the stream has to be gone
+    // inside about two.
+    let run = tokio::time::timeout(Duration::from_secs(4), streaming)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "a revoked grant left its event stream open:\n{}",
+                fixture.daemon.log()
+            )
+        })
+        .unwrap()
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+    assert!(
+        run.events() > 0,
+        "the stream must have been delivering before it was ended"
+    );
+
+    assert!(
+        stream_row_written(&fixture.daemon).await,
+        "an ended stream must still be audited:\n{}",
+        fixture.daemon.log()
+    );
+    let rows = fixture.daemon.audit_rows();
+    let row = rows.iter().find(|r| r["event"] == "proxy_stream").unwrap();
+    assert_eq!(row["kind"], "sse");
+    assert_eq!(row["path"], "/forever");
+}
+
+#[tokio::test]
+async fn a_websocket_reaches_the_upstream_with_the_real_key_and_echoes_both_ways() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let fixture = start_with(&stream_profile()).await;
+    let mut socket = fixture
+        .client
+        .websocket("/ws", &bearer(&fixture.token))
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+
+    const FRAMES: usize = 50;
+    for n in 0..FRAMES {
+        socket
+            .send(Message::Text(format!("frame {n}").into()))
+            .await
+            .unwrap();
+        let echoed = socket.next().await.expect("an echo").unwrap();
+        assert_eq!(echoed, Message::Text(format!("frame {n}").into()));
+    }
+
+    // The upstream saw the real key on the handshake, and no synthetic token.
+    let seen = fixture.upstream.ws_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(
+        seen[0].as_deref(),
+        Some(format!("Bearer {REAL_KEY}").as_str()),
+        "the upstream must see the real key"
+    );
+
+    // Closing propagates: the upstream closes back, and the socket ends.
+    socket.close(None).await.unwrap();
+    while let Some(Ok(message)) = socket.next().await {
+        if message.is_close() {
+            break;
+        }
+    }
+
+    assert!(
+        stream_row_written(&fixture.daemon).await,
+        "no proxy_stream row:\n{}",
+        fixture.daemon.log()
+    );
+    let rows = fixture.daemon.audit_rows();
+    let row = rows.iter().find(|r| r["event"] == "proxy_stream").unwrap();
+    assert_eq!(row["kind"], "ws");
+    assert_eq!(row["path"], "/ws");
+    // Fifty each way, plus the close frames each side sent.
+    let frames = row["events_or_frames"].as_u64().unwrap();
+    assert!(
+        (2 * FRAMES as u64..=2 * FRAMES as u64 + 4).contains(&frames),
+        "fifty frames each way and the closes, not {frames}"
+    );
+    assert!(row["bytes_up"].as_u64().unwrap() > 0);
+    assert!(row["bytes_down"].as_u64().unwrap() > 0);
+
+    // The handshake itself is a request, recorded with the `101` it got.
+    let handshake = rows
+        .iter()
+        .find(|r| r["event"] == "proxy_request" && r["path"] == "/ws")
+        .expect("the handshake must be audited as a request");
+    assert_eq!(handshake["method"], "GET");
+    assert_eq!(handshake["status"], 101);
+    assert_eq!(handshake["decision"], "allow");
+
+    // No payload reached a row, and no credential did either.
+    let whole = serde_json::to_string(&rows).unwrap();
+    assert!(
+        !whole.contains(REAL_KEY),
+        "the audit log holds the real key"
+    );
+    assert!(!whole.contains("frame 7"), "the audit log holds a payload");
+
+    let scrape = scrape(&fixture.daemon).await;
+    assert!(
+        scrape.contains("briefcred_proxy_streams_total{kind=\"ws\"} 1"),
+        "{scrape}"
+    );
+}
+
+#[tokio::test]
+async fn a_websocket_handshake_the_policy_does_not_permit_is_refused() {
+    // `enforce`, and the profile names `/ws` and not `/nope`. A handshake is a
+    // `GET`, so the policy decides it exactly as it decides any other.
+    let fixture = start_with(&stream_profile()).await;
+    let refused = fixture
+        .client
+        .websocket("/nope", &bearer(&fixture.token))
+        .await;
+    assert!(
+        refused.is_err(),
+        "a handshake the policy denies must not be upgraded"
+    );
+    assert!(
+        fixture.upstream.ws_seen.lock().unwrap().is_empty(),
+        "a denied handshake must not reach the upstream"
+    );
+}
+
+#[tokio::test]
+async fn a_websocket_ends_when_its_grant_is_revoked() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let fixture = start_with(&stream_profile()).await;
+    let mint_ids = mint_ids(&fixture.daemon).await;
+    let mut socket = fixture
+        .client
+        .websocket("/ws", &bearer(&fixture.token))
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+
+    socket
+        .send(Message::Text("still here".into()))
+        .await
+        .unwrap();
+    assert!(socket.next().await.expect("an echo").is_ok());
+
+    fixture
+        .daemon
+        .request(Request::ExecDone {
+            session_id: fixture.session_id.clone(),
+            mint_ids,
+            exit_code: Some(0),
+            duration_ms: 1,
+            hold_until_expiry: false,
+        })
+        .await
+        .unwrap();
+
+    // The socket has to end on its own, without the client asking it to.
+    let ended = tokio::time::timeout(Duration::from_secs(4), async {
+        while let Some(message) = socket.next().await {
+            match message {
+                Ok(message) if message.is_close() => return,
+                Ok(_) => continue,
+                Err(_) => return,
+            }
+        }
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "a revoked grant left its websocket open:\n{}",
+        fixture.daemon.log()
+    );
+
+    assert!(
+        stream_row_written(&fixture.daemon).await,
+        "an ended websocket must still be audited:\n{}",
+        fixture.daemon.log()
+    );
+    let rows = fixture.daemon.audit_rows();
+    let row = rows.iter().find(|r| r["event"] == "proxy_stream").unwrap();
+    assert_eq!(row["kind"], "ws");
+    assert!(
+        row["events_or_frames"].as_u64().unwrap() >= 2,
+        "the frames that did cross must still be counted: {row}"
+    );
+}
+
 // --------------------------------------------------------------- the quota
 
 /// The profile's own quota, once the `exec` in `start_with` has spent one.
@@ -941,6 +1596,17 @@ async fn proxy_row_written(daemon: &Daemon) -> bool {
             .audit_rows()
             .iter()
             .any(|row| row["event"] == "proxy_request")
+    })
+    .await
+}
+
+/// Wait until a `ProxyStream` row has reached the disk.
+async fn stream_row_written(daemon: &Daemon) -> bool {
+    briefcred_e2e::daemon_harness::wait_until(Duration::from_secs(10), || async {
+        daemon
+            .audit_rows()
+            .iter()
+            .any(|row| row["event"] == "proxy_stream")
     })
     .await
 }

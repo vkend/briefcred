@@ -39,3 +39,4 @@ rustls-pki-types.workspace = true
 time.workspace = true
 tokio-rustls.workspace = true
 rmcp = { version = "3.2.0", default-features = false, features = ["client", "macros", "transport-async-rw"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
