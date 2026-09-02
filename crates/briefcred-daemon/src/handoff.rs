@@ -331,7 +331,7 @@ pub struct Blob {
 /// starts when the process does, so an instant from the old daemon means
 /// nothing in the new one; an age converts cleanly, and the idle timer picks up
 /// exactly where it left off.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionBlob {
     /// The handle the client is already presenting.
     pub id: String,
@@ -361,6 +361,26 @@ pub struct SessionBlob {
     /// reject the `DPoP` proofs on requests the old one was accepting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_pubkey: Option<String>,
+}
+
+impl std::fmt::Debug for SessionBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Written by hand for the same reason `Session`'s is. `masters_enc`
+        // holds ciphertext rather than masters, but a derived `Debug` would put
+        // the sealed form of the machine's most valuable secrets into the first
+        // error anybody formatted, and the names are the useful part anyway.
+        f.debug_struct("SessionBlob")
+            .field("id", &self.id)
+            .field("profile", &self.profile)
+            .field("opened_at", &self.opened_at)
+            .field("last_used", &self.last_used)
+            .field("mints", &self.mints.len())
+            .field("quota_state", &self.quota_state)
+            .field("http_counters", &self.http_counters)
+            .field("masters", &self.masters_enc.keys().collect::<Vec<_>>())
+            .field("bound_to_a_session_key", &self.session_pubkey.is_some())
+            .finish()
+    }
 }
 
 /// A token bucket's position, so a quota does not reset on upgrade.
@@ -1092,6 +1112,22 @@ mod tests {
             sender_pubkey: base64(&[7u8; 32]),
             issued_at: 1_699_999_999,
         }
+    }
+
+    #[test]
+    fn a_blob_never_debug_prints_a_sealed_master() {
+        let opener = Opener::new();
+        let sealer = Sealer::to(&opener.public_key());
+        let mut blob = blob();
+        blob.sessions[0].masters_enc =
+            BTreeMap::from([("db".to_string(), sealer.seal(b"master-secret").unwrap())]);
+
+        let rendered = format!("{blob:?}");
+        assert!(
+            !rendered.contains(&blob.sessions[0].masters_enc["db"]),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"db\""), "{rendered}");
     }
 
     #[test]
