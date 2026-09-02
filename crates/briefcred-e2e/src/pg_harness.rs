@@ -108,6 +108,19 @@ pub struct PgCluster {
 impl PgCluster {
     /// Initialise and start a cluster, then create the `master_limited` role.
     pub async fn start() -> Result<PgCluster, HarnessError> {
+        PgCluster::start_with_tls(false).await
+    }
+
+    /// The same, with `ssl = on` and a freshly generated self-signed
+    /// certificate for `localhost` and `127.0.0.1`.
+    ///
+    /// Self-signed on purpose: it is what makes the difference between
+    /// `sslmode: require` and `sslmode: verify-full` observable, since the
+    /// first must connect and the second must refuse. `pg_hba.conf` is left as
+    /// `initdb` wrote it — `host`, not `hostssl` — so an unencrypted
+    /// connection is still accepted and `sslmode: disable` remains testable
+    /// against the very same cluster.
+    pub async fn start_with_tls(tls: bool) -> Result<PgCluster, HarnessError> {
         let bin = find_pg_bin()?;
         let dir = TempDir::new().map_err(|e| HarnessError::Failed(e.to_string()))?;
         let port = free_port()?;
@@ -139,10 +152,18 @@ impl PgCluster {
         std::fs::remove_file(&pwfile).ok();
 
         let log = dir.path().join("server.log");
-        let options = format!(
+        let mut options = format!(
             "-p {port} -h 127.0.0.1 -k {} -c fsync=off -c synchronous_commit=off",
             dir.path().display()
         );
+        if tls {
+            let (cert, key) = write_self_signed(&data)?;
+            options.push_str(&format!(
+                " -c ssl=on -c ssl_cert_file={} -c ssl_key_file={}",
+                cert.display(),
+                key.display()
+            ));
+        }
         let mut cluster = PgCluster {
             bin,
             dir,
@@ -292,7 +313,12 @@ impl Drop for PgCluster {
 /// A missing PostgreSQL installation is a skip; anything else is a failure,
 /// because a half-working cluster silently passing would defeat the point.
 pub async fn cluster_or_skip(test: &str) -> Option<PgCluster> {
-    match PgCluster::start().await {
+    cluster_or_skip_with_tls(test, false).await
+}
+
+/// The same, for a cluster that speaks TLS.
+pub async fn cluster_or_skip_with_tls(test: &str, tls: bool) -> Option<PgCluster> {
+    match PgCluster::start_with_tls(tls).await {
         Ok(cluster) => Some(cluster),
         Err(HarnessError::NoServerBinary(reason)) => {
             println!("skipping {test}: {reason}");
@@ -300,6 +326,44 @@ pub async fn cluster_or_skip(test: &str) -> Option<PgCluster> {
         }
         Err(HarnessError::Failed(reason)) => panic!("{test}: harness failed: {reason}"),
     }
+}
+
+/// Generate a self-signed server certificate into `data`, returning its paths.
+///
+/// The key is written `0600`: PostgreSQL refuses to start with a key any group
+/// or other can read, and does so with a message that is easy to misread as a
+/// TLS misconfiguration.
+fn write_self_signed(data: &Path) -> Result<(PathBuf, PathBuf), HarnessError> {
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+    let failed = |what: &str, e: String| HarnessError::Failed(format!("{what}: {e}"));
+
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| failed("cannot generate a server key", e.to_string()))?;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "localhost");
+    let mut params = CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+        .map_err(|e| failed("cannot build certificate parameters", e.to_string()))?;
+    params.distinguished_name = dn;
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::hours(1);
+    params.not_after = now + time::Duration::days(1);
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| failed("cannot sign the server certificate", e.to_string()))?;
+
+    let cert_path = data.join("briefcred-server.crt");
+    let key_path = data.join("briefcred-server.key");
+    std::fs::write(&cert_path, cert.pem()).map_err(|e| failed("write cert", e.to_string()))?;
+    std::fs::write(&key_path, key_pair.serialize_pem())
+        .map_err(|e| failed("write key", e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| failed("chmod key", e.to_string()))?;
+    }
+    Ok((cert_path, key_path))
 }
 
 fn run(program: &Path, args: &[&std::ffi::OsStr]) -> Result<(), HarnessError> {

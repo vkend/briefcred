@@ -728,6 +728,7 @@ credentials:
       port: 5432
       dbname: analytics
       user: reporting
+      sslmode: require
 env:
   DATABASE_URL: ${minted.warehouse.DATABASE_URL}
 ```
@@ -748,6 +749,28 @@ carrying the master:
 | `PGDATABASE` | the configured `dbname` |
 | `PGUSER` | the session id |
 | `PGPASSWORD` | the synthetic token |
+
+### The upstream connection is encrypted
+
+`sslmode` governs the connection the **daemon** opens to the real server, which
+is the one that carries the master password. It is not the subprocess's
+connection to the proxy: that one is loopback and carries only the synthetic
+token.
+
+| `sslmode` | What the daemon does |
+| --- | --- |
+| `require` (default) | Sends `SSLRequest`, refuses the connection if the server answers `N`, and does not verify the certificate |
+| `verify-full` | The same, and additionally verifies the chain against the system trust store and that the certificate names `host` |
+| `disable` | No `SSLRequest`; the master crosses the network in plaintext |
+
+There is deliberately no `prefer` or `allow`. A mode that silently falls back to
+plaintext is a mode whose security depends on something nobody looks at, and the
+thing it would be putting on the wire is the master password.
+
+Use `verify-full` wherever the server's certificate chains to a CA the machine
+trusts. Use `disable` only when the path to the database is already private — a
+loopback address, a tunnel, a unix-domain forward — and never as a way to get
+past a handshake error.
 
 So this works, and `psql` never sees a password:
 

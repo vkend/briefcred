@@ -146,6 +146,7 @@ unlock:
       port: {tap_port}
       dbname: {DBNAME}
       user: {MASTER_USER}
+      sslmode: disable
 env:
   DATABASE_URL: ${{minted.{CREDENTIAL}.DATABASE_URL}}
   PGPASSWORD: ${{minted.{CREDENTIAL}.PGPASSWORD}}

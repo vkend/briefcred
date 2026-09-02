@@ -61,6 +61,14 @@ credentials:
       # secret too would be a way for the two to disagree.
       user: reporting
 
+      # How the daemon's own connection to `warehouse.internal` is protected.
+      # `require` is the default and encrypts without checking the certificate;
+      # `verify-full` also verifies the chain against the system trust store and
+      # that the certificate names the `host` above. `disable` is plaintext, and
+      # sends the master password over the network in the clear — only for an
+      # upstream already reached through a private channel.
+      sslmode: verify-full
+
 exec:
   # `psql` by basename, so `/opt/homebrew/opt/libpq/bin/psql` is permitted too.
   # Name an absolute path instead to pin one specific binary.

@@ -719,6 +719,40 @@ The check happens **before** any upstream connection is opened, which is
 asserted end to end by a counting splice in front of the test cluster: a refused
 client causes zero connections to the database.
 
+### The upstream connection carries the master, so it is encrypted
+
+The client's hop is loopback and carries a token that is worthless off this
+machine. The daemon's hop carries the master password, across whatever network
+sits between here and the database, and it is the only connection in briefcred
+whose plaintext would hand a listener the credential the whole kind exists to
+withhold. SCRAM keeps the password itself off the wire as a string, but it
+leaves every statement, every row, and the channel-binding material readable.
+
+So the daemon sends PostgreSQL's `SSLRequest` before it writes the startup
+packet, and the credential's `sslmode` says what happens next:
+
+| `sslmode` | Behaviour |
+| --- | --- |
+| `require` (default) | TLS, or the connection is refused; the certificate is not verified |
+| `verify-full` | TLS, the chain verified against the system trust store, and the certificate checked against `config.host` |
+| `disable` | No `SSLRequest`; the master crosses the network in the clear |
+
+`require` is the default because a connection nobody configured must not be a
+plaintext one. There is no `prefer` and no `allow`: a mode that silently falls
+back is a mode whose security depends on nobody having changed the server, and a
+server that answers `N` here gets an error rather than a downgrade.
+
+What `require` does **not** buy is authentication of the server. An active
+attacker who can redirect the connection can present any certificate and read
+the SCRAM exchange it terminates. `verify-full` is the mode that closes that,
+and it is the one to use wherever the server's certificate chains to a CA the
+machine already trusts. `disable` is a deliberate statement that the path is
+private by other means; it is not a way to get past a handshake error.
+
+The `CancelRequest` briefcred forwards on its own connection is plaintext, and
+that is not an exception to the above: it carries the `(pid, key)` pair the
+server itself issued and no credential of any kind.
+
 ### The subtraction: there is no Cedar policy here
 
 This is the important one. A `postgres-proxy` credential is **not** bounded by

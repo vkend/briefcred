@@ -14,7 +14,9 @@ briefcred-proto.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 getrandom.workspace = true
+rcgen.workspace = true
 tempfile.workspace = true
+time.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "time"] }
 tokio-postgres.workspace = true
@@ -36,7 +38,6 @@ hyper-util = { workspace = true, features = ["server"] }
 rustls.workspace = true
 sha2.workspace = true
 rustls-pki-types.workspace = true
-time.workspace = true
 tokio-rustls.workspace = true
 rmcp = { version = "3.2.0", default-features = false, features = ["client", "macros", "transport-async-rw"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }

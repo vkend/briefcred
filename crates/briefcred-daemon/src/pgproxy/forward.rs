@@ -26,8 +26,11 @@
 //! if it wanted to — which is the property the audit row's honesty rests on.
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use briefcred_core::minters::postgres_proxy::{PgProxyConfig, SslMode};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 use zeroize::Zeroizing;
 
@@ -120,6 +123,30 @@ pub enum UpstreamError {
         detail: String,
     },
 
+    /// The server will not speak TLS and the credential does not permit
+    /// plaintext.
+    #[error(
+        "`{upstream}` refused TLS, and the master for this credential is not sent over a \
+         plaintext connection; enable TLS on the server, or set `sslmode: disable` on the \
+         credential if the network between here and it is already private"
+    )]
+    TlsRefused {
+        /// The `host:port` that refused.
+        upstream: String,
+    },
+
+    /// The TLS handshake with the server failed.
+    ///
+    /// Under `verify-full` this is where a certificate that does not chain to
+    /// the system trust store, or does not name the configured `host`, lands.
+    #[error("`{upstream}` could not complete a TLS handshake: {detail}")]
+    Tls {
+        /// The `host:port` the handshake was with.
+        upstream: String,
+        /// The handshake failure, or the reason a connector could not be built.
+        detail: String,
+    },
+
     /// The server sent something the proxy could not read.
     #[error("`{upstream}` sent something briefcred could not read: {source}")]
     Protocol {
@@ -131,10 +158,78 @@ pub enum UpstreamError {
     },
 }
 
+/// The upstream socket, with or without a TLS layer over it.
+///
+/// An enum rather than a boxed trait object: there are exactly two shapes and
+/// both are known here, so the relay keeps its concrete types and the read and
+/// write paths stay free of a virtual call per buffer.
+pub enum UpstreamStream {
+    /// A bare TCP connection, for `sslmode: disable`.
+    Plain(TcpStream),
+    /// A TLS session over TCP, for `require` and `verify-full`.
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl UpstreamStream {
+    /// Whether this connection is encrypted, for the log line and the tests.
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, UpstreamStream::Tls(_))
+    }
+}
+
+impl std::fmt::Debug for UpstreamStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UpstreamStream::Plain(_) => "UpstreamStream::Plain",
+            UpstreamStream::Tls(_) => "UpstreamStream::Tls",
+        })
+    }
+}
+
+impl AsyncRead for UpstreamStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpstreamStream::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            UpstreamStream::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for UpstreamStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            UpstreamStream::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            UpstreamStream::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpstreamStream::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            UpstreamStream::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpstreamStream::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            UpstreamStream::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 /// An authenticated upstream connection, ready to be spliced to a client.
 pub struct Upstream {
     /// The socket, authenticated and sitting at `ReadyForQuery`.
-    pub stream: TcpStream,
+    pub stream: UpstreamStream,
     /// Everything the server said between `AuthenticationOk` and
     /// `ReadyForQuery`, in order, to be relayed to the client verbatim.
     pub greeting: Vec<Message>,
@@ -148,6 +243,7 @@ pub struct Upstream {
 impl std::fmt::Debug for Upstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Upstream")
+            .field("encrypted", &self.stream.is_encrypted())
             .field("greeting_messages", &self.greeting.len())
             .field("has_backend_key", &self.backend_key.is_some())
             .finish()
@@ -156,29 +252,23 @@ impl std::fmt::Debug for Upstream {
 
 /// Open and authenticate a connection to the real server.
 ///
-/// `user` and `database` are the credential's configured values, never the
-/// client's: the client named a session and a database it had to match, and
-/// what is sent upstream is what the profile authorised.
+/// The `user` and `database` sent upstream are the credential's configured
+/// values, never the client's: the client named a session and a database it had
+/// to match, and what is sent upstream is what the profile authorised.
+///
+/// The connection is encrypted first, before a single byte of the startup
+/// packet is written, unless the credential's `sslmode` is `disable`.
 pub async fn connect(
-    upstream: &str,
-    user: &str,
-    database: &str,
+    config: &PgProxyConfig,
     master: &Zeroizing<String>,
     forwarded: &BTreeMap<String, String>,
     allow_md5: bool,
 ) -> Result<Upstream, UpstreamError> {
-    let mut stream =
-        TcpStream::connect(upstream)
-            .await
-            .map_err(|e| UpstreamError::Unreachable {
-                upstream: upstream.to_string(),
-                detail: e.to_string(),
-            })?;
-    // Small messages, and every one of them is a round trip: Nagle would add a
-    // delay to each step of the authentication and to every query after it.
-    let _ = stream.set_nodelay(true);
+    let upstream = config.upstream();
+    let upstream = upstream.as_str();
+    let mut stream = negotiate_tls(upstream, &config.host, config.sslmode).await?;
 
-    let packet = startup_packet(user, database, forwarded);
+    let packet = startup_packet(&config.user, &config.dbname, forwarded);
     stream
         .write_all(&packet)
         .await
@@ -187,13 +277,81 @@ pub async fn connect(
             detail: e.to_string(),
         })?;
 
-    authenticate(&mut stream, upstream, user, master, allow_md5).await?;
+    authenticate(&mut stream, upstream, &config.user, master, allow_md5).await?;
     let (greeting, backend_key) = read_greeting(&mut stream, upstream).await?;
     Ok(Upstream {
         stream,
         greeting,
         backend_key,
     })
+}
+
+/// Open the socket and, unless `sslmode` is `disable`, put TLS on it.
+///
+/// PostgreSQL's negotiation is an eight-byte `SSLRequest` with no message tag,
+/// answered by a single byte. `S` means the next byte is a TLS record; `N`
+/// means the server will not, and briefcred does not then fall back — a
+/// fallback is how a master ends up on a plaintext socket without anyone
+/// choosing it.
+async fn negotiate_tls(
+    upstream: &str,
+    host: &str,
+    mode: SslMode,
+) -> Result<UpstreamStream, UpstreamError> {
+    let unreachable = |e: std::io::Error| UpstreamError::Unreachable {
+        upstream: upstream.to_string(),
+        detail: e.to_string(),
+    };
+
+    let mut stream = TcpStream::connect(upstream).await.map_err(unreachable)?;
+    // Small messages, and every one of them is a round trip: Nagle would add a
+    // delay to each step of the authentication and to every query after it.
+    let _ = stream.set_nodelay(true);
+
+    let Some(connector) =
+        crate::pgproxy::tls::connector(mode).map_err(|detail| UpstreamError::Tls {
+            upstream: upstream.to_string(),
+            detail,
+        })?
+    else {
+        return Ok(UpstreamStream::Plain(stream));
+    };
+
+    let mut request = 8i32.to_be_bytes().to_vec();
+    request.extend_from_slice(&crate::pgproxy::startup::SSL_REQUEST.to_be_bytes());
+    stream.write_all(&request).await.map_err(unreachable)?;
+    stream.flush().await.map_err(unreachable)?;
+
+    let mut answer = [0u8; 1];
+    stream
+        .read_exact(&mut answer)
+        .await
+        .map_err(|_| UpstreamError::TlsRefused {
+            upstream: upstream.to_string(),
+        })?;
+    if answer[0] != b'S' {
+        return Err(UpstreamError::TlsRefused {
+            upstream: upstream.to_string(),
+        });
+    }
+
+    // The name the certificate is checked against under `verify-full`, and the
+    // SNI sent either way. An IP literal parses as `ServerName::IpAddress`,
+    // which is what a certificate with an IP SAN would be matched against.
+    let name = rustls_pki_types::ServerName::try_from(host.to_string()).map_err(|e| {
+        UpstreamError::Tls {
+            upstream: upstream.to_string(),
+            detail: format!("`{host}` is not a usable server name: {e}"),
+        }
+    })?;
+    let session = connector
+        .connect(name, stream)
+        .await
+        .map_err(|e| UpstreamError::Tls {
+            upstream: upstream.to_string(),
+            detail: e.to_string(),
+        })?;
+    Ok(UpstreamStream::Tls(Box::new(session)))
 }
 
 /// The startup packet briefcred sends upstream.
@@ -509,6 +667,12 @@ pub fn error_text(body: &[u8]) -> String {
 /// Cancellation is a separate connection by design: it has to be possible while
 /// the original one is busy. Nothing is read back — the server answers a cancel
 /// request by closing the socket, whether or not it did anything.
+///
+/// Plaintext, and deliberately: a `CancelRequest` carries no credential — only
+/// the `(pid, key)` pair the server itself issued — so there is nothing here
+/// for TLS to protect, and a server whose `pg_hba.conf` insists on `hostssl`
+/// will drop it, which is the same best-effort outcome this function already
+/// has for every other reason a cancel can go unanswered.
 pub async fn forward_cancel(upstream: &str, pid: i32, key: i32) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(upstream).await?;
     let mut packet = 16i32.to_be_bytes().to_vec();
@@ -1064,16 +1228,78 @@ mod tests {
         }
     }
 
+    /// A config for the scripted server, which speaks no TLS: these tests are
+    /// about the authentication exchange, and `sslmode: disable` is what lets
+    /// them script it without a certificate.
+    fn config_for(address: &str) -> PgProxyConfig {
+        let (host, port) = address.rsplit_once(':').expect("host:port");
+        PgProxyConfig {
+            host: host.to_string(),
+            port: port.parse().expect("a port"),
+            dbname: "analytics".to_string(),
+            user: "reporting".to_string(),
+            sslmode: SslMode::Disable,
+        }
+    }
+
     async fn connect_to(address: &str, allow_md5: bool) -> Result<Upstream, UpstreamError> {
         connect(
-            address,
-            "reporting",
-            "analytics",
+            &config_for(address),
             &Zeroizing::new("hunter2".to_string()),
             &BTreeMap::new(),
             allow_md5,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn a_server_that_answers_n_to_sslrequest_is_refused_rather_than_downgraded() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8];
+            stream.read_exact(&mut request).await.unwrap();
+            // The eight bytes of an `SSLRequest`, and nothing before them: the
+            // startup packet must not have been written yet.
+            assert_eq!(i32::from_be_bytes(request[..4].try_into().unwrap()), 8);
+            assert_eq!(
+                i32::from_be_bytes(request[4..].try_into().unwrap()),
+                crate::pgproxy::startup::SSL_REQUEST
+            );
+            stream.write_all(b"N").await.unwrap();
+            // Anything the client sends after being told `N`, which must be
+            // nothing at all.
+            let mut rest = Vec::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                stream.read_to_end(&mut rest),
+            )
+            .await;
+            rest
+        });
+
+        let mut config = config_for(&address);
+        config.sslmode = SslMode::Require;
+        let err = connect(
+            &config,
+            &Zeroizing::new("hunter2".to_string()),
+            &BTreeMap::new(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamError::TlsRefused { .. }),
+            "a server refusing TLS must fail the connection: {err}"
+        );
+        assert!(
+            server.await.unwrap().is_empty(),
+            "not one byte of the startup packet may follow an `N`"
+        );
     }
 
     #[tokio::test]

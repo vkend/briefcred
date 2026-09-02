@@ -361,9 +361,7 @@ async fn serve_session(
     }
 
     let upstream = match forward::connect(
-        &grant.config.upstream(),
-        &grant.config.user,
-        &grant.config.dbname,
+        &grant.config,
         &grant.master,
         &startup.forwarded,
         proxy.allow_md5,

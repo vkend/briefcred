@@ -30,7 +30,14 @@
 //!       port: 5432
 //!       dbname: analytics
 //!       user: reporting
+//!       sslmode: require
 //! ```
+//!
+//! `sslmode` governs the daemon's **own** connection to the real server, not
+//! the client's connection to the proxy (that one is loopback and carries only
+//! the synthetic token). It defaults to `require`, so the master password is
+//! never written to a plaintext socket unless a profile says `disable` in so
+//! many words.
 //!
 //! The `user` here is the **real** role the daemon authenticates as upstream,
 //! and the master filed under the credential's `source_key` is that role's
@@ -112,6 +119,40 @@ pub struct PgProxyConfig {
     ///
     /// Its password is the master filed under the credential's `source_key`.
     pub user: String,
+    /// How the daemon's own connection to the real server is protected.
+    ///
+    /// Defaults to [`SslMode::Require`]: the master password is the one secret
+    /// this whole kind exists to keep, and sending it over a plaintext socket
+    /// would put it on the wire the design promises it never reaches.
+    #[serde(default)]
+    pub sslmode: SslMode,
+}
+
+/// How the daemon protects its upstream connection to the real server.
+///
+/// The three libpq spellings that mean something different from each other.
+/// The intermediate ones (`allow`, `prefer`) are deliberately absent: a mode
+/// that silently falls back to plaintext is a mode whose security depends on
+/// something nobody looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SslMode {
+    /// Negotiate TLS and refuse the connection if the server will not.
+    ///
+    /// The certificate is not verified, exactly as libpq's `require` does not
+    /// verify it. This is encryption against a passive listener, not proof of
+    /// who is on the other end; [`SslMode::VerifyFull`] is that.
+    #[default]
+    Require,
+    /// Negotiate TLS, verify the chain against the system trust store, and
+    /// check the certificate against the configured `host`.
+    VerifyFull,
+    /// Do not negotiate TLS at all.
+    ///
+    /// The master password crosses the network in the clear. Only for an
+    /// upstream reached over a channel that is already private — a unix-domain
+    /// forward, a loopback address, an established tunnel.
+    Disable,
 }
 
 fn default_port() -> u16 {
@@ -191,7 +232,8 @@ mod tests {
         serde_yaml_ng::from_str(text).unwrap()
     }
 
-    const FULL: &str = "host: db.internal\nport: 6432\ndbname: analytics\nuser: reporting\n";
+    const FULL: &str =
+        "host: db.internal\nport: 6432\ndbname: analytics\nuser: reporting\nsslmode: verify-full\n";
 
     #[test]
     fn the_kind_registers_itself_as_the_proxys_business() {
@@ -219,6 +261,7 @@ mod tests {
                 port: 6432,
                 dbname: "analytics".into(),
                 user: "reporting".into(),
+                sslmode: SslMode::VerifyFull,
             }
         );
         assert_eq!(config.upstream(), "db.internal:6432");
@@ -230,7 +273,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(config.port, DEFAULT_PORT);
+        assert_eq!(config.sslmode, SslMode::Require);
         assert_eq!(config.upstream(), "h:5432");
+    }
+
+    #[test]
+    fn every_ssl_mode_spelling_resolves_and_nothing_else_does() {
+        for (spelling, expected) in [
+            ("require", SslMode::Require),
+            ("verify-full", SslMode::VerifyFull),
+            ("disable", SslMode::Disable),
+        ] {
+            let document = format!("host: h\ndbname: d\nuser: u\nsslmode: {spelling}\n");
+            let config = PgProxyConfig::parse(KIND, &yaml(&document))
+                .unwrap()
+                .unwrap();
+            assert_eq!(config.sslmode, expected, "{spelling}");
+        }
+        // libpq's fallback modes are not offered: a `prefer` that quietly
+        // dropped to plaintext would put the master on the wire.
+        for refused in ["prefer", "allow", "verify-ca"] {
+            let document = format!("host: h\ndbname: d\nuser: u\nsslmode: {refused}\n");
+            assert!(
+                PgProxyConfig::parse(KIND, &yaml(&document))
+                    .unwrap()
+                    .is_err(),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
@@ -296,11 +366,11 @@ mod tests {
     fn an_unknown_key_is_refused_so_a_typo_cannot_be_ignored() {
         let err = PgProxyConfig::parse(
             KIND,
-            &yaml("host: h\ndbname: d\nuser: u\nsslmode: require\n"),
+            &yaml("host: h\ndbname: d\nuser: u\nsslmodee: require\n"),
         )
         .unwrap()
         .unwrap_err();
-        assert!(err.to_string().contains("sslmode"), "{err}");
+        assert!(err.to_string().contains("sslmodee"), "{err}");
     }
 
     #[test]

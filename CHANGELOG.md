@@ -8,6 +8,15 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **TLS on the Postgres proxy's upstream connection.** The daemon now sends
+  PostgreSQL's `SSLRequest` before the startup packet and refuses the
+  connection if the server will not encrypt it, so the master password no
+  longer crosses the network on a plaintext socket. A `postgres-proxy`
+  credential takes an `sslmode` of `require` (the default), `verify-full`
+  (chain and hostname verified against the system trust store), or `disable`.
+  There is no `prefer` or `allow`: a mode that silently falls back to plaintext
+  is a mode whose security nobody checks.
+
 - **A supply-chain gate in `just check`.** `deny.toml` allows permissive
   licences only, refuses any source but crates.io, treats an open advisory as
   an error, and sets `unmaintained = "all"` so a transitive unmaintained crate

@@ -32,6 +32,7 @@
 //! | [`startup`] | the opening packet, and the three things that are not one |
 //! | [`wire`] | the message frame, and the few messages briefcred writes |
 //! | [`scram`] | proving the master to the real server |
+//! | [`tls`] | encrypting the upstream connection the master crosses |
 //! | [`forward`] | opening the upstream connection, and relaying bytes |
 //! | [`audit`] | the one row a connection leaves behind |
 //! | [`listener`] | the loop that puts all of it in order |
@@ -51,4 +52,5 @@ pub mod forward;
 pub mod listener;
 pub mod scram;
 pub mod startup;
+pub mod tls;
 pub mod wire;
