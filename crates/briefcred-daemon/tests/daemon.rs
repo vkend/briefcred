@@ -297,8 +297,11 @@ async fn a_socket_left_behind_by_a_dead_daemon_is_cleared_on_start() {
         .spawn()
         .unwrap();
 
+    // Thirty seconds. The daemon has to start, and on a machine running the
+    // rest of the suite beside it that is not quick; what is under test is
+    // whether it *replaces* a stale socket, never how fast it boots.
     let mut connected = false;
-    for _ in 0..300 {
+    for _ in 0..1500 {
         if UnixStream::connect(home.path().join("sock")).await.is_ok() {
             connected = true;
             break;

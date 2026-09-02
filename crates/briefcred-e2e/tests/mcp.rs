@@ -163,39 +163,6 @@ async fn a_command_the_profile_forbids_is_refused_without_minting() {
     );
 }
 
-/// A profile whose `postgres-dynamic` credential points at `cluster`.
-fn db_profile(cluster: &PgCluster) -> String {
-    format!(
-        "\
-name: analytics
-unlock:
-  policy: none
-credentials:
-  - name: db
-    kind: postgres-dynamic
-    ttl_secs: 300
-    source_key: pg-master
-    config:
-      host: 127.0.0.1
-      port: {}
-      dbname: {}
-      user: {}
-      sslmode: disable
-      role_template:
-        grants:
-          - privileges: [SELECT]
-            on: ALL TABLES IN SCHEMA public
-          - privileges: [USAGE]
-            on: ALL SEQUENCES IN SCHEMA public
-exec:
-  allow_argv0: [\"/bin/echo\"]
-",
-        cluster.port(),
-        pg_harness::DBNAME,
-        pg_harness::MASTER_USER,
-    )
-}
-
 #[tokio::test]
 async fn db_query_runs_as_a_minted_role_and_revokes_it_when_the_client_leaves() {
     let Some(cluster) = cluster_or_skip("db_query_runs_as_a_minted_role").await else {
@@ -298,28 +265,6 @@ async fn db_query_runs_as_a_minted_role_and_revokes_it_when_the_client_leaves() 
         "one MCP connection mints once"
     );
 
-    // A profile the connection is not bound to is refused rather than opening
-    // a second session.
-    daemon.write_profile("listing", LISTING_ONLY);
-    let bound = wait_until(Duration::from_secs(5), || async {
-        client
-            .call_tool(
-                CallToolRequestParams::new("briefcred_exec").with_arguments(
-                    serde_json::json!({ "profile": "listing", "argv": ["/bin/echo", "hi"] })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            )
-            .await
-            .is_err()
-    })
-    .await;
-    assert!(
-        bound,
-        "a second profile must be refused on the same connection"
-    );
-
     // Closing the connection revokes what it minted.
     client.cancel().await.ok();
     let cleaned = wait_until(Duration::from_secs(20), || async {
@@ -335,36 +280,252 @@ async fn db_query_runs_as_a_minted_role_and_revokes_it_when_the_client_leaves() 
     daemon.shutdown().await;
 }
 
+/// A profile whose `postgres-dynamic` credential points at `cluster`.
+fn db_profile(cluster: &PgCluster) -> String {
+    format!(
+        "\
+name: analytics
+unlock:
+  policy: none
+credentials:
+  - name: db
+    kind: postgres-dynamic
+    ttl_secs: 300
+    source_key: pg-master
+    config:
+      host: 127.0.0.1
+      port: {}
+      dbname: {}
+      user: {}
+      sslmode: disable
+      role_template:
+        grants:
+          - privileges: [SELECT]
+            on: ALL TABLES IN SCHEMA public
+          - privileges: [USAGE]
+            on: ALL SEQUENCES IN SCHEMA public
+exec:
+  allow_argv0: [\"/bin/echo\"]
+",
+        cluster.port(),
+        pg_harness::DBNAME,
+        pg_harness::MASTER_USER,
+    )
+}
+
+/// Three properties of a fresh MCP connection, over one cluster.
+///
+/// They are together because each one needs a *connection* that has not minted
+/// yet — not a daemon, and certainly not a PostgreSQL cluster, of its own.
+/// Starting a cluster per assertion was costing five `initdb`s in parallel and
+/// loading the machine enough to break unrelated timing tests elsewhere in the
+/// suite. One cluster, one daemon, three connections.
 #[tokio::test]
-async fn a_bad_statement_reports_the_databases_own_complaint() {
-    let Some(cluster) = cluster_or_skip("a_bad_statement_reports").await else {
+async fn a_fresh_connection_mints_once_bounds_its_fetch_and_reports_sql_errors() {
+    let Some(cluster) = cluster_or_skip("a_fresh_connection_mints_once").await else {
         return;
     };
+    // Created before the daemon starts, so it exists when the mint runs
+    // `GRANT USAGE ON ALL SEQUENCES`: a sequence created afterwards would not
+    // be covered and the counting query below would fail on permissions.
+    let setup = cluster.connect_master().await;
+    setup
+        .batch_execute("CREATE SEQUENCE rows_produced")
+        .await
+        .expect("the counter sequence");
+
     let mut daemon = Daemon::prepare("metrics_enabled = false\nmaster_source = \"file\"\n");
     daemon.write_profile("analytics", &db_profile(&cluster));
     daemon.write_master("pg-master", &cluster.master_password());
     daemon.start().await.expect("start");
-    let client = mcp_client(&daemon).await;
 
-    let err = client
-        .call_tool(
-            CallToolRequestParams::new("briefcred_db_query").with_arguments(
-                serde_json::json!({ "profile": "analytics", "sql": "SELECT * FROM no_such_table" })
+    // --- Two calls arriving together on a fresh connection mint once. ---
+    //
+    // `rmcp` runs each request as its own task, so a check-then-act
+    // `ensure_minted` has both find the slot empty, both mint, and the second
+    // overwrite the first — leaving a role that nothing revokes, because the
+    // disconnect can only close the session it can still see.
+    {
+        let client = mcp_client(&daemon).await;
+        let query = |sql: &'static str| {
+            client.call_tool(
+                CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                    serde_json::json!({ "profile": "analytics", "sql": sql })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+        };
+        let (first, second) = tokio::join!(query("SELECT 1 AS a"), query("SELECT 2 AS b"));
+        first.expect("the first call succeeds");
+        second.expect("the second call succeeds");
+
+        assert_eq!(
+            cluster.leaked_role_count().await,
+            1,
+            "two concurrent calls must share one mint, not race to two"
+        );
+
+        client.cancel().await.ok();
+        let cleaned = wait_until(Duration::from_secs(20), || async {
+            cluster.leaked_role_count().await == 0
+        })
+        .await;
+        assert!(
+            cleaned,
+            "a role survived the disconnect, so a session was stranded\n{}",
+            daemon.log()
+        );
+    }
+
+    // --- `max_rows` bounds what the *server* produces. ---
+    //
+    // Timing alone cannot show this. An implementation that asks for every row
+    // and then stops reading also finishes quickly, because dropping the
+    // client closes the connection and the backend is killed — so a stopwatch
+    // cannot tell "the server was asked for six rows" from "the server was
+    // asked for a million and then hung up on". The difference is real work.
+    //
+    // So this counts. `nextval` in the target list runs once per row the
+    // server actually produces, and a sequence's value is **not** rolled back,
+    // which makes it the one side effect that survives the read-only
+    // transaction `briefcred_db_query` runs in.
+    {
+        let client = mcp_client(&daemon).await;
+
+        // Mint on a trivial query, so the timed call below is a fetch and not
+        // the one-off cost of starting a helper and creating a role.
+        client
+            .call_tool(
+                CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                    serde_json::json!({ "profile": "analytics", "sql": "SELECT 1 AS one" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .expect("the warm-up query runs");
+
+        // A million rows, from a generator in the **target list** rather than
+        // in `FROM`. That distinction is not cosmetic: a set-returning
+        // function in `FROM` is a function scan, which PostgreSQL materialises
+        // into a tuplestore before yielding its first row, so no row limit of
+        // any kind can stop it. In the target list it is a `ProjectSet`,
+        // produced lazily, which is what a portal limit can cut short.
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.call_tool(
+                CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                    serde_json::json!({
+                        "profile": "analytics",
+                        "sql": "SELECT generate_series(1, 1000000) AS i, nextval('rows_produced')",
+                        "max_rows": 5,
+                    })
                     .as_object()
                     .unwrap()
                     .clone(),
+                ),
             ),
         )
         .await
-        .expect_err("a bad statement must fail");
-    let text = err.to_string();
-    assert!(
-        text.contains("42P01"),
-        "the SQLSTATE belongs in the message: {text}"
-    );
-    assert!(text.contains("no_such_table"), "{text}");
+        .expect("a bounded fetch returns promptly")
+        .expect("the query runs");
 
-    client.cancel().await.ok();
+        let result = json_of(&result);
+        assert_eq!(result["row_count"], 5);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["rows"][0]["i"], 1);
+
+        // The count of rows the server actually produced. Six: the five asked
+        // for and the one extra that reveals there were more.
+        let produced: i64 = setup
+            .query_one(
+                "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM rows_produced",
+                &[],
+            )
+            .await
+            .expect("read the counter")
+            .get(0);
+        assert_eq!(
+            produced, 6,
+            "the server produced {produced} rows for a five-row request"
+        );
+
+        client.cancel().await.ok();
+    }
+
+    // --- A connection is bound to the one profile it minted for. ---
+    //
+    // The second profile is written now rather than at start-up so this is a
+    // refusal by the *connection's* binding and not by the profile being
+    // absent.
+    {
+        daemon.write_profile("listing", LISTING_ONLY);
+        let client = mcp_client(&daemon).await;
+        client
+            .call_tool(
+                CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                    serde_json::json!({ "profile": "analytics", "sql": "SELECT 1 AS one" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .expect("the connection mints for `analytics`");
+
+        // The daemon has to notice `listing` before the refusal can be about
+        // the binding; until then it would be "no such profile".
+        let bound = wait_until(Duration::from_secs(30), || async {
+            let refused = client
+                .call_tool(
+                    CallToolRequestParams::new("briefcred_exec").with_arguments(
+                        serde_json::json!({ "profile": "listing", "argv": ["/bin/echo", "hi"] })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await;
+            matches!(&refused, Err(e) if e.to_string().contains("already using profile"))
+        })
+        .await;
+        assert!(
+            bound,
+            "a second profile must be refused on a connection that has minted\n{}",
+            daemon.log()
+        );
+        client.cancel().await.ok();
+    }
+
+    // --- A bad statement reports the database's own complaint. ---
+    {
+        let client = mcp_client(&daemon).await;
+        let err = client
+            .call_tool(
+                CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                    serde_json::json!({
+                        "profile": "analytics",
+                        "sql": "SELECT * FROM no_such_table",
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .expect_err("a bad statement must fail");
+        let text = err.to_string();
+        assert!(
+            text.contains("42P01"),
+            "the SQLSTATE belongs in the message: {text}"
+        );
+        assert!(text.contains("no_such_table"), "{text}");
+        client.cancel().await.ok();
+    }
+
     daemon.shutdown().await;
 
     // ...and the audit log records the SQLSTATE without the statement. A
@@ -379,165 +540,6 @@ async fn a_bad_statement_reports_the_databases_own_complaint() {
         !log.contains("no_such_table"),
         "the caller's SQL reached the audit log:\n{log}"
     );
-}
-
-/// Two tool calls arriving together on a fresh connection must mint once.
-///
-/// `rmcp` runs each request as its own task, so a check-then-act
-/// `ensure_minted` has both find the slot empty, both mint, and the second
-/// overwrite the first — leaving a role that nothing revokes, because the
-/// disconnect can only close the session it can still see.
-#[tokio::test]
-async fn two_concurrent_tool_calls_on_a_fresh_connection_mint_once() {
-    let Some(cluster) = cluster_or_skip("two_concurrent_tool_calls").await else {
-        return;
-    };
-    let mut daemon = Daemon::prepare("metrics_enabled = false\nmaster_source = \"file\"\n");
-    daemon.write_profile("analytics", &db_profile(&cluster));
-    daemon.write_master("pg-master", &cluster.master_password());
-    daemon.start().await.expect("start");
-    let client = mcp_client(&daemon).await;
-
-    let query = |sql: &'static str| {
-        client.call_tool(
-            CallToolRequestParams::new("briefcred_db_query").with_arguments(
-                serde_json::json!({ "profile": "analytics", "sql": sql })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-        )
-    };
-    let (first, second) = tokio::join!(query("SELECT 1 AS a"), query("SELECT 2 AS b"));
-    first.expect("the first call succeeds");
-    second.expect("the second call succeeds");
-
-    assert_eq!(
-        cluster.leaked_role_count().await,
-        1,
-        "two concurrent calls must share one mint, not race to two"
-    );
-
-    client.cancel().await.ok();
-    let cleaned = wait_until(Duration::from_secs(20), || async {
-        cluster.leaked_role_count().await == 0
-    })
-    .await;
-    assert!(
-        cleaned,
-        "a role survived the disconnect, so a session was stranded\n{}",
-        daemon.log()
-    );
-    daemon.shutdown().await;
-
-    let rows = daemon.audit_rows();
-    let mints = rows.iter().filter(|r| r["event"] == "mint").count();
-    assert_eq!(mints, 1, "{rows:#?}");
-    let opened = rows.iter().filter(|r| r["event"] == "session_open").count();
-    let closed = rows
-        .iter()
-        .filter(|r| r["event"] == "session_close")
-        .count();
-    assert_eq!(opened, 1, "one session for one connection");
-    assert_eq!(closed, opened, "every session opened must be closed");
-}
-
-/// `max_rows` must bound what the **server** produces, not only what is
-/// returned.
-///
-/// Timing alone cannot show this. An implementation that asks for every row
-/// and then stops reading also finishes quickly, because dropping the client
-/// closes the connection and the backend is killed — so a stopwatch cannot
-/// tell "the server was asked for six rows" from "the server was asked for a
-/// billion and then hung up on". The difference is real work: rows computed,
-/// bytes written, a connection that had to be destroyed to stop it.
-///
-/// So this counts. `nextval` in the target list runs once per row the server
-/// actually produces, and a sequence's value is **not** rolled back — which
-/// makes it the one side effect that survives the read-only transaction
-/// `briefcred_db_query` runs in, and therefore the one that can be read back
-/// afterwards as a count of server-side work.
-#[tokio::test]
-async fn max_rows_bounds_what_the_server_produces() {
-    let Some(cluster) = cluster_or_skip("max_rows_bounds_what_the_server_produces").await else {
-        return;
-    };
-    // Created before the daemon starts, so it exists when the mint runs
-    // `GRANT USAGE ON ALL SEQUENCES`: a sequence created afterwards would not
-    // be covered and the query would fail on permissions instead.
-    let setup = cluster.connect_master().await;
-    setup
-        .batch_execute("CREATE SEQUENCE rows_produced")
-        .await
-        .expect("the counter sequence");
-
-    let mut daemon = Daemon::prepare("metrics_enabled = false\nmaster_source = \"file\"\n");
-    daemon.write_profile("analytics", &db_profile(&cluster));
-    daemon.write_master("pg-master", &cluster.master_password());
-    daemon.start().await.expect("start");
-    let client = mcp_client(&daemon).await;
-
-    // Mint on a trivial query, so the timed call below is a fetch and not the
-    // one-off cost of starting a helper and creating a role.
-    client
-        .call_tool(
-            CallToolRequestParams::new("briefcred_db_query").with_arguments(
-                serde_json::json!({ "profile": "analytics", "sql": "SELECT 1 AS one" })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-        )
-        .await
-        .expect("the warm-up query runs");
-
-    // A million rows, from a generator in the **target list** rather than in
-    // `FROM`. That distinction is not cosmetic: a set-returning function in
-    // `FROM` is a function scan, which PostgreSQL materialises into a
-    // tuplestore before yielding its first row, so no row limit of any kind
-    // can stop it. In the target list it is a `ProjectSet`, produced lazily,
-    // which is what a portal limit can actually cut short.
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        client.call_tool(
-            CallToolRequestParams::new("briefcred_db_query").with_arguments(
-                serde_json::json!({
-                    "profile": "analytics",
-                    "sql": "SELECT generate_series(1, 1000000) AS i, nextval('rows_produced')",
-                    "max_rows": 5,
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-            ),
-        ),
-    )
-    .await
-    .expect("a bounded fetch returns promptly")
-    .expect("the query runs");
-
-    let result = json_of(&result);
-    assert_eq!(result["row_count"], 5);
-    assert_eq!(result["truncated"], true);
-    assert_eq!(result["rows"][0]["i"], 1);
-
-    // The count of rows the server actually produced. Six: the five asked for
-    // and the one extra that reveals there were more.
-    let produced: i64 = setup
-        .query_one(
-            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM rows_produced",
-            &[],
-        )
-        .await
-        .expect("read the counter")
-        .get(0);
-    assert_eq!(
-        produced, 6,
-        "the server produced {produced} rows for a five-row request"
-    );
-
-    client.cancel().await.ok();
-    daemon.shutdown().await;
 }
 
 /// A statement with no end is ended by the server, not waited out here.
