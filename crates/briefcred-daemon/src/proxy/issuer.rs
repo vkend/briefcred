@@ -214,6 +214,42 @@ mod tests {
     }
 
     #[test]
+    fn a_revoked_grant_stays_refused_for_as_long_as_its_token_still_verifies() {
+        // The regression this guards: the revocation sweep used to drop an
+        // entry at the token's `exp`, while `verify` accepts for
+        // `CLOCK_SKEW_SECS` past it. In that window the signature checked out
+        // and the revocation was gone, so a grant `briefcred exec` had already
+        // retired started working again.
+        let (_dir, issuer) = issuer();
+        let issued = issuer.issue("s1", None, "openai", 900, 1_000).unwrap();
+        issuer.revoke("s1", "openai", issued.expires_at);
+
+        for now in [
+            issued.expires_at - 1,
+            issued.expires_at,
+            issued.expires_at + crate::proxy::token::CLOCK_SKEW_SECS,
+        ] {
+            assert_eq!(
+                issuer.authorize(&issued.token, now).unwrap_err(),
+                TokenError::Revoked,
+                "at {now}"
+            );
+        }
+
+        // Past the skew allowance the token stops verifying on its own, so the
+        // entry has done its job and the refusal changes shape.
+        assert_eq!(
+            issuer
+                .authorize(
+                    &issued.token,
+                    issued.expires_at + crate::proxy::token::CLOCK_SKEW_SECS + 1
+                )
+                .unwrap_err(),
+            TokenError::Expired
+        );
+    }
+
+    #[test]
     fn a_second_exec_in_a_revoked_session_is_a_new_grant_that_also_stops() {
         // The revocation is on the pair, not on the token string, so a token
         // issued after the revoke for the same pair is refused too — which is

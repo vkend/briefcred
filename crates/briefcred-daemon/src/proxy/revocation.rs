@@ -6,16 +6,27 @@
 //! than at its expiry.
 //!
 //! So the daemon keeps a set. It is in memory only, and that is correct rather
-//! than a shortcut: every entry is discardable at exactly the moment the token
-//! it names would have expired anyway, so a daemon restart loses nothing a
-//! token could still be used with. Entries are keyed on `(session, credential)`
-//! rather than on the token string, because that is what a revoke actually
-//! means — this session may no longer use this credential — and because two
-//! `briefcred exec` runs in one session hold two different token strings for
-//! the same grant.
+//! than a shortcut: every entry is discardable once the token it names has
+//! stopped verifying anyway, so a daemon restart loses nothing a token could
+//! still be used with. Entries are keyed on `(session, credential)` rather than
+//! on the token string, because that is what a revoke actually means — this
+//! session may no longer use this credential — and because two `briefcred exec`
+//! runs in one session hold two different token strings for the same grant.
+//!
+//! # The window the sweep has to cover
+//!
+//! "Stopped verifying" is *not* the token's `exp`.
+//! [`crate::proxy::token::TokenSigner::verify`] allows
+//! [`CLOCK_SKEW_SECS`] past it, so an entry dropped at `exp` would leave a
+//! revoked grant working again for the whole of that minute — the token still
+//! verifies, and the revocation that should refuse it has been swept. The
+//! sweep therefore holds every entry until `exp + CLOCK_SKEW_SECS`, which is
+//! exactly as long as the verifier will accept the token it names.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+use crate::proxy::token::CLOCK_SKEW_SECS;
 
 /// Every `(session, credential)` pair the proxy will no longer serve.
 #[derive(Debug, Default)]
@@ -30,12 +41,13 @@ impl RevocationSet {
         RevocationSet::default()
     }
 
-    /// Stop serving `credential` for `sid`, until `expires_at`.
+    /// Stop serving `credential` for `sid`.
     ///
-    /// `expires_at` is when the *token* stops being accepted on its own, in
-    /// Unix seconds. Keeping the entry exactly that long is what stops the set
-    /// growing for the life of the daemon: past it, the token's own `exp` does
-    /// the same job.
+    /// `expires_at` is the token's own `exp`, in Unix seconds. The entry is
+    /// held until [`CLOCK_SKEW_SECS`] past it — the point at which the verifier
+    /// stops accepting the token anyway — which is what stops the set growing
+    /// for the life of the daemon without opening a window where the token
+    /// verifies and the revocation has gone.
     pub fn revoke(&self, sid: &str, credential: &str, expires_at: i64) {
         self.entries
             .lock()
@@ -45,14 +57,17 @@ impl RevocationSet {
 
     /// Whether `credential` has been revoked for `sid` as of `now`.
     ///
-    /// Sweeps expired entries as it goes, so the set is bounded by what is
-    /// still live without needing a timer of its own.
+    /// Sweeps entries whose tokens have stopped verifying as it goes, so the
+    /// set is bounded by what is still live without needing a timer of its own.
     pub fn is_revoked(&self, sid: &str, credential: &str, now: i64) -> bool {
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries.retain(|_, expires_at| *expires_at >= now);
+        // `now - CLOCK_SKEW_SECS`, not `now`: the verifier accepts a token for
+        // that much longer than its `exp`, and an entry swept any earlier is a
+        // revoked grant that works again.
+        entries.retain(|_, expires_at| *expires_at >= now - CLOCK_SKEW_SECS);
         entries.contains_key(&(sid.to_string(), credential.to_string()))
     }
 
@@ -91,11 +106,20 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_is_forgotten_once_the_token_it_names_would_have_expired() {
+    fn an_entry_outlives_the_expiry_by_the_skew_the_verifier_allows() {
+        // The sweep and `TokenSigner::verify` have to agree about when a token
+        // stops existing. The verifier accepts until `exp + CLOCK_SKEW_SECS`,
+        // so an entry dropped at `exp` would leave a revoked grant usable again
+        // for the whole of that window.
         let set = RevocationSet::new();
         set.revoke("s1", "openai", 1_000);
+
         assert!(set.is_revoked("s1", "openai", 1_000), "still live");
-        assert!(!set.is_revoked("s1", "openai", 1_001));
+        assert!(
+            set.is_revoked("s1", "openai", 1_000 + CLOCK_SKEW_SECS),
+            "a token this old still verifies, so it must still be refused"
+        );
+        assert!(!set.is_revoked("s1", "openai", 1_001 + CLOCK_SKEW_SECS));
         assert!(set.is_empty(), "the sweep must not leave the entry behind");
     }
 
