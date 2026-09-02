@@ -142,6 +142,11 @@ impl State {
         &self.helper_dirs
     }
 
+    /// The on-disk layout, for the trust environment.
+    pub fn paths(&self) -> &Arc<Paths> {
+        &self.paths
+    }
+
     /// Where masters come from.
     pub fn master_source(&self) -> &Arc<dyn MasterSource> {
         &self.master_source
@@ -246,10 +251,23 @@ pub async fn shutdown_requested(watcher: &mut tokio::sync::watch::Receiver<bool>
     let _ = watcher.wait_for(|requested| *requested).await;
 }
 
+/// An identifier for one upgraded connection, for its audit rows.
+///
+/// Random rather than a counter: a counter restarts with the daemon, and two
+/// runs would then produce the same `mcp_call_id` for different work.
+fn connection_id() -> String {
+    let mut bytes = [0u8; 6];
+    getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable");
+    format!("mcp-{}", hex::encode(bytes))
+}
+
 /// The request-name to handler map.
 ///
 /// A table rather than a `match` so a new request kind is one entry and one
 /// function, and so [`dispatch_table`] can be asserted to cover the protocol.
+/// It covers [`Request::NAMES`] minus [`Request::UPGRADE_NAMES`]: an upgrade
+/// takes the connection over in [`serve_connection`] and can never reach a
+/// handler that returns one `Response`.
 pub fn dispatch_table() -> HashMap<&'static str, Handler> {
     let mut table: HashMap<&'static str, Handler> = HashMap::new();
     table.insert("ping", handler!(handle_ping));
@@ -426,7 +444,7 @@ async fn handle_unlock(request: Request, state: Arc<State>) -> Response {
 /// Factored out of [`handle_open_session`] so `Unlock` cannot drift away from
 /// it: two code paths that both decide "may this profile be used now" would be
 /// two chances to get the ordering wrong.
-async fn prove_presence(
+pub(crate) async fn prove_presence(
     state: &Arc<State>,
     profile: &briefcred_core::Profile,
     client_headless: bool,
@@ -854,6 +872,23 @@ async fn serve_connection(
 
         let name = request.name();
         state.metrics().record_request(name);
+
+        // An upgrade is answered once and then owns the connection: the
+        // dispatch table's handlers return a `Response` and have no way to
+        // reach the stream, which is exactly the shape a protocol that is not
+        // request/response cannot fit into.
+        if request.is_upgrade() {
+            let ready = Response::McpReady {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            if let Err(err) = write_frame(&mut stream, &ready).await {
+                eprintln!("briefcred-daemon: cannot acknowledge an upgrade: {err}");
+                return;
+            }
+            crate::mcp::serve(stream, state, connection_id()).await;
+            return;
+        }
+
         // The table is asserted to cover `Request::NAMES`, so the `None` arm
         // is unreachable in a build whose tests pass. It stays because a
         // daemon that answers "I do not know that request" is better than one
@@ -1047,13 +1082,27 @@ mod tests {
     fn the_table_covers_every_request_the_protocol_defines() {
         let table = dispatch_table();
         for name in Request::NAMES {
+            if Request::UPGRADE_NAMES.contains(name) {
+                assert!(
+                    !table.contains_key(name),
+                    "`{name}` takes the connection over; a handler for it could never run"
+                );
+                continue;
+            }
             assert!(table.contains_key(name), "no handler for `{name}`");
         }
         assert_eq!(
             table.len(),
-            Request::NAMES.len(),
+            Request::NAMES.len() - Request::UPGRADE_NAMES.len(),
             "the table has handlers the protocol does not define"
         );
+    }
+
+    #[test]
+    fn a_connection_id_is_unique_per_connection() {
+        let ids: std::collections::BTreeSet<_> = (0..128).map(|_| connection_id()).collect();
+        assert_eq!(ids.len(), 128);
+        assert!(ids.iter().all(|id| id.starts_with("mcp-")));
     }
 
     #[tokio::test]

@@ -40,8 +40,11 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "process", "signal", "sync"] }
+tokio-postgres.workspace = true
 toml.workspace = true
 zeroize.workspace = true
+rmcp = { version = "3.2.0", default-features = false, features = ["server", "macros", "schemars", "transport-async-rw"] }
+schemars = "1.2.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true

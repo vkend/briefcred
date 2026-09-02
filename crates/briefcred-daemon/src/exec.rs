@@ -132,6 +132,35 @@ pub async fn mint(
     raw_args: bool,
     metrics: &crate::metrics::Metrics,
 ) -> Result<Minted, ExecError> {
+    let mut minted = mint_only(profile, specs, masters, helpers, trust, metrics).await?;
+    minted.rows.push(AuditEntry::ExecStart {
+        ts: OffsetDateTime::now_utc(),
+        session_id: session_id.to_string(),
+        mint_ids: minted.pending.iter().map(|p| p.mint_id.clone()).collect(),
+        profile: profile.name.clone(),
+        argv0: argv0.to_string(),
+        args_sha256: args.iter().map(|a| hash_arg(a)).collect(),
+        args: raw_args.then(|| args.to_vec()),
+        pid,
+    });
+    Ok(minted)
+}
+
+/// Mint and compose, without claiming a subprocess is about to start.
+///
+/// [`mint`] is this plus an `ExecStart` row, and `briefcred exec` wants both.
+/// The MCP server wants only this half: `briefcred_db_query` runs a query
+/// inside the daemon and spawns nothing, so an `ExecStart` naming a program
+/// that does not exist would be a fabricated row in a log whose whole value is
+/// that it is not fabricated. It writes an `McpCall` row instead.
+pub async fn mint_only(
+    profile: &Profile,
+    specs: &[&CredentialSpec],
+    masters: &BTreeMap<String, Zeroizing<String>>,
+    helpers: &MinterSet,
+    trust: &BTreeMap<String, String>,
+    metrics: &crate::metrics::Metrics,
+) -> Result<Minted, ExecError> {
     let mut rows: Vec<AuditEntry> = Vec::new();
     let mut summaries: Vec<MintSummary> = Vec::new();
     let mut fields: MintedFields = MintedFields::new();
@@ -181,17 +210,6 @@ pub async fn mint(
         .into_iter()
         .map(|(k, v)| (k, SecretString::from(v)))
         .collect();
-
-    rows.push(AuditEntry::ExecStart {
-        ts: OffsetDateTime::now_utc(),
-        session_id: session_id.to_string(),
-        mint_ids: pending.iter().map(|p| p.mint_id.clone()).collect(),
-        profile: profile.name.clone(),
-        argv0: argv0.to_string(),
-        args_sha256: args.iter().map(|a| hash_arg(a)).collect(),
-        args: raw_args.then(|| args.to_vec()),
-        pid,
-    });
 
     Ok(Minted {
         mints: summaries,

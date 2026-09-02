@@ -208,6 +208,15 @@ pub struct Client {
 }
 
 impl Client {
+    /// The underlying stream, for a request that upgrades the connection.
+    ///
+    /// `Request::Mcp` hands the socket to the daemon's MCP server, so a test
+    /// that sends one has to keep speaking on the same stream rather than
+    /// framing another request onto it.
+    pub fn into_stream(self) -> UnixStream {
+        self.stream
+    }
+
     /// Send one request and read its answer.
     pub async fn send(&mut self, request: Request) -> Result<Response, String> {
         write_frame(&mut self.stream, &request)

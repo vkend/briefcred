@@ -83,6 +83,41 @@ pub enum AuditEntry {
         /// Wall-clock runtime.
         duration_ms: u64,
     },
+    /// A Model Context Protocol tool call finished.
+    ///
+    /// The row an operator reads to answer "what did the agent ask for, and
+    /// what did briefcred give it". `mcp_call_id` is what ties it to the
+    /// `Mint`, `ExecStart` and `Revoke` rows the call caused: those name the
+    /// mints, and this names the mints and the call together.
+    ///
+    /// The tool's *arguments* are not here. A `briefcred_db_query` carries SQL
+    /// and a `briefcred_exec` carries a command line, and both are exactly the
+    /// free-form text an audit row must never hold; the `ExecStart` row a
+    /// `briefcred_exec` writes records `argv[0]` and digests of the rest on
+    /// the same terms as every other exec.
+    McpCall {
+        /// When it finished.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// Identifier for this call, unique within the daemon's lifetime.
+        mcp_call_id: String,
+        /// The tool that was called, for example `briefcred_db_query`.
+        tool: String,
+        /// The profile it acted on, when it named one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        /// The principals the call used, in declaration order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mint_ids: Vec<MintId>,
+        /// `ok` or `error`.
+        outcome: String,
+        /// Why it failed. Present only when `outcome` is `error`, and never
+        /// the caller's own text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// How long the call took.
+        duration_ms: u64,
+    },
     /// A revoke attempt finished.
     Revoke {
         /// When it happened.
@@ -222,8 +257,8 @@ impl AuditEntry {
 
     /// Every principal this row is about, in the order the row records them.
     ///
-    /// A `Mint` or a `Revoke` is about exactly one. An `ExecStart` or an
-    /// `ExecEnd` is about however many that run carried. Daemon-lifecycle,
+    /// A `Mint` or a `Revoke` is about exactly one. An `ExecStart`, an
+    /// `ExecEnd`, or an `McpCall` is about however many that run carried. Daemon-lifecycle,
     /// session, and authentication rows describe the daemon rather than a
     /// principal, so they are about none.
     pub fn mint_ids(&self) -> &[MintId] {
@@ -231,9 +266,9 @@ impl AuditEntry {
             AuditEntry::Mint { mint_id, .. } | AuditEntry::Revoke { mint_id, .. } => {
                 std::slice::from_ref(mint_id)
             }
-            AuditEntry::ExecStart { mint_ids, .. } | AuditEntry::ExecEnd { mint_ids, .. } => {
-                mint_ids
-            }
+            AuditEntry::ExecStart { mint_ids, .. }
+            | AuditEntry::ExecEnd { mint_ids, .. }
+            | AuditEntry::McpCall { mint_ids, .. } => mint_ids,
             AuditEntry::DaemonStart { .. }
             | AuditEntry::DaemonStop { .. }
             | AuditEntry::AuthReject { .. }

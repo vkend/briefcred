@@ -8,7 +8,7 @@ use briefcred_proto::Response;
 use clap::{Parser, Subcommand};
 
 use crate::error::{Error, Result};
-use crate::{audit, bootstrap, ca, client, exec, install, lifecycle, trust};
+use crate::{audit, bootstrap, ca, client, exec, install, lifecycle, mcp, trust};
 
 /// A local, biometric-gated credential broker for AI agents and tooling.
 #[derive(Debug, Parser)]
@@ -84,6 +84,13 @@ pub enum Command {
     Profiles,
     /// Report whether briefcred is working, and what is missing if not.
     Health,
+    /// Serve briefcred's Model Context Protocol tools on stdin and stdout.
+    ///
+    /// Run by an MCP client, not by a person: it speaks JSON-RPC on its
+    /// standard streams and prints nothing a human would want to read. The
+    /// tools it exposes run inside the daemon, so no credential is ever
+    /// returned to the client.
+    Mcp,
     /// Print audit rows.
     Audit {
         /// Only rows from the last `30m`, `24h`, `7d`, and so on.
@@ -215,6 +222,10 @@ pub async fn run(cli: Cli) -> Result<u8> {
         }
         Command::Health => {
             print_health(&paths).await;
+            Ok(0)
+        }
+        Command::Mcp => {
+            mcp::bridge(paths.sock()).await?;
             Ok(0)
         }
         Command::Audit { since, json } => {

@@ -25,7 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "time", "io-std"] }
 toml.workspace = true
 zeroize.workspace = true
 

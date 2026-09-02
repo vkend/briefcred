@@ -16,6 +16,7 @@ pub mod exec;
 pub mod heapscan;
 pub mod helper;
 pub mod inproc;
+pub mod mcp;
 pub mod metrics;
 pub mod profiles;
 pub mod reconcile;

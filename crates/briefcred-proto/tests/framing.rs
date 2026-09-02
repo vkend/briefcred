@@ -274,6 +274,7 @@ fn the_name_list_covers_every_request_variant_exactly_once() {
             argv0: "psql".into(),
             args: vec![],
         },
+        Request::Mcp,
         #[cfg(feature = "debug-heapscan")]
         Request::HeapScan {
             needle_sha256: "00".into(),
@@ -336,4 +337,25 @@ fn open_session_without_the_headless_flag_does_not_deserialise() {
             client_headless: true,
         }
     );
+}
+
+/// The upgrade names have to be real request names, or the daemon's dispatch
+/// table would exclude a handler nothing ever removes.
+#[test]
+fn every_upgrade_is_a_request_the_protocol_defines() {
+    for name in Request::UPGRADE_NAMES {
+        assert!(Request::NAMES.contains(name), "`{name}` is not a request");
+    }
+    assert!(Request::Mcp.is_upgrade());
+    assert!(!Request::Ping.is_upgrade());
+}
+
+/// The acknowledgement that hands the socket over carries no credential.
+#[test]
+fn the_mcp_acknowledgement_is_metadata_only() {
+    let json = serde_json::to_string(&Response::McpReady {
+        version: "0.1.0".into(),
+    })
+    .unwrap();
+    assert_eq!(json, r#"{"response":"mcp_ready","version":"0.1.0"}"#);
 }

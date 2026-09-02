@@ -645,12 +645,29 @@ async fn connect(
     config: &PostgresConfig,
     master: &Zeroizing<String>,
 ) -> Result<tokio_postgres::Client> {
+    connect_as(config, &config.user, master).await
+}
+
+/// Connect to the cluster `config` names as an arbitrary role.
+///
+/// The master connection uses `config.user`; this exists for the one caller
+/// that has to connect as a role briefcred *minted* rather than as the master
+/// — the daemon's MCP `db_query` tool, which runs a query with the credential
+/// it just created and never hands that credential out. It is here rather than
+/// there so that the TLS policy, the root store, and the `application_name`
+/// are the ones this module already reasons about, and so a change to any of
+/// them cannot apply to one connection and not the other.
+pub async fn connect_as(
+    config: &PostgresConfig,
+    user: &str,
+    password: &Zeroizing<String>,
+) -> Result<tokio_postgres::Client> {
     let mut pg = tokio_postgres::Config::new();
     pg.host(&config.host)
         .port(config.port)
         .dbname(&config.dbname)
-        .user(&config.user)
-        .password(master.as_bytes())
+        .user(user)
+        .password(password.as_bytes())
         .application_name("briefcred")
         .ssl_mode(config.sslmode.into());
 

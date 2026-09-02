@@ -59,7 +59,7 @@ tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde", "serde-well-known"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-tokio-postgres = { version = "0.7", features = ["with-time-0_3"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-time-0_3"] }
 tokio-postgres-rustls = "0.14"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 toml = "0.9"

@@ -16,6 +16,7 @@ pub mod error;
 pub mod exec;
 pub mod install;
 pub mod lifecycle;
+pub mod mcp;
 pub mod service;
 pub mod trust;
 

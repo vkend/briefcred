@@ -122,6 +122,30 @@ pub enum Request {
         #[serde(default)]
         hold_until_expiry: bool,
     },
+    /// Turn this connection into a Model Context Protocol stream.
+    ///
+    /// This is the one request that does not have a matching reply and then
+    /// carry on. The daemon answers [`Response::McpReady`] and then **stops
+    /// framing**: everything after that acknowledgement, in both directions,
+    /// is the newline-delimited JSON-RPC an MCP client speaks. The connection
+    /// is finished with when the stream closes.
+    ///
+    /// # Why an upgrade rather than a request per message
+    ///
+    /// MCP is not request/response. A server sends notifications nothing
+    /// asked for, a client sends notifications that get no reply, and a
+    /// long-running tool call may be interleaved with other traffic. Wrapping
+    /// each line in a `Request`/`Response` pair would need the daemon to
+    /// invent a reply for a notification and would serialise a protocol that
+    /// is not serial. Handing the socket over instead means `briefcred mcp` is
+    /// a byte pump with no opinion about MCP at all, and the MCP server
+    /// implementation is the only thing that has to understand the protocol.
+    ///
+    /// The socket is still mode `0600` in a `0700` directory and the peer's
+    /// uid is still checked before this request is read, so the upgrade
+    /// widens no boundary. What it does widen is *capability*: see
+    /// `THREAT_MODEL.md`.
+    Mcp,
     /// Ask whether a command *would* be permitted, minting nothing.
     ///
     /// The hook's question. It runs before the agent's tool call, so it must
@@ -164,6 +188,7 @@ impl Request {
             Request::CloseSession { .. } => "close_session",
             Request::Unlock { .. } => "unlock",
             Request::Exec { .. } => "exec",
+            Request::Mcp => "mcp",
             Request::ExecDone { .. } => "exec_done",
             Request::HookCheck { .. } => "hook_check",
             #[cfg(feature = "debug-heapscan")]
@@ -171,7 +196,7 @@ impl Request {
         }
     }
 
-    /// Every variant name the daemon must have a handler for.
+    /// Every variant name the daemon must answer, one way or another.
     pub const NAMES: &'static [&'static str] = &[
         "ping",
         "status",
@@ -182,11 +207,25 @@ impl Request {
         "close_session",
         "unlock",
         "exec",
+        "mcp",
         "exec_done",
         "hook_check",
         #[cfg(feature = "debug-heapscan")]
         "heap_scan",
     ];
+
+    /// The requests that take the connection over rather than being answered
+    /// from the dispatch table.
+    ///
+    /// The daemon's table is asserted to cover [`Request::NAMES`] *minus*
+    /// these, so a new request still cannot be forgotten and an upgrade is not
+    /// quietly given a handler that could never run.
+    pub const UPGRADE_NAMES: &'static [&'static str] = &["mcp"];
+
+    /// Whether this request takes the connection over.
+    pub fn is_upgrade(&self) -> bool {
+        Request::UPGRADE_NAMES.contains(&self.name())
+    }
 }
 
 /// A message from the daemon back to a client.
@@ -273,6 +312,17 @@ pub enum Response {
     ExecRecorded {
         /// How many principals were enqueued for revoke.
         queued: usize,
+    },
+    /// Answer to [`Request::Mcp`]: everything after this frame is MCP.
+    ///
+    /// Carries the daemon's version so a client can tell what it is talking
+    /// to before it sends an `initialize`, and nothing else. There is no
+    /// credential material on this path and there never will be: the whole
+    /// point of hosting the MCP server in the daemon is that a minted
+    /// credential is used there and does not leave.
+    McpReady {
+        /// The daemon binary's crate version.
+        version: String,
     },
     /// Answer to [`Request::HookCheck`].
     HookDecision {
