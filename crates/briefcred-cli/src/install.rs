@@ -30,6 +30,10 @@ pub const STARTER_CONFIG: &str = "\
 # How many days of audit logs to keep.
 # retention_days = 90
 
+# Seconds a daemon replaced by 'briefcred daemon upgrade' gives the requests
+# and streams it was already serving before it exits.
+# handoff_drain_secs = 30
+
 # The loopback port for the Prometheus endpoint. 0 asks for a free port.
 # metrics_port = 9317
 

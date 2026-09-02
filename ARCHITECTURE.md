@@ -306,6 +306,15 @@ pays for it in noise: stderr at every load, a banner above
     name, and connection settings. Never a master, never a minted secret.
 16. `SecretString` is the only serialisable secret type, it exists only on the
     daemon-to-helper pipe and the `Minted` reply, and it prints `<redacted>`.
+17. A handoff never writes a secret anywhere. The state blob exists in the
+    outgoing daemon's memory, crosses a `0600` socket in a `0700` directory,
+    and is dropped; every master in it is encrypted to the incoming daemon's
+    ephemeral X25519 key before it is serialised, so the blob is readable by
+    exactly one process even in a core file or a socket trace.
+18. Nothing about the outgoing daemon changes until the incoming one confirms
+    it is serving. A handoff that fails at any step leaves a daemon that is
+    still listening, still holding its sessions, and still the only owner of
+    the sockets.
 
 ## The helper protocol
 
@@ -721,6 +730,69 @@ The idle sweep and the unlock cache both read a `Clock` rather than
 `Instant::now`, so their boundaries are tested against a stopped clock instead
 of a sleep. The clock is monotonic: a session must not become immortal, or
 instantly stale, because the laptop resynchronised NTP.
+
+A session is also owned entirely by itself. Its masters, its mints, its token
+bucket and its HTTP counters are its own values, not shares of a per-profile
+object, so twenty concurrent runs of one profile get twenty budgets and twenty
+sets of principals — and no request against one can see or spend another's. The
+`SessionStore`'s map is the only shared thing, and it is behind an `RwLock` held
+for the length of a lookup rather than the length of a mint: a handler takes the
+`Arc`s it needs and lets go, so a round trip to a database never serialises the
+daemon.
+
+## Handing the daemon over
+
+`briefcred daemon upgrade` replaces the process without closing a socket. The
+whole design is one ordering claim: **nothing about the outgoing daemon changes
+until the incoming one has said it is serving.**
+
+```
+briefcred daemon upgrade
+  |
+  |-- spawn: briefcred-daemon --takeover <state/handoff-<rand>.sock>
+  |                                  |-- bind 0600, generate an ephemeral X25519 pair
+  |                                  `-- wait. nothing else is bound.
+  |
+  `-- Request::Handoff{socket} --> old daemon
+                                     |-- connect, check peer uid
+                                     |<-- Hello{version, pid, ephemeral_pubkey}
+                                     |
+                                     |-- sendmsg: SCM_RIGHTS[ipc, metrics, proxy, pgproxy]
+                                     |            + Envelope{ blob, Ed25519 over its bytes }
+                                     |              blob.sessions[].masters_enc =
+                                     |                ChaCha20-Poly1305(X25519(ephemeral))
+                                     |                                  |
+                                     |          verify signature -------+
+                                     |          decrypt, rebuild sessions, restore revocations
+                                     |          adopt fds, start accepting
+                                     |<-- Ready{pid, sessions}
+                                     |
+                                     |-- stop accepting, drain in-flight
+                                     |   (requests, SSE relays, WebSocket relays)
+                                     |-- audit, wipe masters *without* revoking
+                                     `-- exit 0
+```
+
+Four details carry most of the weight:
+
+- **The Unix socket travels as a descriptor.** Nothing unlinks `sock`, so a
+  client connecting during the swap is never told "no such file", and the
+  outgoing daemon deliberately does not remove the file on its way out.
+- **The signature is checked before the JSON is parsed.** A same-uid process
+  can connect to the takeover socket, but it cannot choose the shape of what
+  gets deserialised without first reading the token-signer key out of the key
+  store.
+- **Ages, not instants.** `opened_at` and `last_used` cross as milliseconds
+  before the blob was issued, and the incoming daemon's `SystemClock` is
+  backdated by the oldest of them, so the idle timers resume rather than reset.
+- **The drain counts more than connections.** A `CONNECT` tunnel completes its
+  connection future as soon as it is upgraded, and a WebSocket relay is a task
+  of its own, so both take an `InFlight` guard directly. Without that the drain
+  would report zero while a stream was still running.
+
+On Linux the same descriptors can also come from systemd: `briefcred install`
+writes a `briefcred.socket` unit, and the daemon adopts `LISTEN_FDS` in the
+order that unit lists them — but only when `LISTEN_PID` names its own process.
 
 ## The root CA
 

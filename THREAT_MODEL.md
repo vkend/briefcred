@@ -37,6 +37,13 @@ weakens a guarantee has to say so out loud before it ships.
    bytes, checked against a trust root the operator listed in `daemon.toml` —
    not by the transport it arrived over, and not by who hosts it.
 
+7. **Daemon / daemon boundary.** `briefcred daemon upgrade` hands one process's
+   listening sockets and open sessions to another. Both run as the same user,
+   so this boundary is *inside* boundary 2 and cannot be a defence against a
+   local attacker — but the material crossing it is the most valuable briefcred
+   holds, so it is authenticated and encrypted anyway. See **The handoff** below
+   for what that buys and what it does not.
+
 ## Attacker model
 
 **In scope.**
@@ -525,6 +532,64 @@ an attacker who can write to `profiles/` is running as the user and is already
 inside boundary 1, where they could equally rewrite `daemon.toml`, add their
 own trust root, or run the credential-bearing subprocess directly.
 
+## The handoff
+
+`briefcred daemon upgrade` moves every open session's master credential from one
+process to another over a Unix socket. That is a copy of the daemon's most
+dangerous state, so it is worth being exact about what protects it.
+
+### What it is bounded by
+
+- **The socket.** Mode `0600`, in the `0700` state directory, at a path drawn
+  from the OS CSPRNG per attempt. The incoming daemon checks the connecting
+  peer's uid before it says a word, exactly as the IPC socket does.
+- **Confidentiality.** Every master is encrypted with ChaCha20-Poly1305 under a
+  key agreed by X25519 against an ephemeral public key the incoming daemon
+  generates when it binds the socket and never persists. A fresh nonce per
+  master; the shared secret is hashed with a domain separator and both public
+  keys, so it cannot be replayed as a key for anything else. The ciphertext is
+  readable by exactly one process, and by nothing that later reads a core file,
+  a socket trace, or the outgoing daemon's memory.
+- **Authenticity.** The blob is signed with the machine's Ed25519 token-signer
+  key — the same key the proxy signs synthetic tokens with — and the signature
+  is verified **before the JSON is parsed**. A process that can reach the
+  takeover socket but cannot read that key out of the login keychain cannot
+  make the new daemon adopt anything, and cannot even choose the shape of what
+  gets deserialised.
+- **Durability: none, deliberately.** No plaintext master, no minted token and
+  no signing key is written to a file at any point in a handoff. The blob is
+  built in memory, sent, and dropped.
+- **Failing closed.** The incoming daemon answers `ready` only after it has
+  verified, decrypted, rebuilt and started accepting. Anything short of that is
+  a `refused`, and the outgoing daemon keeps running with its sockets and its
+  sessions untouched. An upgrade that half happened would be two daemons each
+  believing they own the socket, which is worse than one that did not happen.
+- **Continuity of every other control.** Quota buckets resume at their position,
+  HTTP counters resume at their totals, the proxy's revocation set moves across,
+  and each session keeps its per-session public key. An upgrade is therefore not
+  a way to refill a `quota:`, to reset a `context.resp_bytes_so_far` budget, to
+  un-revoke a grant, or to shed a `DPoP` binding.
+
+### What it is not bounded by, and this is the important part
+
+- **A same-uid attacker who can read the key store is inside it.** The signature
+  proves "this machine's briefcred", not "the binary you meant to upgrade to".
+  A local process running as you can already read the token-signer key, connect
+  to the IPC socket, open sessions, and be handed minted credentials; being able
+  to stand up a daemon that adopts a handoff is not a new capability, it is the
+  same one wearing a different hat. Boundary 2 is where this is decided, and
+  nothing here moves it.
+- **The binary is not verified.** `--binary <path>` runs what it is pointed at.
+  briefcred does not check a code signature, a hash, or a publisher; a user who
+  can write to the path the CLI resolves can already replace the daemon the
+  service manager starts at the next login.
+- **The handoff copies masters that were already resident.** It does not make a
+  master live longer than its session, but for the length of the swap the same
+  master exists in two processes. Both wipe it: the incoming daemon on its own
+  session lifecycle, the outgoing one when it drops the session on the way out.
+- **A drain has a deadline.** A stream still open when `handoff_drain_secs`
+  expires is cut. The outgoing daemon says so on its log; nothing else notices.
+
 ## Known limitations, stated plainly
 
 - A local process running as the same user is inside every boundary. briefcred
@@ -555,6 +620,10 @@ own trust root, or run the credential-bearing subprocess directly.
 - The revoke queue gives up after eight attempts. A backend that is unreachable
   for longer leaves a principal behind until the reconciler's next sweep, which
   is bounded by the profile's `ttl_secs` in how long that principal is useful.
+- A handoff authenticates the machine, not the binary. `briefcred daemon
+  upgrade` will hand every open session's master to whatever `--binary` names,
+  provided it can read the token-signer key — which any process running as you
+  already can. See **The handoff** above.
 
 
 ## Phase 10: the Postgres proxy, and Model A for PostgreSQL

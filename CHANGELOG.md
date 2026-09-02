@@ -8,6 +8,55 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Added
 
+- **Zero-downtime upgrade**, and with it Phase 7 of the roadmap.
+  `briefcred daemon upgrade [--binary <path>]` replaces the running daemon
+  without closing a socket. The CLI starts the new binary with
+  `--takeover <socket>`; the old daemon passes it the four listening
+  descriptors — IPC, metrics, HTTP proxy, Postgres proxy — over `SCM_RIGHTS`
+  together with a signed blob of every open session, and stands down only once
+  the new daemon has confirmed it is serving. The Unix socket travels as a
+  descriptor rather than being unlinked and rebound, so a client connecting
+  during the swap is never told "no such file", and the ports do not move.
+- **Masters cross the handoff encrypted to the daemon taking over.** The new
+  daemon generates an ephemeral X25519 key pair when it binds the takeover
+  socket and advertises the public half; each master is sealed with
+  ChaCha20-Poly1305 under a key agreed against it, with a fresh nonce per
+  master. No plaintext master, token, or signing key is written anywhere during
+  a handoff: the blob exists in memory, crosses a `0600` socket in a `0700`
+  directory, and is dropped.
+- **The blob is signed with the machine's token-signer key** — the same Ed25519
+  key the proxy signs synthetic tokens with — and the signature is checked
+  before the JSON is parsed. A same-uid process can connect to the takeover
+  socket, but it cannot produce a blob the new daemon will adopt without first
+  reading a key out of the login keychain.
+- **A session survives the upgrade whole.** Its identifier, profile, age, mints,
+  quota position, HTTP counters and per-session public key all move across, so a
+  client's handle keeps working, the idle timer resumes where it left off, and
+  neither a quota nor a `context.resp_bytes_so_far` budget is refilled by an
+  upgrade. The proxy's revocation set moves too, so the new daemon does not
+  start serving grants the old one had already retired.
+- **In-flight work is drained rather than cut.** The outgoing daemon stops
+  accepting and then waits for the requests and streams it was already serving —
+  including the ones inside a `CONNECT` tunnel and a relayed WebSocket, which
+  outlive the connection future that produced them — bounded by the new
+  `handoff_drain_secs`, thirty seconds by default. Its sessions are wiped
+  without being revoked: the daemon that took them over is holding them, and
+  queueing their revokes would kill credentials it is still serving.
+- **`briefcred_handoffs_total{outcome}`**, with `handed_over`, `adopted` and
+  `failed` seeded at zero, and a **`daemon_handoff` audit row** written by both
+  daemons, so the log shows which process was serving at any moment. A session
+  that moved closes with reason `handoff` rather than `shutdown`.
+- **systemd socket activation on Linux.** `briefcred install` now writes a
+  `briefcred.socket` unit alongside the service unit, and the daemon honours
+  `LISTEN_FDS` for its initial bind — but only when `LISTEN_PID` names its own
+  process, so an inherited environment cannot make it adopt descriptors meant
+  for something else. The unit's `ListenStream=` order and the daemon's
+  adoption order are one fact written in two places, and both are snapshot- and
+  unit-tested.
+- **`docs/upgrade.md`**: the whole sequence, what an upgrade does and does not
+  guarantee, what happens when it fails, and how the launchd and systemd units
+  fit around a process the service manager did not start.
+
 - **Streaming through the HTTP proxy**, and with it Phase 6 of the roadmap.
   Server-sent events and WebSocket now cross the proxy, and both go through the
   same checks as any other request first — the token, the quota, and the Cedar

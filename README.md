@@ -173,6 +173,31 @@ asserted in a test to cover every request the protocol defines.
 it stops accepting, gives in-flight connections five seconds to finish, removes
 the socket file, and writes a `daemon_stop` row.
 
+### Upgrading without downtime
+
+`briefcred daemon upgrade` replaces the running daemon with a new binary
+without closing a socket. It starts the new daemon with `--takeover <socket>`,
+and the old one passes it the four listening descriptors over `SCM_RIGHTS`
+together with a signed blob of every open session — masters encrypted to the
+new daemon's ephemeral X25519 key, so no plaintext master ever touches the disk
+or an unencrypted channel. The old daemon stands down only once the new one has
+confirmed it is serving, and then drains what it was already handling.
+
+```console
+$ briefcred daemon upgrade
+upgrading pid 4102 to /opt/briefcred/bin/briefcred-daemon
+daemon upgraded: pid 4102 handed 3 session(s) to pid 4188
+the sockets never closed; pid 4102 is draining what it had in flight
+```
+
+A session handle a client already holds keeps working against the new process,
+the ports do not move, and an event stream or WebSocket that was open before
+the upgrade runs to its end. Every failure before the confirmation leaves the
+running daemon exactly as it was. On Linux, `briefcred install` also writes a
+`briefcred.socket` unit so systemd can hold the listeners across an ordinary
+restart. `docs/upgrade.md` has the whole sequence, what it does and does not
+guarantee, and how the service manager fits around it.
+
 ### Configuration
 
 `daemon.toml` lives at the root of the briefcred home. Every key is optional.
@@ -190,6 +215,7 @@ the socket file, and writes a `daemon_stop` row.
 | `pgproxy.allow_md5` | `false` | Permit MD5 when an upstream database asks for it |
 | `upstream_roots` | none | **For tests.** A PEM bundle of extra CAs the proxy trusts upstream |
 | `session_idle_secs` | `1800` | Seconds a session may go untouched before it is wiped |
+| `handoff_drain_secs` | `30` | Seconds a replaced daemon gives its in-flight requests and streams |
 | `master_source` | platform default | `"keychain"`, `"file"`, or `"env"` |
 | `ca.keystore` | platform default | `"keychain"` or `"file"`; where the CA key lives |
 | `profiles.trust_roots` | `[]` | Minisign public key lines whose signatures vouch for a registry profile |
@@ -346,6 +372,7 @@ always run whatever you liked with it. `THREAT_MODEL.md` says this at length.
 | `briefcred profile verify <file> --pub <path>` | Check a profile against its `.minisig`. Accepts signatures from stock `minisign` too. |
 | `briefcred profile sync` | Fetch every registry in `daemon.toml`, verifying as it goes. |
 | `briefcred mcp` | Serve the Model Context Protocol tools on stdin and stdout, for an agent. |
+| `briefcred daemon upgrade [--binary <path>]` | Replace the running daemon in place, keeping every socket and session. |
 
 `briefcred profile bootstrap` asks for the master credential **last**, after the
 unlock gate has said yes, and writes it straight to the platform key store. The
