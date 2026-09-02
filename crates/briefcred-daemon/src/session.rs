@@ -16,6 +16,7 @@
 //!   life of the login.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ use zeroize::Zeroizing;
 
 use crate::clock::Clock;
 use crate::helper::MinterSet;
+use crate::quota::TokenBucket;
 use crate::revoke::PendingRevoke;
 
 /// How often the eviction task looks for idle sessions.
@@ -72,6 +74,55 @@ pub struct Session {
     /// keeping the whole session map locked for the length of a round trip to
     /// a database.
     pub helpers: Arc<MinterSet>,
+    /// This session's share of the profile's `quota`, when it has one.
+    ///
+    /// Per session rather than per profile, so two concurrent runs of the same
+    /// profile get a budget each. Dying with the session is the point: a quota
+    /// bounds one run's blast radius, and one that outlived its session would
+    /// refuse work on behalf of something that no longer exists.
+    pub quota: Option<Arc<TokenBucket>>,
+    /// What this session has done through the HTTP proxy so far.
+    ///
+    /// An `Arc` of atomics rather than fields on the session, because the proxy
+    /// reads and increments them per request and holding the session map's lock
+    /// for the length of a forwarded response would serialise the whole proxy.
+    pub http: Arc<HttpCounters>,
+}
+
+/// Per-session HTTP proxy counters, for the Cedar `context`.
+///
+/// Counters and not a quota: these never refuse anything on their own. They are
+/// what lets a policy say "this session has had enough", which is a different
+/// control from a rate — a byte budget is a total, and a bucket is a speed.
+#[derive(Debug, Default)]
+pub struct HttpCounters {
+    requests: AtomicU64,
+    resp_bytes: AtomicU64,
+}
+
+impl HttpCounters {
+    /// Count one request, and report how many came *before* it.
+    ///
+    /// Before rather than including, so the first request of a session sees
+    /// zero and `context.requests_so_far < 100` permits exactly one hundred.
+    pub fn begin_request(&self) -> u64 {
+        self.requests.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Add the bytes one response returned to the client.
+    pub fn add_resp_bytes(&self, bytes: u64) {
+        self.resp_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes returned to this session so far.
+    pub fn resp_bytes(&self) -> u64 {
+        self.resp_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Requests this session has made so far.
+    pub fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for Session {
@@ -84,6 +135,8 @@ impl std::fmt::Debug for Session {
             .field("masters", &self.masters.keys().collect::<Vec<_>>())
             .field("mints", &self.mints.keys().collect::<Vec<_>>())
             .field("bound_to_a_session_key", &self.pubkey.is_some())
+            .field("quota", &self.quota)
+            .field("http", &self.http)
             .finish()
     }
 }
@@ -187,6 +240,14 @@ impl SessionStore {
             mints: BTreeMap::new(),
             pubkey,
             helpers: Arc::new(MinterSet::new(helper_dirs)),
+            // Built here, from the profile as it stood when the session was
+            // opened. A profile edited mid-session does not silently hand a
+            // running agent a bigger budget.
+            quota: profile
+                .quota
+                .as_ref()
+                .map(|quota| Arc::new(TokenBucket::new(quota, Arc::clone(&self.clock)))),
+            http: Arc::new(HttpCounters::default()),
         };
         let id = session.id.clone();
         let expires_at = session.expires_at(now, self.idle_for);
@@ -661,6 +722,72 @@ credentials:
             .await
             .unwrap();
         assert!(store.contains(&id).await);
+    }
+
+    #[tokio::test]
+    async fn a_session_gets_its_own_bucket_from_the_profile() {
+        let clock = TestClock::new();
+        let store = store(clock.clone(), Duration::from_secs(1800));
+        let profile = profile("name: dev\nquota:\n  rate: 10\n  burst: 2\n");
+
+        let (first, _) = store
+            .open(&profile, &source(), Vec::new(), None)
+            .await
+            .unwrap();
+        let (second, _) = store
+            .open(&profile, &source(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let bucket = |id: &str| {
+            let store = &store;
+            let id = id.to_string();
+            async move {
+                store
+                    .with_session(&id, |s| s.quota.clone())
+                    .await
+                    .unwrap()
+                    .expect("the profile declares a quota")
+            }
+        };
+
+        let first_bucket = bucket(&first).await;
+        first_bucket.charge().outcome.unwrap();
+        first_bucket.charge().outcome.unwrap();
+        assert!(
+            first_bucket.charge().outcome.is_err(),
+            "the first session is spent"
+        );
+
+        // The second session has its own budget: one agent's burst must not be
+        // another agent's refusal.
+        assert!(bucket(&second).await.charge().outcome.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_session_of_an_unmetered_profile_has_no_bucket() {
+        let store = store(TestClock::new(), Duration::from_secs(1800));
+        let (id, _) = store
+            .open(&one_credential(), &source(), Vec::new(), None)
+            .await
+            .unwrap();
+        assert!(store
+            .with_session(&id, |s| s.quota.is_none())
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn the_http_counters_report_what_came_before_each_request() {
+        let counters = HttpCounters::default();
+        assert_eq!(counters.begin_request(), 0, "the first request sees none");
+        assert_eq!(counters.begin_request(), 1);
+        assert_eq!(counters.requests(), 2);
+
+        assert_eq!(counters.resp_bytes(), 0);
+        counters.add_resp_bytes(400);
+        counters.add_resp_bytes(600);
+        assert_eq!(counters.resp_bytes(), 1000);
     }
 
     #[tokio::test]
