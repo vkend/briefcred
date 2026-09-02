@@ -121,6 +121,10 @@ briefcred uninstall
 CA is still generated and `ca.pem` still written; only the system trust store
 is left alone, and `briefcred ca show` prints the command to run later.
 
+Run `briefcred install --trust-ca` yourself, without `sudo`; the CLI asks for
+your password itself for that one step, and running the whole thing as root
+provisions root's home instead of yours.
+
 On macOS the unit is a LaunchAgent at
 `~/Library/LaunchAgents/dev.briefcred.daemon.plist` with `RunAtLoad`,
 `KeepAlive`, and `ProcessType Interactive`, bootstrapped into `gui/<uid>`. It is

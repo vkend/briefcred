@@ -199,6 +199,17 @@ pub enum DaemonAction {
 /// status: a wrapper that swallowed a non-zero exit would break every script
 /// that used it.
 pub async fn run(cli: Cli) -> Result<u8> {
+    if needs_root_refusal(&cli.command) {
+        let argv: Vec<String> = std::env::args().collect();
+        if let Some(message) = refuse_root(
+            effective_uid(),
+            std::env::var("SUDO_USER").ok().as_deref(),
+            &argv,
+        ) {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    }
     let paths = Paths::discover()?;
     match cli.command {
         Command::Install { dry_run, trust_ca } => {
@@ -290,6 +301,67 @@ pub async fn run(cli: Cli) -> Result<u8> {
         }
         Command::Profile { action } => run_profile(&paths, action).await,
     }
+}
+
+/// Whether `command` is one of the ones that must not run as root.
+///
+/// Every one of these either provisions files under the caller's home
+/// directory or asks the service manager to act in the caller's `gui`
+/// session; running them as root targets root's home and root's session
+/// instead, which is never what was meant. The one exception is the single
+/// trust-store command these commands run internally, which asks `sudo` for
+/// itself and so is never run with the whole CLI already elevated.
+fn needs_root_refusal(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Install { .. }
+            | Command::Uninstall
+            | Command::Daemon {
+                action: DaemonAction::Start
+                    | DaemonAction::Stop
+                    | DaemonAction::Restart
+                    | DaemonAction::Upgrade { .. }
+            }
+            | Command::Ca {
+                action: CaAction::Regenerate { .. } | CaAction::Untrust
+            }
+            | Command::Profile {
+                action: ProfileAction::Bootstrap
+            }
+    )
+}
+
+/// The effective uid this process is running with.
+#[allow(unsafe_code)]
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, reads no memory, and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Whether this invocation must be refused, and if so, the message to print.
+///
+/// Pure so the three cases (plain root, root via `sudo`, and not root at all)
+/// can be tested without touching a real uid or environment. `argv` is the
+/// process's own arguments, `sudo -> briefcred install --trust-ca` and all,
+/// so the suggested command it prints back is exactly what was typed.
+fn refuse_root(euid: u32, sudo_user: Option<&str>, argv: &[String]) -> Option<String> {
+    if euid != 0 {
+        return None;
+    }
+    let mut message = String::from(
+        "briefcred: do not run this command as root. Run it as your own user; \
+         the one step that needs administrator rights (adding the CA to the \
+         system trust store) asks for your password itself.",
+    );
+    if sudo_user.is_some() {
+        let invocation = argv.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+        if !invocation.is_empty() {
+            message.push('\n');
+            message.push_str("You appear to have used sudo; run: briefcred ");
+            message.push_str(&invocation);
+        }
+    }
+    Some(message)
 }
 
 /// Whether stdout is a terminal.
@@ -883,6 +955,42 @@ mod tests {
         // A dry run provisions nothing and starts nothing, so "not listening"
         // is the expected outcome rather than a failure.
         assert_eq!(super::install_exit_code(true, false), 0);
+    }
+
+    #[test]
+    fn root_without_sudo_is_refused_with_no_suggested_command() {
+        let argv = vec![
+            "briefcred".to_string(),
+            "install".to_string(),
+            "--trust-ca".to_string(),
+        ];
+        let message = super::refuse_root(0, None, &argv).expect("root must be refused");
+        assert!(message.contains("do not run this command as root"));
+        assert!(!message.contains("You appear to have used sudo"));
+    }
+
+    #[test]
+    fn root_via_sudo_is_refused_and_told_the_unprivileged_invocation() {
+        let argv = vec![
+            "briefcred".to_string(),
+            "install".to_string(),
+            "--trust-ca".to_string(),
+        ];
+        let message = super::refuse_root(0, Some("vishal"), &argv).expect("root must be refused");
+        assert!(message.contains("do not run this command as root"));
+        assert!(message.contains("You appear to have used sudo; run: briefcred install --trust-ca"));
+    }
+
+    #[test]
+    fn a_non_root_caller_is_never_refused() {
+        assert_eq!(
+            super::refuse_root(501, None, &["briefcred".to_string()]),
+            None
+        );
+        assert_eq!(
+            super::refuse_root(501, Some("vishal"), &["briefcred".to_string()]),
+            None
+        );
     }
 
     use super::*;

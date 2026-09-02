@@ -8,6 +8,11 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Fixed
 
+- **`briefcred` refuses to run as root.** `install`, `uninstall`, `daemon
+  start|stop|restart|upgrade`, `ca regenerate|untrust`, and `profile bootstrap`
+  now exit 2 with a message explaining why if the effective uid is 0, rather
+  than provisioning root's home and targeting the wrong `launchctl` session.
+  `--trust-ca` still runs `sudo` itself for the one step that needs it.
 - **`briefcred install` and `briefcred daemon start|restart|stop` exit non-zero
   when the daemon never reached the state that was asked for.** The service
   manager accepting the job is not the daemon running, and a script had no way
