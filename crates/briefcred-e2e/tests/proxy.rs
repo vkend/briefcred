@@ -806,12 +806,18 @@ async fn a_session_over_its_quota_gets_a_429_with_a_retry_after() {
         String::from_utf8_lossy(&body),
         r#"{"error":"briefcred quota exceeded"}"#
     );
-    // Ten seconds a token, so the wait is ten. Asserted as a number rather
-    // than as a string so a header of `10s` or `0` would fail.
-    assert_eq!(
-        retry_after.as_deref().map(str::parse::<u64>),
-        Some(Ok(10)),
-        "a throttled client must be told when to come back"
+    // Ten seconds a token, so the wait is ten — or nine, if a whole second of
+    // wall clock passed between the exec that emptied the bucket and this
+    // request. Parsed as a number rather than compared as a string, so a
+    // header of `10s` or `0` still fails.
+    let seconds = retry_after
+        .as_deref()
+        .expect("a throttled client must be told when to come back")
+        .parse::<u64>()
+        .expect("`Retry-After` must be whole seconds");
+    assert!(
+        (9..=10).contains(&seconds),
+        "`Retry-After: {seconds}` is not the nine or ten seconds a 0.1/s bucket owes"
     );
 
     // The upstream never heard about the throttled request.

@@ -295,12 +295,17 @@ fn audit_count(daemon: &Daemon, event: &str) -> usize {
 
 /// A profile whose `postgres-dynamic` credential points at `cluster`.
 fn db_profile(cluster: &PgCluster) -> String {
+    quota_db_profile(cluster, "")
+}
+
+/// The same, with a `quota:` block spliced in.
+fn quota_db_profile(cluster: &PgCluster, quota: &str) -> String {
     format!(
         "\
 name: analytics
 unlock:
   policy: none
-credentials:
+{quota}credentials:
   - name: db
     kind: postgres-dynamic
     ttl_secs: 300
@@ -324,6 +329,90 @@ exec:
         pg_harness::DBNAME,
         pg_harness::MASTER_USER,
     )
+}
+
+#[tokio::test]
+async fn a_second_tool_call_over_the_quota_is_refused_and_counted() {
+    let Some(cluster) = cluster_or_skip("a_second_tool_call_over_the_quota").await else {
+        return;
+    };
+
+    // Metrics on, so the test can prove the `mcp` surface reaches the scrape.
+    let mut daemon =
+        Daemon::prepare("metrics_enabled = true\nmetrics_port = 0\nmaster_source = \"file\"\n");
+    // One token, refilling every ten seconds: the first call takes it and
+    // nothing refills inside the test.
+    daemon.write_profile(
+        "analytics",
+        &quota_db_profile(&cluster, "quota:\n  rate: 0.1\n  burst: 1\n"),
+    );
+    daemon.write_master("pg-master", &cluster.master_password());
+    daemon.start().await.expect("start");
+    let client = mcp_client(&daemon).await;
+
+    let query = || {
+        client.call_tool(
+            CallToolRequestParams::new("briefcred_db_query").with_arguments(
+                serde_json::json!({ "profile": "analytics", "sql": "SELECT 1 AS one" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+    };
+
+    let first = query().await.expect("the first call is inside the quota");
+    assert_eq!(json_of(&first)["rows"][0]["one"], 1);
+
+    // The mint already happened, so this is the case that would go unmetered
+    // if only the connection's first call were charged.
+    let refused = query()
+        .await
+        .expect_err("the second call has no token left");
+    let message = format!("{refused:?}");
+    assert!(
+        message.contains("quota") && message.contains("analytics"),
+        "the refusal must name the quota and the profile: {message}"
+    );
+    assert!(
+        message.contains("10s"),
+        "and must say how long to wait: {message}"
+    );
+
+    let scrape = scrape(&daemon).await;
+    assert!(
+        scrape
+            .contains("briefcred_quota_rejections_total{profile=\"analytics\",surface=\"mcp\"} 1"),
+        "{scrape}"
+    );
+    assert!(
+        scrape.contains("briefcred_quota_saturation{profile=\"analytics\"} 1"),
+        "{scrape}"
+    );
+
+    client.cancel().await.ok();
+    daemon.shutdown().await;
+}
+
+/// Scrape the daemon's Prometheus endpoint.
+async fn scrape(daemon: &Daemon) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let Response::Status { metrics_addr, .. } =
+        daemon.request(Request::Status).await.expect("status")
+    else {
+        panic!("expected a status\n{}", daemon.log());
+    };
+    let addr = metrics_addr.expect("metrics are enabled for this daemon");
+    let mut stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .expect("connect to the metrics endpoint");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("send the scrape");
+    let mut body = String::new();
+    stream.read_to_string(&mut body).await.expect("read it");
+    body
 }
 
 /// Three properties of a fresh MCP connection, over one cluster.
