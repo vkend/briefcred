@@ -251,19 +251,32 @@ impl Fixture {
     /// the old daemon to hand over — lives in the command, and a test that
     /// reimplemented it would be testing its own copy.
     async fn upgrade(&self, extra: &[&str]) -> std::process::Output {
+        let output = self
+            .upgrade_command(extra)
+            .output()
+            .expect("run briefcred daemon upgrade");
+        self.note_successor().await;
+        output
+    }
+
+    /// The command, unspawned, so a test can run it in the background.
+    fn upgrade_command(&self, extra: &[&str]) -> std::process::Command {
         let mut command = std::process::Command::new(binary_dir().join("briefcred"));
         command
             .args(["daemon", "upgrade"])
             .args(extra)
             .env("BRIEFCRED_HOME", self.daemon.home())
             .env("BRIEFCRED_HELPER_DIR", binary_dir());
-        let output = command.output().expect("run briefcred daemon upgrade");
+        command
+    }
+
+    /// Record whoever is serving now, if it is not the daemon we started.
+    async fn note_successor(&self) {
         if let Ok(Response::Status { pid, .. }) = self.daemon.request(Request::Status).await {
-            if pid != self.pid {
+            if pid != self.pid && !self.successors.lock().unwrap().contains(&pid) {
                 self.successors.lock().unwrap().push(pid);
             }
         }
-        output
     }
 }
 
@@ -635,6 +648,182 @@ async fn an_upgrade_under_a_live_websocket_drops_no_frames() {
     assert_ne!(serving_pid(&fixture.daemon).await, fixture.pid);
 
     fixture.daemon.request(Request::Shutdown).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_asked_for_during_the_handoff_window_is_refused() {
+    // The window is real: the daemon being replaced goes on accepting IPC from
+    // the moment it is asked to hand over until the new daemon says it is
+    // serving. A session opened in there would reach no blob and be adopted by
+    // nobody, so a credential minted against it is one that neither daemon
+    // holds a revoke for. `BRIEFCRED_TEST_TAKEOVER_DELAY_MS` widens the window
+    // to something a test can act inside.
+    let mut fixture = start().await;
+
+    let mut running = fixture
+        .upgrade_command(&[])
+        .env("BRIEFCRED_TEST_TAKEOVER_DELAY_MS", "3000")
+        .spawn()
+        .expect("start briefcred daemon upgrade");
+
+    // Inside the window: the old daemon has been asked to hand over and the
+    // new one has not yet been given anything.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let refusals = [
+        fixture
+            .daemon
+            .request(Request::OpenSession {
+                profile: "openai".to_string(),
+                client_headless: true,
+                session_pubkey: None,
+            })
+            .await
+            .expect("the daemon must still answer"),
+        fixture
+            .daemon
+            .request(Request::Exec {
+                session_id: fixture.session_id.clone(),
+                credentials: None,
+                argv0: "curl".to_string(),
+                args: Vec::new(),
+                pid: std::process::id(),
+            })
+            .await
+            .expect("the daemon must still answer"),
+    ];
+    for response in &refusals {
+        assert!(
+            matches!(response, Response::Error { message } if message.contains("handing off")),
+            "the window must refuse rather than mint: {response:?}\n{}",
+            fixture.daemon.log()
+        );
+    }
+
+    let status = running.wait().expect("the upgrade finishes");
+    fixture.note_successor().await;
+    assert!(
+        status.success(),
+        "the upgrade itself must still succeed:\n{}",
+        fixture.daemon.log()
+    );
+
+    // Nothing was minted in the window, so nothing was orphaned: the only
+    // session that existed is the one the blob carried, and it was moved
+    // rather than revoked.
+    let log = fixture.daemon.log();
+    assert!(
+        fixture.daemon.wait_for_exit(Duration::from_secs(30)).await,
+        "the replaced daemon is still running:\n{log}"
+    );
+    let rows = fixture.daemon.audit_rows();
+    assert!(
+        !rows.iter().any(|row| row["event"] == "revoke"),
+        "nothing should have needed revoking"
+    );
+    let closes: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["event"] == "session_close")
+        .filter_map(|row| row["reason"].as_str())
+        .collect();
+    assert_eq!(closes, vec!["handoff"], "{closes:?}");
+
+    // And the retry the refusal tells the client to make lands on the new pid.
+    assert!(matches!(
+        fixture
+            .daemon
+            .request(Request::OpenSession {
+                profile: "openai".to_string(),
+                client_headless: true,
+                session_pubkey: None,
+            })
+            .await,
+        Ok(Response::SessionOpened { .. })
+    ));
+
+    fixture.daemon.request(Request::Shutdown).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_one_of_two_concurrent_handoffs_proceeds() {
+    // Two successors would each be sent a copy of every listening descriptor
+    // and every master, and four processes would then disagree about who owns
+    // the sockets. Exactly one caller may claim the handoff.
+    let fixture = start().await;
+
+    let first = fixture.daemon.connect().await.expect("connect");
+    let second = fixture.daemon.connect().await.expect("connect");
+    let socket = fixture
+        .daemon
+        .home()
+        .join("state")
+        .join("handoff-concurrent.sock");
+
+    // One real takeover daemon, and two requests aimed at it. Only one can be
+    // the one it accepts, and the daemon must refuse the other itself rather
+    // than letting it race for the socket.
+    let mut takeover = std::process::Command::new(binary_dir().join("briefcred-daemon"))
+        .arg("--takeover")
+        .arg(&socket)
+        .env("BRIEFCRED_HOME", fixture.daemon.home())
+        .env("BRIEFCRED_HELPER_DIR", binary_dir())
+        .env("BRIEFCRED_TEST_TAKEOVER_DELAY_MS", "1500")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start the takeover daemon");
+    assert!(
+        wait_for_path(&socket, Duration::from_secs(10)).await,
+        "the takeover socket never appeared"
+    );
+
+    let request = || Request::Handoff {
+        socket: socket.to_string_lossy().into_owned(),
+    };
+    let (a, b) = tokio::join!(
+        async {
+            let mut first = first;
+            first.send(request()).await
+        },
+        async {
+            let mut second = second;
+            second.send(request()).await
+        }
+    );
+
+    let outcomes = [a.expect("a reply"), b.expect("a reply")];
+    let completed = outcomes
+        .iter()
+        .filter(|response| matches!(response, Response::HandoffComplete { .. }))
+        .count();
+    let refused = outcomes
+        .iter()
+        .filter(|response| {
+            matches!(response, Response::Error { message } if message.contains("already in progress"))
+        })
+        .count();
+    assert_eq!(
+        (completed, refused),
+        (1, 1),
+        "exactly one handoff may proceed: {outcomes:?}\n{}",
+        fixture.daemon.log()
+    );
+
+    let _ = takeover.kill();
+    let _ = takeover.wait();
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// Poll until `path` exists, or the deadline passes.
+async fn wait_for_path(path: &std::path::Path, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        if std::fs::symlink_metadata(path).is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
 }
 
 /// A one-shot GET, for the metrics endpoint.

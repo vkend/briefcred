@@ -271,10 +271,23 @@ impl Daemon {
         }
     }
 
-    /// The daemon's own stdout and stderr, for a failure message.
+    /// Every daemon log under this home, for a failure message.
+    ///
+    /// Both files, because an upgrade produces two daemons: this harness's own
+    /// child writes `daemon.log`, and the successor `briefcred daemon upgrade`
+    /// starts writes `daemon.err.log`. A handoff that failed inside the
+    /// successor would otherwise leave the test reporting the log of the
+    /// process that was working fine.
     pub fn log(&self) -> String {
-        std::fs::read_to_string(self.home.path().join("logs").join("daemon.log"))
-            .unwrap_or_default()
+        let logs = self.home.path().join("logs");
+        ["daemon.log", "daemon.err.log", "daemon.out.log"]
+            .into_iter()
+            .filter_map(|name| {
+                let text = std::fs::read_to_string(logs.join(name)).ok()?;
+                (!text.trim().is_empty()).then(|| format!("--- {name}\n{text}"))
+            })
+            .collect::<Vec<String>>()
+            .join("\n")
     }
 
     /// Every audit row written so far, oldest first.
