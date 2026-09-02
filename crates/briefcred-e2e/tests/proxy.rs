@@ -2211,25 +2211,41 @@ async fn the_proxy_stays_within_its_latency_budget_over_two_hundred_calls() {
         .await
         .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
 
-    let measure = |transport: &grpc::Transport| {
-        let transport = transport.clone();
-        async move {
+    // Interleaved, one call each per round, rather than two runs one after the
+    // other. The whole test suite runs in parallel around this one, so a
+    // machine that gets busy halfway through would otherwise load the second
+    // measurement and not the first, and the comparison would be between two
+    // different machines.
+    let mut direct_calls = Vec::with_capacity(LATENCY_CALLS);
+    let mut proxied_calls = Vec::with_capacity(LATENCY_CALLS);
+    for n in 0..LATENCY_CALLS {
+        let text = n.to_string();
+        for (transport, into) in [(&direct, &mut direct_calls), (&proxied, &mut proxied_calls)] {
             let started = std::time::Instant::now();
-            for n in 0..LATENCY_CALLS {
-                grpc::call_unary(&transport, "Unary", &n.to_string())
-                    .await
-                    .unwrap();
-            }
-            started.elapsed() / LATENCY_CALLS as u32
+            grpc::call_unary(transport, "Unary", &text)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+            into.push(started.elapsed());
         }
-    };
-    let direct_each = measure(&direct).await;
-    let proxied_each = measure(&proxied).await;
+    }
 
-    // A ratio with an absolute allowance on top. On loopback a call is tens of
-    // microseconds, so a debug build's scheduling jitter is a larger share of
-    // it than the proxy is; without the two milliseconds this asserts the
-    // machine's timer noise rather than briefcred's overhead.
+    // The median rather than the mean. One call that lost its thread to the
+    // scheduler for fifty milliseconds moves a mean over two hundred by a
+    // quarter of a millisecond, which is larger than the thing being measured;
+    // it moves the median not at all.
+    let median = |mut calls: Vec<Duration>| {
+        calls.sort_unstable();
+        calls[calls.len() / 2]
+    };
+    let direct_each = median(direct_calls);
+    let proxied_each = median(proxied_calls);
+
+    // A ratio with an absolute allowance on top. On loopback a call is a
+    // hundred microseconds or so, and the proxied path terminates one TLS
+    // session and originates a second on top of the token check, the quota
+    // charge, the Cedar decision and an audit row — so the ratio alone would be
+    // asserting that a proxy is free. The allowance is what makes this a bound
+    // on the time briefcred adds, which is the honest thing to bound.
     let budget = direct_each.mul_f64(1.10) + Duration::from_millis(2);
     assert!(
         proxied_each <= budget,
