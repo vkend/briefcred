@@ -146,7 +146,14 @@ pub enum AuditEntry {
         resp_bytes: u64,
         /// How long the whole exchange took.
         latency_ms: u64,
-        /// One of `allow`, `deny`, or `would_deny`.
+        /// What happened, and who decided it.
+        ///
+        /// `allow` and `would_deny` were forwarded; `deny` was refused by the
+        /// policy or by a token that did not authorise. `swap_error` and
+        /// `upstream_error` are **not** policy outcomes — the policy allowed
+        /// those, and briefcred or the upstream failed afterwards — so an
+        /// operator reading a rising count knows whether to widen a policy or
+        /// to go and look at something.
         decision: String,
     },
     /// A revoke attempt finished.

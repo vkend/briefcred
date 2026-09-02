@@ -186,7 +186,22 @@ Every request through the proxy writes one audit row, whatever happened to it:
  "req_bytes":0,"resp_bytes":8241,"latency_ms":312,"decision":"allow"}
 ```
 
-`decision` is `allow`, `deny`, or `would_deny`. The same three labels appear on
-`briefcred_proxy_requests_total{decision,status_class}`, so a Prometheus alert
-on a rising `deny` count is a policy that is too narrow, and a rising
-`would_deny` count is a profile somebody forgot to promote to `enforce`.
+`decision` is one of five labels, which also appear on
+`briefcred_proxy_requests_total{decision,status_class}`:
+
+| `decision` | what it tells you |
+| --- | --- |
+| `allow` | the policy permitted it |
+| `deny` | the policy refused it, or the token did not authorise |
+| `would_deny` | the policy refused it and `policy_mode` is `observe` |
+| `swap_error` | the policy allowed it; briefcred could not attach the credential |
+| `upstream_error` | the policy allowed it; the upstream was unreachable |
+
+The last two are deliberately **not** `deny`. They are the cases where your
+policy was right and something else went wrong, so a rising `deny` count means
+a policy that is too narrow, a rising `would_deny` count means a profile
+somebody forgot to promote to `enforce`, and a rising `swap_error` or
+`upstream_error` count means nobody needs to touch the policy at all.
+
+`status` is the upstream's own code, and is absent on every row that never
+reached an upstream.

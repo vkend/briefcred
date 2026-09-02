@@ -212,7 +212,7 @@ currently being written, and ignores any filename it did not write.
 | `briefcred_mint_duration_seconds{kind}` | histogram | Time to mint one credential, by minter kind |
 | `briefcred_revoke_duration_seconds{kind}` | histogram | Time for one revoke attempt, by minter kind |
 | `briefcred_revoke_failures_total{kind}` | counter | Revoke attempts that failed, by minter kind |
-| `briefcred_proxy_requests_total{decision,status_class}` | counter | Proxied requests, by policy decision and status class |
+| `briefcred_proxy_requests_total{decision,status_class}` | counter | Proxied requests, by decision and status class |
 | `briefcred_proxy_latency_seconds{kind}` | histogram | Time for one proxied request, by policy decision |
 
 The two histograms time failures as well as successes: a backend that takes
@@ -661,6 +661,22 @@ briefcred's proxy on this machine.
 
 A request the policy refuses never reaches the vendor at all, and no
 credential is attached to it.
+
+`decision` says who refused, which matters because two of its values are not
+policy outcomes:
+
+| `decision` | meaning | `status` |
+| --- | --- | --- |
+| `allow` | permitted and forwarded | the upstream's |
+| `deny` | the policy refused it, or the token did not authorise | absent |
+| `would_deny` | the policy refused it and the profile is observing | the upstream's |
+| `swap_error` | the policy allowed it; the credential would not go in | absent |
+| `upstream_error` | the policy allowed it; the upstream was unreachable | absent |
+
+`status` is the *upstream's* code, so it is absent wherever the request never
+got one. That is what keeps "briefcred is broken" and "the vendor is down"
+apart on a dashboard, and it is why a `502` briefcred generated is not recorded
+as though a vendor had sent it.
 
 ### The three kinds
 

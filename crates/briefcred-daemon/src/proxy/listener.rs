@@ -28,8 +28,30 @@
 //!    counted as they go; nothing is buffered whole.
 //! 6. **Audit and count.** One `ProxyRequest` row when the response body ends.
 //!
-//! Every refusal before step 5 is still audited, because "briefcred stopped
-//! this" is exactly what the log is for.
+//! # What each refusal is recorded as
+//!
+//! Every refusal is *counted*, on
+//! `briefcred_proxy_requests_total{decision,status_class}`. Only a refusal that
+//! got as far as resolving a session is *audited*, because a `ProxyRequest` row
+//! names a `mint_id` and a request whose token did not verify has no mint to
+//! name. So a bad token is a metric and a line on the daemon's log, and
+//! everything from the policy onwards is a row.
+//!
+//! The `decision` distinguishes who refused, which matters because two of these
+//! are not policy decisions at all:
+//!
+//! | `decision` | what happened |
+//! | --- | --- |
+//! | `allow` | the policy permitted it and it was forwarded |
+//! | `deny` | the policy refused it, or the token did not authorise |
+//! | `would_deny` | the policy refused it and the profile is observing |
+//! | `swap_error` | the policy **allowed** it; the credential would not go in |
+//! | `upstream_error` | the policy **allowed** it; the upstream was unreachable |
+//!
+//! `status` is the upstream's own code and is absent for all but `allow` and
+//! `would_deny`: nothing else reached an upstream to get one, and putting
+//! briefcred's `502` there would make a proxy failure indistinguishable from a
+//! vendor outage.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -61,6 +83,25 @@ use crate::server::State;
 
 /// The body type every response out of this module has.
 type OutBody = BoxBody<Bytes, hyper::Error>;
+
+/// briefcred refused the request: the policy said no, or the token did not
+/// authorise one.
+const DECISION_DENY: &str = "deny";
+
+/// The policy allowed the request, but the credential could not be put into it.
+///
+/// Distinct from `deny` because it is a briefcred fault rather than a policy
+/// outcome: a profile whose `deny` count is climbing needs its policy widened,
+/// and one whose `swap_error` count is climbing needs somebody to look at the
+/// master it is holding.
+const DECISION_SWAP_ERROR: &str = "swap_error";
+
+/// The policy allowed the request, but the upstream could not be reached.
+///
+/// Also not a policy outcome. This is the series that separates "the vendor is
+/// down" from "briefcred is refusing me", which are the two things a user
+/// staring at a failing agent cannot otherwise tell apart.
+const DECISION_UPSTREAM_ERROR: &str = "upstream_error";
 
 /// Everything one proxied request needs, shared across every connection.
 pub struct Proxy {
@@ -279,6 +320,7 @@ async fn forward(
             &method,
             "",
             "",
+            DECISION_DENY,
         );
     };
     // The query string is dropped here and never picked up again: it routinely
@@ -296,6 +338,7 @@ async fn forward(
             &method,
             &host,
             &path,
+            DECISION_DENY,
         );
     };
     let claims = match proxy.issuer.authorize(&presented, now) {
@@ -313,6 +356,7 @@ async fn forward(
                 &method,
                 &host,
                 &path,
+                DECISION_DENY,
             );
         }
     };
@@ -327,6 +371,7 @@ async fn forward(
             &method,
             &host,
             &path,
+            DECISION_DENY,
         );
     };
 
@@ -353,6 +398,7 @@ async fn forward(
                 &method,
                 &host,
                 &path,
+                DECISION_DENY,
             );
         }
     }
@@ -403,6 +449,7 @@ async fn forward(
             &method,
             &host,
             &path,
+            DECISION_SWAP_ERROR,
         );
     }
     // A proof is for briefcred, not for the vendor, and forwarding it would
@@ -434,6 +481,7 @@ async fn forward(
                 &method,
                 &host,
                 &path,
+                DECISION_UPSTREAM_ERROR,
             );
         }
     };
@@ -623,25 +671,22 @@ fn refuse(
     method: &str,
     host: &str,
     path: &str,
+    decision: &str,
 ) -> Response<OutBody> {
     let elapsed = started.elapsed();
     if let Some(mint_id) = mint_id {
         proxy.state.audit(&proxy_row(
-            mint_id,
-            method,
-            host,
-            path,
-            Some(code.as_u16()),
-            0,
-            0,
-            elapsed,
-            "deny",
+            mint_id, method, host, path,
+            // Not `code`. `status` is the *upstream's* answer, and nothing
+            // that reaches here got one — the status the client sees is
+            // briefcred's own, and `decision` is what says why.
+            None, 0, 0, elapsed, decision,
         ));
     }
     proxy
         .state
         .metrics()
-        .record_proxy_request("deny", Some(code.as_u16()), elapsed);
+        .record_proxy_request(decision, None, elapsed);
     status(code)
 }
 
