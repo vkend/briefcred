@@ -1284,7 +1284,8 @@ A notarised briefcred binary is checked against Apple's service the first time
 it runs.
 
 `release/Formula/briefcred.rb` is the Homebrew formula. It installs all five
-binaries — the two a user types and the three the daemon spawns — and carries a
+binaries — `briefcred` and `briefcred-daemon`, the two helper processes the
+daemon spawns to mint, and `briefcred-hook` for the agent — and carries a
 `service` block so `brew services start briefcred` runs the daemon as a
 LaunchAgent, equivalently to what `briefcred install` writes.
 

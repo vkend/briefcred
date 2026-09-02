@@ -88,8 +88,9 @@ briefcred-e2e       test-only: Postgres and daemon harnesses, e2e tests
 Five binaries ship: `briefcred`, `briefcred-daemon`, `briefcred-hook`,
 `briefcred-helper-postgres-dynamic`, and `briefcred-helper-aws-sts`. An install
 that leaves out a helper is a broker that starts and cannot mint, which is why
-the Homebrew formula's `test do` block checks for all five and the end-to-end
-harness refuses to start when one is absent.
+the Homebrew formula's `test do` block runs `briefcred` and checks the other
+four are present, and the end-to-end harness refuses to start when one is
+absent.
 
 A helper's **binary** is
 named for the minter kind it serves rather than for its crate —
