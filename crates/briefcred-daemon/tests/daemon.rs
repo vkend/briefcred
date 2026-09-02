@@ -22,12 +22,12 @@ struct Daemon {
 
 /// Add the port overrides every test needs, unless the test set them itself.
 ///
-/// A daemon started by a test must not bind either of the real ports: two test
+/// A daemon started by a test must not bind any of the real ports: two test
 /// binaries run concurrently, and one of them would lose the race to whichever
 /// daemon the developer actually has installed.
 fn with_ephemeral_ports(config: &str) -> String {
     let mut config = config.to_string();
-    for line in ["metrics_port = 0", "proxy_port = 0"] {
+    for line in ["metrics_port = 0", "proxy_port = 0", "pg_proxy_port = 0"] {
         let key = line.split_whitespace().next().expect("a key");
         if !config
             .lines()

@@ -18,6 +18,7 @@ pub mod helper;
 pub mod inproc;
 pub mod mcp;
 pub mod metrics;
+pub mod pgproxy;
 pub mod profiles;
 pub mod proxy;
 pub mod reconcile;
@@ -116,6 +117,33 @@ pub async fn run() -> Result<()> {
         .map(|(_, _, issuer, _)| Arc::clone(issuer));
     let proxy_addr = bound_proxy.as_ref().map(|(_, addr, _, _)| addr.to_string());
 
+    // The Postgres proxy signs its synthetic tokens with the *same* issuer as
+    // the HTTP proxy: one signing key per daemon, one revocation set, one place
+    // that decides a token is no longer good. Two issuers would mean a `Revoke`
+    // that retired a grant in one of them and not the other.
+    //
+    // So it can only run where that issuer exists. A `daemon.toml` that turns
+    // the HTTP proxy off and leaves this one on is refused rather than started
+    // half-working, because the failure would otherwise appear as every
+    // `postgres-proxy` credential silently failing to mint.
+    if config.pg_proxy_enabled && issuer.is_none() {
+        return Err(Error::Config {
+            path: paths.daemon_toml(),
+            message: "`pg_proxy_enabled` needs `proxy_enabled`: the Postgres proxy verifies \
+                      synthetic tokens with the HTTP proxy's signing key"
+                .to_string(),
+        });
+    }
+    let bound_pg_proxy = match (config.pg_proxy_enabled, issuer.as_ref()) {
+        (true, Some(issuer)) => {
+            let (listener, addr) = pgproxy::listener::bind(config.pg_proxy_port)
+                .map_err(|e| Error::io("bind the postgres proxy listener on", paths.root(), e))?;
+            Some((listener, addr, Arc::clone(issuer)))
+        }
+        _ => None,
+    };
+    let pg_proxy_addr = bound_pg_proxy.as_ref().map(|(_, addr, _)| addr.to_string());
+
     let paths = Arc::new(paths);
     let listener = server::bind(paths.sock())?;
     let (shutdown, _) = tokio::sync::watch::channel(false);
@@ -124,6 +152,7 @@ pub async fn run() -> Result<()> {
         metrics: Arc::clone(&metrics),
         metrics_addr,
         proxy_addr,
+        pg_proxy_addr: pg_proxy_addr.clone(),
         shutdown,
         profiles: Arc::clone(&profiles),
         sessions: Arc::clone(&sessions),
@@ -165,6 +194,19 @@ pub async fn run() -> Result<()> {
         tokio::spawn(proxy::listener::serve(
             proxy_listener,
             proxy::listener::Proxy::new(Arc::clone(&state), issuer, upstream),
+            state.shutdown_signal(),
+        ));
+    }
+    if let Some((pg_listener, addr, issuer)) = bound_pg_proxy {
+        eprintln!("briefcred-daemon: postgres proxy on postgresql://{addr}");
+        tokio::spawn(pgproxy::listener::serve(
+            pg_listener,
+            pgproxy::listener::PgProxy::new(
+                Arc::clone(&state),
+                issuer,
+                config.pgproxy.tls,
+                config.pgproxy.allow_md5,
+            ),
             state.shutdown_signal(),
         ));
     }

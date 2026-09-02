@@ -59,6 +59,7 @@ pub struct State {
     audit: AuditHandle,
     metrics_addr: Option<String>,
     proxy_addr: Option<String>,
+    pg_proxy_addr: Option<String>,
     shutdown: tokio::sync::watch::Sender<bool>,
     shutdown_reason: Mutex<&'static str>,
     profiles: Arc<ProfileStore>,
@@ -88,6 +89,8 @@ pub struct StateParts {
     pub metrics_addr: Option<String>,
     /// Where the HTTP proxy is listening, if it is.
     pub proxy_addr: Option<String>,
+    /// Where the Postgres proxy is listening, if it is.
+    pub pg_proxy_addr: Option<String>,
     /// The shutdown signal's sending half.
     pub shutdown: tokio::sync::watch::Sender<bool>,
     /// The loaded profiles.
@@ -123,6 +126,7 @@ impl State {
             audit: parts.audit,
             metrics_addr: parts.metrics_addr,
             proxy_addr: parts.proxy_addr,
+            pg_proxy_addr: parts.pg_proxy_addr,
             shutdown: parts.shutdown,
             shutdown_reason: Mutex::new("unknown"),
             profiles: parts.profiles,
@@ -142,6 +146,15 @@ impl State {
     /// The HTTP proxy's token authority, when the proxy is enabled.
     pub fn proxy(&self) -> Option<&Arc<crate::proxy::issuer::ProxyIssuer>> {
         self.proxy.as_ref()
+    }
+
+    /// Where the Postgres proxy is listening, when it is enabled.
+    ///
+    /// A `postgres-proxy` mint needs this to build the `DATABASE_URL` it hands
+    /// the subprocess, so a daemon with the proxy switched off cannot serve one
+    /// and says so rather than publishing a port nothing answers on.
+    pub fn pg_proxy_addr(&self) -> Option<&str> {
+        self.pg_proxy_addr.as_deref()
     }
 
     /// The open sessions.
@@ -321,6 +334,7 @@ async fn handle_status(_request: Request, state: Arc<State>) -> Response {
         audit_path: state.audit_path().await,
         metrics_addr: state.metrics_addr.clone(),
         proxy_addr: state.proxy_addr.clone(),
+        pg_proxy_addr: state.pg_proxy_addr.clone(),
     }
 }
 
@@ -601,6 +615,7 @@ async fn handle_exec(request: Request, state: Arc<State>) -> Response {
         issuer,
         session_id: &session_id,
         session_pubkey: session_pubkey.as_ref(),
+        pg_proxy_addr: state.pg_proxy_addr(),
     });
 
     let minted = crate::exec::mint(
@@ -1052,6 +1067,7 @@ mod tests {
             metrics,
             metrics_addr: None,
             proxy_addr: None,
+            pg_proxy_addr: None,
             shutdown,
             profiles,
             sessions: Arc::new(SessionStore::new(clock.clone(), Duration::from_secs(1800))),

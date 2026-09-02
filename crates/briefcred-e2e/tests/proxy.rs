@@ -308,7 +308,7 @@ async fn start(policy_mode: &str) -> Fixture {
     std::fs::write(
         daemon.home().join("daemon.toml"),
         format!(
-            "metrics_enabled = false\nmetrics_port = 0\nproxy_port = 0\n\
+            "metrics_enabled = false\nmetrics_port = 0\nproxy_port = 0\npg_proxy_port = 0\n\
              master_source = \"file\"\nupstream_roots = {:?}\n[ca]\nkeystore = \"file\"\n",
             roots.display().to_string()
         ),

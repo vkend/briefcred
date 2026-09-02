@@ -619,6 +619,7 @@ fn print_status(status: &Response, sock: &Path) {
         audit_path,
         metrics_addr,
         proxy_addr,
+        pg_proxy_addr,
     } = status
     else {
         return;
@@ -643,6 +644,10 @@ fn print_status(status: &Response, sock: &Path) {
     match proxy_addr {
         Some(addr) => println!("  proxy      http://{addr}"),
         None => println!("  proxy      disabled"),
+    }
+    match pg_proxy_addr {
+        Some(addr) => println!("  pg proxy   postgresql://{addr}"),
+        None => println!("  pg proxy   disabled"),
     }
 }
 

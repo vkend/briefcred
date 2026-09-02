@@ -27,6 +27,12 @@ pub const DEFAULT_METRICS_PORT: u16 = 9317;
 /// other is.
 pub const DEFAULT_PROXY_PORT: u16 = 9318;
 
+/// The Postgres proxy port used when the file says nothing.
+///
+/// One past the HTTP proxy's, so briefcred's three loopback listeners are
+/// adjacent and an operator who has found one knows where the others are.
+pub const DEFAULT_PG_PROXY_PORT: u16 = 9319;
+
 /// How often the reconciler sweeps when the file says nothing.
 pub const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = crate::reconcile::DEFAULT_INTERVAL_SECS;
 
@@ -47,6 +53,33 @@ pub struct AuditConfig {
     /// the audit log. An operator who needs to see the actual SQL an agent ran
     /// turns it on knowingly and accepts that the log is now sensitive.
     pub raw_args: bool,
+}
+
+/// The `[pgproxy]` table of `daemon.toml`.
+///
+/// The port and the on/off switch are top-level keys next to the HTTP proxy's,
+/// because that is where an operator looks for a port. What lives here is the
+/// two questions about how the Postgres proxy *behaves*, both of which are off
+/// by default and both of which weaken something when turned on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PgProxyConfig {
+    /// Answer a client's `SSLRequest` with a leaf from briefcred's CA.
+    ///
+    /// Off by default because the listener is loopback-only, so TLS here
+    /// encrypts a socket that never leaves the machine. It exists for a client
+    /// that refuses to connect without it — `sslmode=require` in a driver
+    /// nobody wants to reconfigure — and it needs a CA the client trusts, which
+    /// is what `briefcred ca trust` installs.
+    pub tls: bool,
+
+    /// Permit MD5 when the upstream server asks for it.
+    ///
+    /// Off by default. PostgreSQL has deprecated MD5 authentication, and a
+    /// server still asking for it is one whose roles should be moved to
+    /// `scram-sha-256`. Turning this on logs a deprecation warning once and
+    /// then does as it is told.
+    pub allow_md5: bool,
 }
 
 /// How long a `briefcred_db_query` statement may run when nothing says.
@@ -78,6 +111,15 @@ pub struct Config {
     pub proxy_port: u16,
     /// Whether to run the HTTP proxy at all.
     pub proxy_enabled: bool,
+    /// The loopback port the Postgres proxy listens on.
+    ///
+    /// Zero asks the operating system for a free port, which is how the
+    /// integration tests avoid colliding with a real daemon. Loopback only:
+    /// a client authenticates to this listener with a password in the clear,
+    /// and the daemon behind it holds a master that can reach a real database.
+    pub pg_proxy_port: u16,
+    /// Whether to run the Postgres proxy at all.
+    pub pg_proxy_enabled: bool,
     /// A PEM bundle of extra certificate authorities the proxy trusts upstream.
     ///
     /// **For tests.** The proxy verifies upstream certificates against the
@@ -104,6 +146,8 @@ pub struct Config {
     pub mcp_query_timeout_secs: u64,
     /// What the audit log records beyond the defaults.
     pub audit: AuditConfig,
+    /// How the Postgres proxy behaves once it is running.
+    pub pgproxy: PgProxyConfig,
     /// Where master credentials are read from.
     ///
     /// Absent means the platform default: the login keychain on macOS, files
@@ -126,11 +170,14 @@ impl Default for Config {
             metrics_enabled: true,
             proxy_port: DEFAULT_PROXY_PORT,
             proxy_enabled: true,
+            pg_proxy_port: DEFAULT_PG_PROXY_PORT,
+            pg_proxy_enabled: true,
             upstream_roots: None,
             session_idle_secs: DEFAULT_SESSION_IDLE_SECS,
             reconcile_interval_secs: DEFAULT_RECONCILE_INTERVAL_SECS,
             mcp_query_timeout_secs: DEFAULT_MCP_QUERY_TIMEOUT_SECS,
             audit: AuditConfig::default(),
+            pgproxy: PgProxyConfig::default(),
             master_source: None,
             ca: CaConfig::default(),
         }
@@ -223,6 +270,10 @@ mod tests {
         assert!(config.metrics_enabled);
         assert_eq!(config.proxy_port, 9318);
         assert!(config.proxy_enabled);
+        assert_eq!(config.pg_proxy_port, 9319);
+        assert!(config.pg_proxy_enabled);
+        assert!(!config.pgproxy.tls, "loopback TLS must be opted into");
+        assert!(!config.pgproxy.allow_md5, "MD5 must be opted into");
         assert_eq!(config.upstream_roots, None);
         assert_eq!(config.session_idle_secs, 1800);
         assert_eq!(config.session_idle(), Duration::from_secs(1800));
@@ -302,6 +353,22 @@ mod tests {
         let config = Config::from_toml_str("proxy_port = 0\nproxy_enabled = false\n").unwrap();
         assert_eq!(config.proxy_port, 0);
         assert!(!config.proxy_enabled);
+    }
+
+    #[test]
+    fn the_postgres_proxy_can_be_moved_or_turned_off() {
+        let config =
+            Config::from_toml_str("pg_proxy_port = 0\npg_proxy_enabled = false\n").unwrap();
+        assert_eq!(config.pg_proxy_port, 0);
+        assert!(!config.pg_proxy_enabled);
+    }
+
+    #[test]
+    fn the_two_postgres_proxy_behaviours_are_opted_into_through_their_own_table() {
+        let config = Config::from_toml_str("[pgproxy]\ntls = true\nallow_md5 = true\n").unwrap();
+        assert!(config.pgproxy.tls);
+        assert!(config.pgproxy.allow_md5);
+        assert!(Config::from_toml_str("[pgproxy]\nallow_mdfive = true\n").is_err());
     }
 
     #[test]

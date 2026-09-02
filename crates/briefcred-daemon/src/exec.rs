@@ -36,19 +36,26 @@ use crate::helper::MinterSet;
 use crate::proxy::issuer::ProxyIssuer;
 use crate::revoke::PendingRevoke;
 
-/// The session context an HTTP credential is minted against.
+/// The session context a proxy-served credential is minted against.
 ///
 /// Only the proxy kinds need it, and only they can use it: a synthetic token
 /// names the session it was issued to, and no minter that runs behind the
 /// [`briefcred_core::Minter`] contract has any way to know what that is.
 #[derive(Clone, Copy)]
 pub struct ProxyGrant<'a> {
-    /// The daemon's token authority.
+    /// The daemon's token authority, shared by both proxies.
     pub issuer: &'a ProxyIssuer,
     /// The session the tokens are issued to.
     pub session_id: &'a str,
     /// The client's per-session public key, when it offered one.
     pub session_pubkey: Option<&'a [u8; 32]>,
+    /// Where the Postgres proxy is listening, when it is running.
+    ///
+    /// Separate from the issuer because the two proxies share one signing key
+    /// but not one address, and because either can be switched off: a
+    /// `postgres-proxy` credential minted with `None` here would publish a
+    /// `DATABASE_URL` pointing at nothing.
+    pub pg_proxy_addr: Option<&'a str>,
 }
 
 impl std::fmt::Debug for ProxyGrant<'_> {
@@ -221,7 +228,7 @@ pub async fn mint_only(
         // profile's point of view it is one more credential this run produced.
         let outcome = if registry.is_proxy(&spec.kind) {
             match proxy {
-                Some(grant) => issue_http(profile, spec, grant),
+                Some(grant) => issue_synthetic(profile, spec, grant),
                 None => {
                     return Err(ExecError::NoProxyGrant {
                         credential: spec.name.clone(),
@@ -281,24 +288,66 @@ type MintOutcome = (
     PendingRevoke,
 );
 
-/// Issue one HTTP credential's synthetic token.
+/// Issue one proxy-served credential's synthetic token.
 ///
 /// The same shape as [`mint_one`] so the loop above does not care which it
 /// called, but nothing here talks to a backend: the "principal" is a signed
-/// statement, and the real key stays in the session's master map where the
-/// proxy will look it up when a request arrives carrying this token.
-fn issue_http(
+/// statement, and the real credential stays in the session's master map where
+/// whichever proxy the token is presented to will look it up.
+///
+/// Which proxy that is decides only what *fields* are published — the token
+/// itself is the same signed statement either way, because both proxies verify
+/// it with the same key.
+fn issue_synthetic(
     profile: &Profile,
     spec: &CredentialSpec,
     grant: ProxyGrant<'_>,
 ) -> Result<MintOutcome, String> {
-    // Parsed rather than assumed: reaching here means the registry said this
-    // kind is the proxy's, and a config that does not resolve to a kind is a
-    // profile that should not have loaded.
-    briefcred_core::minters::http::HttpKind::parse(&spec.kind, &spec.config)
-        .ok_or_else(|| format!("`{}` is not an HTTP credential kind", spec.kind))?
-        .map_err(|e| e.to_string())?;
+    let fields = if spec.kind == briefcred_core::minters::postgres_proxy::KIND {
+        pg_proxy_fields(spec, grant)?
+    } else {
+        // Parsed rather than assumed: reaching here means the registry said
+        // this kind is a proxy's, and a config that does not resolve to a kind
+        // is a profile that should not have loaded.
+        briefcred_core::minters::http::HttpKind::parse(&spec.kind, &spec.config)
+            .ok_or_else(|| format!("`{}` is not a proxy-served credential kind", spec.kind))?
+            .map_err(|e| e.to_string())?;
+        HttpFields::Http
+    };
+    issue(profile, spec, grant, fields)
+}
 
+/// Which set of fields a proxy-served credential publishes.
+enum HttpFields {
+    /// `TOKEN` and `PROXY_URL`, for the HTTP proxy's three kinds.
+    Http,
+    /// The six a PostgreSQL client reads, for `postgres-proxy`.
+    Postgres(
+        briefcred_core::minters::postgres_proxy::PgProxyConfig,
+        String,
+    ),
+}
+
+/// The Postgres proxy's configuration and address, or why it cannot be served.
+fn pg_proxy_fields(spec: &CredentialSpec, grant: ProxyGrant<'_>) -> Result<HttpFields, String> {
+    let config =
+        briefcred_core::minters::postgres_proxy::PgProxyConfig::parse(&spec.kind, &spec.config)
+            .ok_or_else(|| format!("`{}` is not a Postgres proxy credential", spec.kind))?
+            .map_err(|e| e.to_string())?;
+    let address = grant.pg_proxy_addr.ok_or_else(|| {
+        "the Postgres proxy is not running; set `pg_proxy_enabled = true` in daemon.toml"
+            .to_string()
+    })?;
+    Ok(HttpFields::Postgres(config, address.to_string()))
+}
+
+/// Sign the token and publish the fields the credential's proxy expects.
+fn issue(
+    profile: &Profile,
+    spec: &CredentialSpec,
+    grant: ProxyGrant<'_>,
+    fields: HttpFields,
+) -> Result<MintOutcome, String> {
     let config = to_json(&spec.config)?;
     let mint_id = MintId::generate();
     let now = OffsetDateTime::now_utc().unix_timestamp();
@@ -313,15 +362,12 @@ fn issue_http(
         )
         .map_err(|e| e.to_string())?;
 
-    let mut values: BTreeMap<String, Zeroizing<String>> = BTreeMap::new();
-    values.insert(
-        briefcred_core::minters::http::TOKEN_FIELD.to_string(),
-        issued.token.clone(),
-    );
-    values.insert(
-        briefcred_core::minters::http::PROXY_URL_FIELD.to_string(),
-        Zeroizing::new(grant.issuer.proxy_url().to_string()),
-    );
+    let values = match fields {
+        HttpFields::Http => http_fields(&issued.token, grant.issuer.proxy_url()),
+        HttpFields::Postgres(pg, address) => {
+            postgres_fields(&issued.token, grant.session_id, &pg, &address)
+        }
+    };
 
     Ok((
         MintSummary {
@@ -350,6 +396,67 @@ fn issue_http(
             not_before_unix_ms: 0,
         },
     ))
+}
+
+/// The two fields an `http-*` credential publishes.
+fn http_fields(token: &Zeroizing<String>, proxy_url: &str) -> BTreeMap<String, Zeroizing<String>> {
+    BTreeMap::from([
+        (
+            briefcred_core::minters::http::TOKEN_FIELD.to_string(),
+            token.clone(),
+        ),
+        (
+            briefcred_core::minters::http::PROXY_URL_FIELD.to_string(),
+            Zeroizing::new(proxy_url.to_string()),
+        ),
+    ])
+}
+
+/// The six fields a `postgres-proxy` credential publishes.
+///
+/// Every one of them points at the proxy rather than at the real server, and
+/// the only password among them is the synthetic token. The session identifier
+/// is the user, because the proxy has to know which session is connecting
+/// before it has seen a password and the startup packet's `user` is the only
+/// field that arrives that early.
+///
+/// Nothing here is percent-encoded, and nothing needs to be: a session id is
+/// hexadecimal and a token is `bc.` followed by two unpadded base64url strings,
+/// so neither can carry a character that would end the userinfo early. The
+/// assertion in this module's tests is what keeps that true.
+fn postgres_fields(
+    token: &Zeroizing<String>,
+    session_id: &str,
+    config: &briefcred_core::minters::postgres_proxy::PgProxyConfig,
+    address: &str,
+) -> BTreeMap<String, Zeroizing<String>> {
+    use briefcred_core::minters::postgres_proxy as pg;
+
+    let (host, port) = address
+        .rsplit_once(':')
+        .map(|(host, port)| (host.to_string(), port.to_string()))
+        .unwrap_or_else(|| (address.to_string(), String::new()));
+    BTreeMap::from([
+        (
+            pg::DATABASE_URL_FIELD.to_string(),
+            Zeroizing::new(format!(
+                "postgresql://{session_id}:{}@{address}/{}",
+                token.as_str(),
+                config.dbname
+            )),
+        ),
+        (pg::PGHOST_FIELD.to_string(), Zeroizing::new(host)),
+        (pg::PGPORT_FIELD.to_string(), Zeroizing::new(port)),
+        (
+            pg::PGDATABASE_FIELD.to_string(),
+            Zeroizing::new(config.dbname.clone()),
+        ),
+        (
+            pg::PGUSER_FIELD.to_string(),
+            Zeroizing::new(session_id.to_string()),
+        ),
+        (pg::PGPASSWORD_FIELD.to_string(), token.clone()),
+    ])
 }
 
 /// Mint one credential through its helper.
@@ -584,6 +691,111 @@ credentials:
         let text = err.to_string();
         assert!(text.contains("wharehouse"), "{text}");
         assert!(text.contains("db, warehouse"), "{text}");
+    }
+
+    /// A profile with one credential of `kind`, configured with `config`.
+    fn one_credential(kind: &str, config: &str) -> Profile {
+        profile(&format!(
+            "name: dev\ncredentials:\n  - name: warehouse\n    kind: {kind}\n    ttl_secs: 900\n{config}"
+        ))
+    }
+
+    const PG_CONFIG: &str = "    config:\n      host: db.internal\n      port: 6432\n      dbname: analytics\n      user: reporting\n";
+
+    /// An issuer backed by a throwaway file key store.
+    fn issuer() -> (tempfile::TempDir, std::sync::Arc<ProxyIssuer>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::new(briefcred_core::keystore::FileKeyStore::new(dir.path()));
+        (dir, ProxyIssuer::open(store, "http://127.0.0.1:9318"))
+    }
+
+    fn mint_proxy_credential(
+        profile: &Profile,
+        pg_proxy_addr: Option<&str>,
+    ) -> Result<MintOutcome, String> {
+        let (_dir, issuer) = issuer();
+        issue_synthetic(
+            profile,
+            &profile.credentials[0],
+            ProxyGrant {
+                issuer: &issuer,
+                session_id: "0f1e2d3c4b5a6978",
+                session_pubkey: None,
+                pg_proxy_addr,
+            },
+        )
+    }
+
+    #[test]
+    fn a_postgres_proxy_credential_publishes_the_six_fields_a_client_reads() {
+        let profile = one_credential("postgres-proxy", PG_CONFIG);
+        let (summary, values, pending) =
+            mint_proxy_credential(&profile, Some("127.0.0.1:9319")).unwrap();
+
+        let names: Vec<&str> = values.keys().map(String::as_str).collect();
+        let mut expected = briefcred_core::minters::postgres_proxy::FIELDS;
+        expected.sort_unstable();
+        assert_eq!(
+            names, expected,
+            "the map is ordered, so sort the expectation"
+        );
+
+        assert_eq!(&*values["PGHOST"], "127.0.0.1");
+        assert_eq!(&*values["PGPORT"], "9319");
+        assert_eq!(&*values["PGDATABASE"], "analytics");
+        assert_eq!(&*values["PGUSER"], "0f1e2d3c4b5a6978");
+        // The password is the synthetic token, never the master.
+        assert!(
+            values["PGPASSWORD"].starts_with("bc."),
+            "{:?}",
+            summary.credential
+        );
+        assert_eq!(
+            &*values["DATABASE_URL"],
+            &format!(
+                "postgresql://0f1e2d3c4b5a6978:{}@127.0.0.1:9319/analytics",
+                values["PGPASSWORD"].as_str()
+            )
+        );
+        assert_eq!(pending.credential, "warehouse");
+        assert_eq!(pending.revoke_token, "0f1e2d3c4b5a6978");
+    }
+
+    #[test]
+    fn nothing_in_the_connection_string_needs_percent_encoding() {
+        // A session id is hexadecimal and a token is `bc.` plus two unpadded
+        // base64url strings. If either ever grew a `@`, a `/`, or a `:`, the
+        // URL would silently point somewhere else.
+        let profile = one_credential("postgres-proxy", PG_CONFIG);
+        let (_summary, values, _pending) =
+            mint_proxy_credential(&profile, Some("127.0.0.1:9319")).unwrap();
+        let userinfo = format!("{}:{}", &*values["PGUSER"], &*values["PGPASSWORD"]);
+        assert!(
+            userinfo
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b":.-_".contains(&b)),
+            "{userinfo} carries a character a URL would read as a delimiter"
+        );
+    }
+
+    #[test]
+    fn a_postgres_proxy_credential_cannot_be_minted_without_a_proxy_to_point_at() {
+        // Publishing a `DATABASE_URL` for a port nothing answers on would turn
+        // a configuration mistake into a connection refused with no explanation.
+        let profile = one_credential("postgres-proxy", PG_CONFIG);
+        let err = mint_proxy_credential(&profile, None).unwrap_err();
+        assert!(err.contains("pg_proxy_enabled"), "{err}");
+    }
+
+    #[test]
+    fn an_http_credential_still_publishes_only_its_token_and_proxy_url() {
+        let profile = one_credential("http-bearer", "");
+        let (_summary, values, _pending) = mint_proxy_credential(&profile, None).unwrap();
+        assert_eq!(
+            values.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["PROXY_URL", "TOKEN"]
+        );
+        assert_eq!(&*values["PROXY_URL"], "http://127.0.0.1:9318");
     }
 
     #[test]

@@ -272,6 +272,14 @@ pub enum Response {
         /// reading `daemon.toml` and guessing whether the port was taken.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proxy_addr: Option<String>,
+        /// Where the Postgres proxy is listening, if it is enabled.
+        ///
+        /// The address a `postgres-proxy` credential's `DATABASE_URL` points
+        /// at, for the same reason: a user debugging "my agent cannot reach
+        /// the database" should not have to read `daemon.toml` and guess
+        /// whether the port was taken.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pg_proxy_addr: Option<String>,
     },
     /// Acknowledgement of [`Request::Shutdown`], sent before the daemon stops.
     ShuttingDown,
