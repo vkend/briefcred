@@ -407,17 +407,14 @@ pub async fn drain_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        let retry = if paused.load(std::sync::atomic::Ordering::SeqCst) {
-            Vec::new()
-        } else {
-            match queue.run_pass(revoker.as_ref(), &audit, &metrics).await {
-                Ok(retry) => retry,
-                Err(err) => {
-                    eprintln!("briefcred-daemon: revoke queue: {err}");
-                    Vec::new()
-                }
+        // The entries that will be retried are already back on the queue by the
+        // time `run_pass` returns, and the sleep below is computed from the
+        // queue itself, so the returned list is not needed here.
+        if !paused.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Err(err) = queue.run_pass(revoker.as_ref(), &audit, &metrics).await {
+                eprintln!("briefcred-daemon: revoke queue: {err}");
             }
-        };
+        }
         // Before the sleep, not after: the whole point is that nothing holds a
         // master while the queue is idle, and the queue is idle most of the
         // time. The exception is a queue that is mid-retry — see
@@ -433,7 +430,6 @@ pub async fn drain_loop(
         // Sleep until the earliest thing on the queue is due, so one stubborn
         // entry does not hold up one that has only just arrived.
         let wait = queue.next_due_in().await.unwrap_or(MAX_BACKOFF);
-        let _ = &retry;
 
         tokio::select! {
             _ = crate::server::shutdown_requested(&mut shutdown) => return,

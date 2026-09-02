@@ -144,13 +144,6 @@ fn http_get(addr: &str, path: &str) -> String {
     body
 }
 
-struct Timer(&'static str, std::time::Instant);
-impl Drop for Timer {
-    fn drop(&mut self) {
-        eprintln!("TIME {} {:?}", self.0, self.1.elapsed());
-    }
-}
-
 fn audit_rows(dir: &Path) -> Vec<AuditEntry> {
     let mut rows = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -164,11 +157,6 @@ fn audit_rows(dir: &Path) -> Vec<AuditEntry> {
 
 #[tokio::test]
 async fn the_daemon_pings_reports_status_serves_metrics_and_shuts_down() {
-    let __t = std::time::Instant::now();
-    let __g = Timer(
-        "the_daemon_pings_reports_status_serves_metrics_and_shuts_down",
-        __t,
-    );
     let mut daemon = Daemon::start("retention_days = 90\nmetrics_port = 0\n");
     let mut stream = daemon.connect().await;
 
@@ -247,8 +235,6 @@ async fn the_daemon_pings_reports_status_serves_metrics_and_shuts_down() {
 
 #[tokio::test]
 async fn the_socket_and_its_directory_are_private_to_the_owner() {
-    let __t = std::time::Instant::now();
-    let __g = Timer("the_socket_and_its_directory_are_private_to_the_owner", __t);
     let daemon = Daemon::start("metrics_enabled = false\n");
     let _stream = daemon.connect().await;
 
@@ -268,8 +254,6 @@ async fn the_socket_and_its_directory_are_private_to_the_owner() {
 
 #[tokio::test]
 async fn metrics_can_be_switched_off_entirely() {
-    let __t = std::time::Instant::now();
-    let __g = Timer("metrics_can_be_switched_off_entirely", __t);
     let daemon = Daemon::start("metrics_enabled = false\n");
     let mut stream = daemon.connect().await;
 
@@ -281,11 +265,6 @@ async fn metrics_can_be_switched_off_entirely() {
 
 #[tokio::test]
 async fn a_socket_left_behind_by_a_dead_daemon_is_cleared_on_start() {
-    let __t = std::time::Instant::now();
-    let __g = Timer(
-        "a_socket_left_behind_by_a_dead_daemon_is_cleared_on_start",
-        __t,
-    );
     let home = tempfile::tempdir().unwrap();
     // A plain file where the socket belongs: what a SIGKILLed daemon leaves.
     std::fs::write(home.path().join("sock"), b"stale").unwrap();
@@ -315,8 +294,6 @@ async fn a_socket_left_behind_by_a_dead_daemon_is_cleared_on_start() {
 
 #[tokio::test]
 async fn a_second_daemon_refuses_to_take_over_a_live_socket() {
-    let __t = std::time::Instant::now();
-    let __g = Timer("a_second_daemon_refuses_to_take_over_a_live_socket", __t);
     let daemon = Daemon::start("metrics_enabled = false\n");
     let _stream = daemon.connect().await;
 
@@ -331,11 +308,6 @@ async fn a_second_daemon_refuses_to_take_over_a_live_socket() {
 
 #[tokio::test]
 async fn shutdown_does_not_wait_out_the_drain_timeout_on_idle_connections() {
-    let __t = std::time::Instant::now();
-    let __g = Timer(
-        "shutdown_does_not_wait_out_the_drain_timeout_on_idle_connections",
-        __t,
-    );
     let mut daemon = Daemon::start("metrics_enabled = false\n");
     let mut control = daemon.connect().await;
     // A second connection that is open, authenticated, and silent. Before the
@@ -359,8 +331,6 @@ async fn shutdown_does_not_wait_out_the_drain_timeout_on_idle_connections() {
 
 #[tokio::test]
 async fn sigterm_stops_the_daemon_and_says_so_in_the_audit_log() {
-    let __t = std::time::Instant::now();
-    let __g = Timer("sigterm_stops_the_daemon_and_says_so_in_the_audit_log", __t);
     let mut daemon = Daemon::start("metrics_enabled = false\n");
     let _stream = daemon.connect().await;
 

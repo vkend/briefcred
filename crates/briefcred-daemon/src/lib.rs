@@ -542,8 +542,13 @@ pub async fn run_with(startup: Startup) -> Result<()> {
 ///
 /// The socket is already bound, so the daemon being replaced connects and then
 /// waits here for the hello — which is exactly the interval in which it is
-/// still accepting IPC and its blob does not yet exist. Nothing outside a test
-/// sets the variable, and a daemon that ignores it behaves as it always did.
+/// still accepting IPC and its blob does not yet exist.
+///
+/// Compiled only into a debug build. An environment variable that makes a
+/// shipping daemon sit in the middle of a handoff is a denial of service
+/// anything running as the user could arrange, and the test that needs it runs
+/// against a debug binary.
+#[cfg(debug_assertions)]
 async fn takeover_delay() {
     let Some(millis) = std::env::var("BRIEFCRED_TEST_TAKEOVER_DELAY_MS")
         .ok()
@@ -554,6 +559,10 @@ async fn takeover_delay() {
     eprintln!("briefcred-daemon: BRIEFCRED_TEST_TAKEOVER_DELAY_MS is set; waiting {millis} ms");
     tokio::time::sleep(Duration::from_millis(millis)).await;
 }
+
+/// The release build's version: no variable, no wait, nothing to reach.
+#[cfg(not(debug_assertions))]
+async fn takeover_delay() {}
 
 /// Turn an adopted descriptor into a listening TCP socket.
 fn adopt_tcp(fd: OwnedFd, what: &'static str) -> Result<(tokio::net::TcpListener, SocketAddr)> {
