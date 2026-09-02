@@ -1,6 +1,6 @@
 //! The command surface and its output.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use briefcred_core::ca::machine_hostname;
 use briefcred_core::paths::Paths;
@@ -8,7 +8,7 @@ use briefcred_proto::Response;
 use clap::{Parser, Subcommand};
 
 use crate::error::{Error, Result};
-use crate::{audit, bootstrap, ca, client, exec, install, lifecycle, mcp, trust};
+use crate::{audit, bootstrap, ca, client, exec, install, lifecycle, mcp, signing, trust};
 
 /// A local, biometric-gated credential broker for AI agents and tooling.
 #[derive(Debug, Parser)]
@@ -113,11 +113,35 @@ pub enum Command {
 pub enum ProfileAction {
     /// Interactively write a profile and store its master credential.
     Bootstrap,
-    /// Print one profile as the daemon parsed it.
+    /// Print one profile as the daemon parsed it, and where it came from.
     Show {
         /// The profile's name.
         name: String,
     },
+    /// Generate a minisign signing key pair for publishing profiles.
+    Keygen {
+        /// Directory to write `briefcred.key` and `briefcred.pub` into.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Sign a profile, writing `<file>.minisig` beside it.
+    Sign {
+        /// The file to sign.
+        file: PathBuf,
+        /// The secret key to sign with.
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Check a profile against its `.minisig` and a public key.
+    Verify {
+        /// The file to check.
+        file: PathBuf,
+        /// The public key to check it against.
+        #[arg(long = "pub")]
+        public_key: PathBuf,
+    },
+    /// Fetch every registry in daemon.toml, verifying as it goes.
+    Sync,
 }
 
 /// The `briefcred ca` subcommands.
@@ -239,7 +263,7 @@ pub async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
-        Command::Profile { action } => run_profile(&paths, action).await.map(|()| 0),
+        Command::Profile { action } => run_profile(&paths, action).await,
     }
 }
 
@@ -256,7 +280,7 @@ fn stdout_is_tty() -> bool {
     }
 }
 
-async fn run_profile(paths: &Paths, action: ProfileAction) -> Result<()> {
+async fn run_profile(paths: &Paths, action: ProfileAction) -> Result<u8> {
     match action {
         ProfileAction::Bootstrap => {
             let source_kind = master_source_kind(paths)?;
@@ -268,7 +292,7 @@ async fn run_profile(paths: &Paths, action: ProfileAction) -> Result<()> {
                 "
 the daemon reloads profiles by itself; 'briefcred profiles' will show it"
             );
-            Ok(())
+            Ok(0)
         }
         ProfileAction::Show { name } => {
             let reply =
@@ -276,15 +300,60 @@ the daemon reloads profiles by itself; 'briefcred profiles' will show it"
                     .await?;
             match reply {
                 Response::Profile { profile } => {
-                    print_profiles(&Response::Profiles {
-                        profiles: vec![profile],
-                    });
-                    Ok(())
+                    print_profile_detail(&profile);
+                    Ok(0)
                 }
                 Response::Error { message } => Err(Error::Refused(message)),
                 other => Err(Error::Unexpected(format!("{other:?}"))),
             }
         }
+        ProfileAction::Keygen { out } => signing::keygen(&out).map(|()| 0),
+        ProfileAction::Sign { file, key } => signing::sign(&file, &key).map(|()| 0),
+        ProfileAction::Verify { file, public_key } => {
+            signing::verify(&file, &public_key).map(|()| 0)
+        }
+        ProfileAction::Sync => signing::sync(paths).await,
+    }
+}
+
+/// Everything `briefcred profile show` prints about one profile.
+///
+/// The provenance block is the reason this command exists rather than being a
+/// one-row table: before running a profile, the question worth answering is
+/// who wrote it and who vouched for it.
+fn print_profile_detail(profile: &briefcred_proto::ProfileSummary) {
+    println!("{}", profile.name);
+    if let Some(description) = &profile.description {
+        println!("  description  {description}");
+    }
+    println!(
+        "  unlock       {} ({}s cache)",
+        profile.unlock_policy, profile.unlock_cache_secs
+    );
+    println!("  source       {}", profile.source);
+    println!("  signature    {}", profile.signature);
+    if let Some(key_id) = &profile.signer_key_id {
+        println!("  signed by    {key_id}");
+    }
+    if let Some(shadowed) = &profile.overrides {
+        println!(
+            "  overrides    the `{}` profile published by {shadowed}",
+            profile.name
+        );
+    }
+    if profile.signature == "dev_mode" {
+        println!("  !! this profile was NOT verified; dev_mode is on");
+    }
+    if profile.credentials.is_empty() {
+        println!("  credentials  none");
+        return;
+    }
+    println!("  credentials");
+    for credential in &profile.credentials {
+        println!(
+            "    {} ({}, {}s, master `{}`)",
+            credential.name, credential.kind, credential.ttl_secs, credential.source_key
+        );
     }
 }
 
@@ -314,7 +383,18 @@ fn print_profiles(reply: &Response) {
         println!("no profiles; run 'briefcred profile bootstrap' to write one");
         return;
     }
-    println!("{:<20}{:<12}{:<8}CREDENTIALS", "PROFILE", "UNLOCK", "CACHE");
+    // The warning goes above the table rather than in a column: a profile
+    // running unverified is not a property to scan a column for.
+    for profile in profiles.iter().filter(|p| p.signature == "dev_mode") {
+        println!(
+            "!! `{}` was NOT verified and is loaded only because dev_mode is on",
+            profile.name
+        );
+    }
+    println!(
+        "{:<20}{:<12}{:<8}{:<20}{:<10}CREDENTIALS",
+        "PROFILE", "UNLOCK", "CACHE", "SOURCE", "SIGNATURE"
+    );
     for profile in profiles {
         let credentials = if profile.credentials.is_empty() {
             "-".to_string()
@@ -327,10 +407,12 @@ fn print_profiles(reply: &Response) {
                 .join(", ")
         };
         println!(
-            "{:<20}{:<12}{:<8}{credentials}",
+            "{:<20}{:<12}{:<8}{:<20}{:<10}{credentials}",
             profile.name,
             profile.unlock_policy,
-            format!("{}s", profile.unlock_cache_secs)
+            format!("{}s", profile.unlock_cache_secs),
+            profile.source,
+            profile.signature
         );
     }
 }
@@ -730,6 +812,24 @@ mod tests {
             vec!["briefcred", "audit", "--since", "24h", "--json"],
             vec!["briefcred", "profile", "bootstrap"],
             vec!["briefcred", "profile", "show", "db-ro"],
+            vec!["briefcred", "profile", "keygen", "--out", "/tmp/keys"],
+            vec![
+                "briefcred",
+                "profile",
+                "sign",
+                "/tmp/a.yaml",
+                "--key",
+                "/tmp/keys/briefcred.key",
+            ],
+            vec![
+                "briefcred",
+                "profile",
+                "verify",
+                "/tmp/a.yaml",
+                "--pub",
+                "/tmp/keys/briefcred.pub",
+            ],
+            vec!["briefcred", "profile", "sync"],
         ] {
             Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }

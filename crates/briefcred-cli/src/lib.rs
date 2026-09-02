@@ -19,6 +19,7 @@ pub mod lifecycle;
 pub mod mcp;
 pub mod service;
 pub mod session_key;
+pub mod signing;
 pub mod trust;
 
 pub use cli::{Cli, Command, DaemonAction, ProfileAction};

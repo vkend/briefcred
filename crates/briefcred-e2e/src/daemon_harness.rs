@@ -50,19 +50,41 @@ pub struct Daemon {
 /// binaries run concurrently, and one of them would lose the race to whichever
 /// daemon the developer actually has installed.
 fn with_ephemeral_ports(config: &str) -> String {
-    let mut config = config.to_string();
-    for line in ["metrics_port = 0", "proxy_port = 0", "pg_proxy_port = 0"] {
-        let key = line.split_whitespace().next().expect("a key");
-        if !config
-            .lines()
-            .any(|existing| existing.trim_start().starts_with(key))
-        {
-            config.push('\n');
-            config.push_str(line);
+    let missing: Vec<&str> = ["metrics_port = 0", "proxy_port = 0", "pg_proxy_port = 0"]
+        .into_iter()
+        .filter(|line| {
+            let key = line.split_whitespace().next().expect("a key");
+            !config
+                .lines()
+                .any(|existing| existing.trim_start().starts_with(key))
+        })
+        .collect();
+
+    // Inserted before the first table header, not appended. These are
+    // top-level keys, and in TOML a key written after `[profiles]` belongs to
+    // `[profiles]` — so appending would silently move the daemon's ports into
+    // whichever table a test happened to write last, and the daemon would
+    // refuse to start with a message about the wrong key entirely.
+    let mut out = String::new();
+    let mut inserted = false;
+    for line in config.lines() {
+        if !inserted && line.trim_start().starts_with('[') {
+            for extra in &missing {
+                out.push_str(extra);
+                out.push('\n');
+            }
+            inserted = true;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !inserted {
+        for extra in &missing {
+            out.push_str(extra);
+            out.push('\n');
         }
     }
-    config.push('\n');
-    config
+    out
 }
 
 impl Daemon {
