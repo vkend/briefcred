@@ -5,7 +5,9 @@
 
 use std::path::Path;
 
-use briefcred_cli::service::{launch_agent_plist, systemd_unit, ServiceSpec};
+use briefcred_cli::service::{
+    launch_agent_plist, systemd_socket_unit, systemd_unit, Ports, ServiceSpec,
+};
 use briefcred_core::paths::{Paths, Platform};
 
 fn spec(platform: Platform) -> ServiceSpec {
@@ -113,4 +115,77 @@ fn both_files_point_at_the_same_home_the_paths_resolved() {
     assert_eq!(spec.label(), "dev.briefcred.daemon");
     assert!(spec.stdout_log().ends_with("logs/daemon.out.log"));
     assert!(spec.stderr_log().ends_with("logs/daemon.err.log"));
+}
+
+#[test]
+fn the_systemd_socket_unit_is_exactly_this() {
+    let expected = "\
+[Unit]
+Description=briefcred credential broker sockets
+Documentation=https://github.com/briefcred/briefcred
+
+[Socket]
+ListenStream=/tmp/bc/sock
+ListenStream=127.0.0.1:9317
+ListenStream=127.0.0.1:9318
+ListenStream=127.0.0.1:9319
+SocketMode=0600
+Service=briefcred.service
+
+[Install]
+WantedBy=sockets.target
+";
+    assert_eq!(systemd_socket_unit(&spec(Platform::Linux)), expected);
+}
+
+#[test]
+fn the_socket_unit_binds_the_ports_daemon_toml_names() {
+    // The unit and the daemon have to agree about which listener is which, and
+    // an operator who moved the proxy off 9318 moved it for the whole machine.
+    let ports = Ports::from_daemon_toml("metrics_port = 19317\npg_proxy_port = 19319\n");
+    let unit = systemd_socket_unit(&spec(Platform::Linux).with_ports(ports));
+
+    assert!(unit.contains("ListenStream=127.0.0.1:19317"), "{unit}");
+    assert!(
+        unit.contains("ListenStream=127.0.0.1:9318"),
+        "a port the file does not name keeps its default: {unit}"
+    );
+    assert!(unit.contains("ListenStream=127.0.0.1:19319"), "{unit}");
+}
+
+#[test]
+fn a_daemon_toml_this_binary_cannot_parse_still_installs() {
+    // An install must never fail because the running daemon's configuration
+    // has a key this `briefcred` is too old to know about.
+    assert_eq!(
+        Ports::from_daemon_toml("this is not toml at all ["),
+        Ports::default()
+    );
+    assert_eq!(
+        Ports::from_daemon_toml("proxy_port = 99999999\n"),
+        Ports::default(),
+        "a port that is not a port keeps the default rather than truncating"
+    );
+}
+
+#[test]
+fn the_socket_unit_lists_its_streams_in_the_order_the_daemon_adopts_them() {
+    // systemd says only how many descriptors it passed, so the order here and
+    // the daemon's `handoff::ACTIVATION_ORDER` are one fact in two places.
+    // Swapping two lines would have the daemon serve its HTTP proxy on the
+    // metrics port and publish nothing anybody could scrape.
+    let unit = systemd_socket_unit(&spec(Platform::Linux));
+    let streams: Vec<&str> = unit
+        .lines()
+        .filter_map(|line| line.strip_prefix("ListenStream="))
+        .collect();
+    assert_eq!(
+        streams,
+        vec![
+            "/tmp/bc/sock",
+            "127.0.0.1:9317",
+            "127.0.0.1:9318",
+            "127.0.0.1:9319"
+        ]
+    );
 }

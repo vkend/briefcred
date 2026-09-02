@@ -16,7 +16,7 @@ use briefcred_core::paths::Paths;
 
 use crate::error::{Error, Result};
 use crate::lifecycle;
-use crate::service::{unit_text, ServiceSpec};
+use crate::service::{systemd_socket_unit, unit_text, ServiceSpec};
 use crate::trust;
 
 /// The `daemon.toml` written on a first install.
@@ -203,7 +203,10 @@ pub fn provision(
         report.files.push((config, "starter configuration"));
     }
 
-    let spec = ServiceSpec::new(paths, daemon_binary);
+    let spec =
+        ServiceSpec::new(paths, daemon_binary).with_ports(crate::service::Ports::from_daemon_toml(
+            &std::fs::read_to_string(paths.daemon_toml()).unwrap_or_default(),
+        ));
     let unit = paths.service_file();
     if !dry_run {
         // The service directory belongs to launchd or systemd and is expected
@@ -214,6 +217,21 @@ pub fn provision(
         set_mode(&unit, 0o644)?;
     }
     report.files.push((unit, "service unit"));
+
+    // Only on Linux, and only because systemd is the one service manager here
+    // that can hold the listeners itself: with the socket unit in place a
+    // client connecting while the daemon restarts is queued rather than
+    // refused. launchd has no equivalent this daemon uses, so on macOS the
+    // daemon binds its own and `briefcred daemon upgrade` is the seamless path.
+    if paths.platform() == briefcred_core::paths::Platform::Linux {
+        let socket_unit = paths.service_dir().join("briefcred.socket");
+        if !dry_run {
+            std::fs::write(&socket_unit, systemd_socket_unit(&spec))
+                .map_err(|e| Error::io("write", &socket_unit, e))?;
+            set_mode(&socket_unit, 0o644)?;
+        }
+        report.files.push((socket_unit, "socket-activation unit"));
+    }
 
     if !dry_run {
         // Idempotent: a reinstall keeps the CA the machine already trusts,
@@ -268,11 +286,15 @@ pub fn uninstall(paths: &Paths) -> Result<Removal> {
 pub fn remove_files(paths: &Paths) -> Result<Removal> {
     let mut removal = Removal::default();
 
-    let unit = paths.service_file();
-    match std::fs::remove_file(&unit) {
-        Ok(()) => removal.removed.push(unit),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(Error::io("remove", &unit, err)),
+    for unit in [
+        paths.service_file().to_path_buf(),
+        paths.service_dir().join("briefcred.socket"),
+    ] {
+        match std::fs::remove_file(&unit) {
+            Ok(()) => removal.removed.push(unit),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(Error::io("remove", &unit, err)),
+        }
     }
 
     match std::fs::remove_file(paths.sock()) {

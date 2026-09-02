@@ -28,6 +28,7 @@ pub mod minisign;
 pub mod minters;
 pub mod paths;
 pub mod policy;
+pub mod ports;
 pub mod profile;
 pub mod registry;
 pub mod session_env;

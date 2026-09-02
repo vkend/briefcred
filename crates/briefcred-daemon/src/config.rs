@@ -18,21 +18,9 @@ use crate::error::{Error, Result};
 /// How many days of audit logs are kept when the file says nothing.
 pub const DEFAULT_RETENTION_DAYS: u32 = 90;
 
-/// The Prometheus port used when the file says nothing.
-pub const DEFAULT_METRICS_PORT: u16 = 9317;
-
-/// The HTTP proxy port used when the file says nothing.
-///
-/// One past the metrics port, so the two briefcred listens on are adjacent and
-/// an operator who has allowed one through a local firewall knows where the
-/// other is.
-pub const DEFAULT_PROXY_PORT: u16 = 9318;
-
-/// The Postgres proxy port used when the file says nothing.
-///
-/// One past the HTTP proxy's, so briefcred's three loopback listeners are
-/// adjacent and an operator who has found one knows where the others are.
-pub const DEFAULT_PG_PROXY_PORT: u16 = 9319;
+// Owned by `briefcred_core::ports`, because `briefcred install` writes the same
+// three numbers into a systemd socket unit and the two must not drift apart.
+pub use briefcred_core::ports::{DEFAULT_METRICS_PORT, DEFAULT_PG_PROXY_PORT, DEFAULT_PROXY_PORT};
 
 /// How often the reconciler sweeps when the file says nothing.
 pub const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = crate::reconcile::DEFAULT_INTERVAL_SECS;
