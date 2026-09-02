@@ -241,7 +241,7 @@ briefcred profile schema > ~/.config/briefcred-profile.schema.json
           "default": []
         },
         "allow_args": {
-          "description": "Regular expressions every argument must match one of. Empty means \"any\".",
+          "description": "Regular expressions every argument must match one of. Empty means \"any\".\n\nThe match is **unanchored**: a pattern matches if it occurs anywhere in\nthe argument, so `DROP` permits `--x=DROP` and `SELECT` permits\n`NOT SELECT`. Anchor the patterns yourself with `^` and `$` wherever the\nwhole argument is what you mean, as in `'^-c$'`.\n\nLeft unanchored rather than changed, because anchoring silently would\nturn every existing profile's substring pattern into one that matches\nnothing — a list that refuses every argument rather than one that\npermits too many, which is a failure an operator discovers at the worst\nmoment.",
           "type": "array",
           "items": {
             "type": "string"

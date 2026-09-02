@@ -8,6 +8,18 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Fixed
 
+- **`briefcred install` and `briefcred daemon start|restart|stop` exit non-zero
+  when the daemon never reached the state that was asked for.** The service
+  manager accepting the job is not the daemon running, and a script had no way
+  to tell the difference from the exit code.
+- **Documentation corrections.** `allow_args` patterns are unanchored, and the
+  README and profile schema now say so. A `postgres-proxy` connection open when
+  its token expires *is* torn down, and the warehouse example no longer claims
+  otherwise. The daemon does not notice a dead wrapper by its socket closing;
+  the comments that said it did have been corrected. `briefcred-proto`'s header
+  no longer claims nothing on the wire carries credential material, since
+  `Response::Minted` does.
+
 - **An MCP quota refusal writes a `session_close` row.** The session opened for
   the call was closed again with no matching close row, so the audit log read
   as a session still holding masters. It is now recorded with the reason

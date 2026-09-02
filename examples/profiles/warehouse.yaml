@@ -46,8 +46,11 @@ credentials:
 
     # An hour. The token stops verifying at the end of it, and an agent working
     # through a long analysis should not have to be re-unlocked mid-task. A
-    # connection already open when the token expires is not torn down — the
-    # token authenticates the *opening* of a connection.
+    # connection already open when the token expires *is* torn down: the proxy
+    # re-checks every live connection once a second and closes it within about
+    # a second of the token expiring, the grant being revoked, or the session
+    # going away. So this is the outer bound on a query as well as on a
+    # connect.
     ttl_secs: 3600
 
     config:

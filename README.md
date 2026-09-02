@@ -504,6 +504,22 @@ entry that is a path permits only that path, which is how you pin a binary. An
 empty list means "any", for both allowlists, and is worth narrowing before an
 agent uses the profile.
 
+`allow_args` is a list of regular expressions, and each argument has to match at
+least one of them. **The match is unanchored**: a pattern matches if it occurs
+anywhere in the argument, so `DROP` also permits `--x=DROP` and `SELECT` also
+permits `NOT SELECT`. Anchor the patterns yourself wherever the whole argument
+is what you mean:
+
+```yaml
+exec:
+  allow_args: ['^-c$', '^SELECT ']   # `-c` exactly, then a statement
+```
+
+An unanchored pattern is not a bug in a profile that meant one — `'^SELECT '`
+above is anchored at the front only, on purpose, because the rest of the
+statement follows. It is a bug in a profile that wrote `DROP` expecting an
+argument that *is* `DROP`.
+
 Three more keys govern the HTTP proxy, described under **The HTTP proxy**:
 
 ```yaml

@@ -6,8 +6,20 @@
 //! sending and the receiving side so a hostile or confused peer cannot make
 //! the daemon allocate 4 GiB from a four-byte header.
 //!
-//! Nothing on this wire carries credential material. The daemon's replies are
-//! metadata, in the same spirit as the audit log.
+//! # What crosses this wire
+//!
+//! Almost all of it is metadata, in the same spirit as the audit log. The
+//! exception is [`Response::Minted`], which carries the minted fields and the
+//! composed environment: the daemon is the only side that holds the profile,
+//! the masters and the CA paths at once, and the client's job is to apply what
+//! it is given to a child. That reply is why the socket is mode `0600` inside
+//! a `0700` directory and why the daemon checks the peer's uid before reading
+//! a frame.
+//!
+//! Every secret on this wire is a [`SecretString`], which redacts itself in
+//! `Debug` and is never written to a file or a log. No **master** credential
+//! ever crosses it in any reply: what `Minted` carries is the short-lived
+//! credential or the synthetic token that stands in for one.
 
 #![forbid(unsafe_code)]
 

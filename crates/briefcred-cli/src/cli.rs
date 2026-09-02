@@ -206,7 +206,11 @@ pub async fn run(cli: Cli) -> Result<u8> {
             let options = install::InstallOptions { dry_run, trust_ca };
             let report = install::install(&paths, &binary, options, keystore(&paths)?.as_ref())?;
             print_install(&report, dry_run);
-            Ok(0)
+            // A dry run installs nothing, so there is nothing for it to have
+            // failed at. A real one that ends with no daemon listening has not
+            // done what it says on the tin, and a script that checks the exit
+            // code has to be able to see that.
+            Ok(install_exit_code(dry_run, report.ready))
         }
         Command::Uninstall => {
             let removal = install::uninstall(&paths)?;
@@ -214,7 +218,7 @@ pub async fn run(cli: Cli) -> Result<u8> {
             Ok(0)
         }
         Command::Ca { action } => run_ca(&paths, action).map(|()| 0),
-        Command::Daemon { action } => run_daemon(&paths, action).await.map(|()| 0),
+        Command::Daemon { action } => run_daemon(&paths, action).await,
         Command::Exec {
             profile,
             credentials,
@@ -551,12 +555,12 @@ fn run_ca(paths: &Paths, action: CaAction) -> Result<()> {
     }
 }
 
-async fn run_daemon(paths: &Paths, action: DaemonAction) -> Result<()> {
+async fn run_daemon(paths: &Paths, action: DaemonAction) -> Result<u8> {
     match action {
         DaemonAction::Status => {
             let status = client::status(paths.sock()).await?;
             print_status(&status, paths.sock());
-            Ok(())
+            Ok(0)
         }
         // Each of these waits for the daemon to actually reach the requested
         // state. The service manager returns as soon as it has accepted the
@@ -564,32 +568,29 @@ async fn run_daemon(paths: &Paths, action: DaemonAction) -> Result<()> {
         // the daemon and reports it down.
         DaemonAction::Start => {
             lifecycle::run(&lifecycle::start_plan(paths))?;
-            report_settled(
+            Ok(report_settled(
                 install::wait_until_listening(paths.sock(), install::READY_TIMEOUT),
                 "started",
                 "listening",
-            );
-            Ok(())
+            ))
         }
         DaemonAction::Stop => {
             lifecycle::run(&lifecycle::stop_plan(paths))?;
-            report_settled(
+            Ok(report_settled(
                 install::wait_until_gone(paths.sock(), install::READY_TIMEOUT),
                 "stopped",
                 "gone",
-            );
-            Ok(())
+            ))
         }
         DaemonAction::Restart => {
             lifecycle::run(&lifecycle::restart_plan(paths))?;
-            report_settled(
+            Ok(report_settled(
                 install::wait_until_listening(paths.sock(), install::READY_TIMEOUT),
                 "restarted",
                 "listening",
-            );
-            Ok(())
+            ))
         }
-        DaemonAction::Upgrade { binary } => run_upgrade(paths, binary).await,
+        DaemonAction::Upgrade { binary } => run_upgrade(paths, binary).await.map(|()| 0),
     }
 }
 
@@ -660,15 +661,32 @@ async fn run_upgrade(paths: &Paths, binary: Option<std::path::PathBuf>) -> Resul
     }
 }
 
-fn report_settled(settled: bool, done: &str, expected: &str) {
+/// Say whether the daemon reached the state that was asked for, and answer
+/// with the exit code that says the same thing.
+///
+/// The service manager accepting the job is not the daemon running. A `daemon
+/// start` that ends with nothing listening has failed, and a script that
+/// starts the daemon and then uses it needs to find that out from the exit
+/// code rather than by reading the sentence.
+fn report_settled(settled: bool, done: &str, expected: &str) -> u8 {
     if settled {
         println!("daemon {done}");
-    } else {
-        println!(
-            "the service manager accepted the job, but the daemon was not {expected} after {} s",
-            install::READY_TIMEOUT.as_secs()
-        );
+        return 0;
     }
+    println!(
+        "the service manager accepted the job, but the daemon was not {expected} after {} s",
+        install::READY_TIMEOUT.as_secs()
+    );
+    1
+}
+
+/// What `briefcred install` exits with.
+///
+/// A dry run installs nothing, so there is nothing for it to have failed at. A
+/// real one that ends with no daemon listening has not done what it says on the
+/// tin, and a script that checks the exit code has to be able to see that.
+fn install_exit_code(dry_run: bool, ready: bool) -> u8 {
+    u8::from(!dry_run && !ready)
 }
 
 fn current_exe() -> Result<std::path::PathBuf> {
@@ -847,6 +865,26 @@ pub fn human_uptime(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lifecycle_command_that_never_settled_exits_non_zero() {
+        // The service manager accepting the job is not the daemon running. A
+        // script that starts the daemon and then uses it has to find out from
+        // the exit code, not from the sentence.
+        assert_eq!(super::report_settled(true, "started", "listening"), 0);
+        assert_eq!(super::report_settled(false, "started", "listening"), 1);
+        assert_eq!(super::report_settled(true, "stopped", "gone"), 0);
+        assert_eq!(super::report_settled(false, "stopped", "gone"), 1);
+    }
+
+    #[test]
+    fn an_install_that_left_no_daemon_listening_exits_non_zero() {
+        assert_eq!(super::install_exit_code(false, true), 0);
+        assert_eq!(super::install_exit_code(false, false), 1);
+        // A dry run provisions nothing and starts nothing, so "not listening"
+        // is the expected outcome rather than a failure.
+        assert_eq!(super::install_exit_code(true, false), 0);
+    }
+
     use super::*;
     use clap::CommandFactory;
 

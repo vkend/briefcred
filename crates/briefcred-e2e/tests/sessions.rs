@@ -58,9 +58,10 @@ struct Run {
 }
 
 async fn run_one(daemon: &Daemon) -> Run {
-    // One connection for the whole run, exactly as `briefcred exec` does: the
-    // daemon notices a dead wrapper by the socket closing, so a connection per
-    // request would be a different thing under test.
+    // One connection for the whole run, exactly as `briefcred exec` does. Not
+    // because the daemon watches the socket — it does not, and a killed wrapper
+    // is reaped by idle eviction and the reconciler — but because every request
+    // here belongs to one session and one connection is what a real run uses.
     let mut client = daemon.connect().await.expect("connect");
 
     let Response::SessionOpened { session_id, .. } = client

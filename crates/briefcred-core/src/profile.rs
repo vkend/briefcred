@@ -264,6 +264,17 @@ pub struct ExecPolicy {
     #[serde(default)]
     pub allow_argv0: Vec<String>,
     /// Regular expressions every argument must match one of. Empty means "any".
+    ///
+    /// The match is **unanchored**: a pattern matches if it occurs anywhere in
+    /// the argument, so `DROP` permits `--x=DROP` and `SELECT` permits
+    /// `NOT SELECT`. Anchor the patterns yourself with `^` and `$` wherever the
+    /// whole argument is what you mean, as in `'^-c$'`.
+    ///
+    /// Left unanchored rather than changed, because anchoring silently would
+    /// turn every existing profile's substring pattern into one that matches
+    /// nothing — a list that refuses every argument rather than one that
+    /// permits too many, which is a failure an operator discovers at the worst
+    /// moment.
     #[serde(default)]
     pub allow_args: Vec<String>,
 }

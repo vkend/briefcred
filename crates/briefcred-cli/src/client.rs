@@ -18,9 +18,13 @@ use crate::session_key::SessionKey;
 ///
 /// `briefcred exec` sends four — open, exec, done, close — and they have to be
 /// the same session's, so a connection per request would work but would make
-/// four connects where one will do. More importantly, holding the connection
-/// open for the length of the child's run is what lets the daemon notice that
-/// a wrapper died: the socket closes with the process.
+/// four connects where one will do.
+///
+/// The daemon does **not** watch this socket: a wrapper that is killed leaves
+/// its session behind, and what reaps it is idle eviction after
+/// `session_idle_secs`, or the reconciler sweeping the mints it never reported.
+/// The close on the happy path is the `CloseSession` request below, not the
+/// socket going away.
 pub struct Connection {
     stream: UnixStream,
 }
