@@ -83,6 +83,7 @@ pub async fn run() -> Result<()> {
     let profiles = Arc::new(ProfileStore::new(
         paths.profiles_dir(),
         briefcred_core::Registry::discover(),
+        config.profiles.trust()?,
     ));
     let sessions = Arc::new(SessionStore::new(clock.clone(), config.session_idle()));
 
@@ -367,8 +368,31 @@ impl revoke::Revoker for QueueRevoker {
 /// row is the only record that it did.
 fn report_reload(state: &State, outcome: Reload) {
     match outcome {
-        Reload::Loaded { count } => {
+        Reload::Loaded { count, warnings } => {
             eprintln!("briefcred-daemon: loaded {count} profile(s)");
+            for warning in warnings {
+                // Two lines per unverified file, one printed and one audited.
+                // The print is for whoever is watching the daemon start; the
+                // audit row is for whoever asks, next month, what this daemon
+                // was actually running.
+                let dev_mode = warning.contains("dev_mode");
+                eprintln!("briefcred-daemon: !! PROFILE NOT VERIFIED: {warning}");
+                let (path, reason) = match warning.split_once(": ") {
+                    Some((path, reason)) => (path.to_string(), reason.to_string()),
+                    None => (String::new(), warning.clone()),
+                };
+                state.audit(&AuditEntry::ProfileTrustWarning {
+                    ts: OffsetDateTime::now_utc(),
+                    path,
+                    action: if dev_mode {
+                        "loaded_dev_mode"
+                    } else {
+                        "dropped"
+                    }
+                    .to_string(),
+                    reason,
+                });
+            }
         }
         Reload::Failed { message } => {
             eprintln!("briefcred-daemon: keeping the last good profiles: {message}");

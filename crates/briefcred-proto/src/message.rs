@@ -427,6 +427,36 @@ pub struct ProfileSummary {
     pub unlock_cache_secs: u64,
     /// The credentials the profile declares, in declaration order.
     pub credentials: Vec<CredentialSummary>,
+    /// Where the profile came from: `local`, or `registry(<name>)`.
+    ///
+    /// A client that is about to run a profile is entitled to know whether the
+    /// user wrote it or fetched it, because those are different questions
+    /// about who chose the hosts it may reach.
+    #[serde(default = "local_source")]
+    pub source: String,
+    /// What its signature was worth: `verified`, `unsigned`, `invalid`, or
+    /// `dev_mode`.
+    ///
+    /// A registry profile only ever reaches a client as `verified` or, when
+    /// the daemon is in development mode, `dev_mode`. A local profile is
+    /// `unsigned`, which is not a complaint: nothing signs what you wrote
+    /// yourself.
+    #[serde(default = "unsigned_signature")]
+    pub signature: String,
+    /// The minisign key id that vouched for it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_key_id: Option<String>,
+    /// The registry whose profile of the same name this one shadows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<String>,
+}
+
+fn local_source() -> String {
+    "local".to_string()
+}
+
+fn unsigned_signature() -> String {
+    "unsigned".to_string()
 }
 
 /// One declared credential, reduced to what a client is allowed to see.

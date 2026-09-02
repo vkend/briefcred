@@ -30,6 +30,10 @@ fn sample_profile() -> ProfileSummary {
         description: Some("read-only analytics shell".into()),
         unlock_policy: "biometric".into(),
         unlock_cache_secs: 300,
+        source: "registry(acme)".into(),
+        signature: "verified".into(),
+        signer_key_id: Some("0102030405060708".into()),
+        overrides: None,
         credentials: vec![CredentialSummary {
             name: "db".into(),
             kind: "postgres-dynamic".into(),

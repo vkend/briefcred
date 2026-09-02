@@ -10,12 +10,19 @@
 //! - **Reloads are debounced.** An editor's save is several filesystem events
 //!   (write, rename, chmod), and a `notify` burst must produce one reload, not
 //!   five, or the daemon reloads a half-written file.
+//!
+//! Last-good does not extend to trust. A registry profile whose signature
+//! stops verifying is dropped from the set on the next reload rather than kept
+//! from the previous one: continuing to run a profile precisely because its
+//! signature has just gone bad is the opposite of what an operator wants. Each
+//! such file produces a warning the daemon prints and audits.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use briefcred_core::distribution::{LoadedProfile, ProfileSet, Trust};
 use briefcred_core::{Profile, Registry};
 use tokio::sync::RwLock;
 
@@ -33,7 +40,8 @@ pub const DEBOUNCE: Duration = Duration::from_millis(250);
 pub struct ProfileStore {
     dir: PathBuf,
     registry: Registry,
-    profiles: RwLock<BTreeMap<String, Profile>>,
+    trust: Trust,
+    profiles: RwLock<BTreeMap<String, LoadedProfile>>,
 }
 
 /// What one reload attempt did.
@@ -43,6 +51,11 @@ pub enum Reload {
     Loaded {
         /// How many profiles are loaded.
         count: usize,
+        /// One line per file that was dropped or distrusted.
+        ///
+        /// A reload can succeed and still have complaints: one registry file
+        /// failing verification does not stop the other twenty from loading.
+        warnings: Vec<String>,
     },
     /// The directory did not parse. The previous set is still in force.
     Failed {
@@ -53,10 +66,14 @@ pub enum Reload {
 
 impl ProfileStore {
     /// An empty store that will read from `dir` and validate against `registry`.
-    pub fn new(dir: impl Into<PathBuf>, registry: Registry) -> ProfileStore {
+    ///
+    /// `trust` decides what happens to the `registry/` subtree: which keys
+    /// count, and whether an unverified file is dropped or loaded loudly.
+    pub fn new(dir: impl Into<PathBuf>, registry: Registry, trust: Trust) -> ProfileStore {
         ProfileStore {
             dir: dir.into(),
             registry,
+            trust,
             profiles: RwLock::new(BTreeMap::new()),
         }
     }
@@ -68,11 +85,12 @@ impl ProfileStore {
 
     /// Re-read the directory, keeping the previous set if it does not parse.
     pub async fn reload(&self) -> Reload {
-        match Profile::load_dir(&self.dir, &self.registry) {
-            Ok(loaded) => {
-                let count = loaded.len();
-                *self.profiles.write().await = loaded;
-                Reload::Loaded { count }
+        match ProfileSet::load(&self.dir, &self.registry, &self.trust) {
+            Ok(set) => {
+                let count = set.profiles.len();
+                let warnings = set.warnings;
+                *self.profiles.write().await = set.profiles;
+                Reload::Loaded { count, warnings }
             }
             Err(err) => Reload::Failed {
                 message: err.to_string(),
@@ -82,12 +100,40 @@ impl ProfileStore {
 
     /// Every loaded profile, in name order.
     pub async fn list(&self) -> Vec<Profile> {
+        self.profiles
+            .read()
+            .await
+            .values()
+            .map(|loaded| loaded.profile.clone())
+            .collect()
+    }
+
+    /// Every loaded profile with where it came from, in name order.
+    pub async fn list_loaded(&self) -> Vec<LoadedProfile> {
         self.profiles.read().await.values().cloned().collect()
     }
 
     /// One profile by name.
     pub async fn get(&self, name: &str) -> Option<Profile> {
+        self.profiles
+            .read()
+            .await
+            .get(name)
+            .map(|loaded| loaded.profile.clone())
+    }
+
+    /// One profile by name, with where it came from.
+    pub async fn get_loaded(&self, name: &str) -> Option<LoadedProfile> {
         self.profiles.read().await.get(name).cloned()
+    }
+
+    /// Whether any loaded profile is only there because `dev_mode` is on.
+    pub async fn has_dev_mode_profiles(&self) -> bool {
+        self.profiles
+            .read()
+            .await
+            .values()
+            .any(|p| p.signature == briefcred_core::distribution::SignatureStatus::DevMode)
     }
 
     /// How many profiles are loaded.
@@ -154,6 +200,10 @@ pub async fn watch<F>(
 
 /// Start a recursive `notify` watcher that pings `tx` on every event.
 ///
+/// Recursive because `profiles/registry/<name>/` holds fetched profiles, and a
+/// `briefcred profile sync` that the daemon does not notice is a sync the user
+/// has to restart the daemon to see.
+///
 /// The returned watcher must be kept alive: dropping it stops the watch.
 fn spawn_watcher(
     dir: &Path,
@@ -174,7 +224,7 @@ fn spawn_watcher(
             Err(err) => eprintln!("briefcred-daemon: profile watch error: {err}"),
         }
     })?;
-    watcher.watch(dir, notify::RecursiveMode::NonRecursive)?;
+    watcher.watch(dir, notify::RecursiveMode::Recursive)?;
     Ok(watcher)
 }
 
@@ -184,7 +234,165 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn store(dir: &Path) -> Arc<ProfileStore> {
-        Arc::new(ProfileStore::new(dir, Registry::discover()))
+        Arc::new(ProfileStore::new(dir, Registry::discover(), Trust::none()))
+    }
+
+    /// A successful reload of `count` profiles with nothing to complain about.
+    fn loaded(count: usize) -> Reload {
+        Reload::Loaded {
+            count,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// A store over `dir` that believes exactly one signing key.
+    fn trusting_store(dir: &Path, key: &briefcred_core::minisign::SecretKey) -> Arc<ProfileStore> {
+        Arc::new(ProfileStore::new(
+            dir,
+            Registry::discover(),
+            Trust {
+                roots: vec![key.public()],
+                dev_mode: false,
+            },
+        ))
+    }
+
+    /// Write `yaml` into `dir/registry/acme/`, signed with `key` when given.
+    fn publish(
+        dir: &Path,
+        file: &str,
+        yaml: &str,
+        key: Option<&briefcred_core::minisign::SecretKey>,
+    ) {
+        let registry_dir = dir.join("registry").join("acme");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(registry_dir.join(file), yaml).unwrap();
+        if let Some(key) = key {
+            std::fs::write(
+                registry_dir.join(format!("{file}.minisig")),
+                key.sign(yaml.as_bytes(), file).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signed_registry_profile_loads_and_an_unsigned_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, _) = briefcred_core::minisign::SecretKey::generate().unwrap();
+        publish(dir.path(), "alpha.yaml", "name: alpha\n", Some(&key));
+        publish(dir.path(), "beta.yaml", "name: beta\n", None);
+        let store = trusting_store(dir.path(), &key);
+
+        let Reload::Loaded { count, warnings } = store.reload().await else {
+            panic!("the reload must succeed even with one bad file");
+        };
+        assert_eq!(count, 1);
+        assert!(store.get("alpha").await.is_some());
+        assert!(store.get("beta").await.is_none(), "unsigned must not load");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("beta.yaml"), "{warnings:?}");
+        assert!(!store.has_dev_mode_profiles().await);
+    }
+
+    #[tokio::test]
+    async fn a_registry_profile_whose_signature_stops_verifying_is_dropped_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, _) = briefcred_core::minisign::SecretKey::generate().unwrap();
+        publish(dir.path(), "alpha.yaml", "name: alpha\n", Some(&key));
+        let store = trusting_store(dir.path(), &key);
+        store.reload().await;
+        assert_eq!(store.len().await, 1);
+
+        // Someone edits the file under the daemon's feet. Last-good is what
+        // protects a *typo*; it must not protect a tampered profile.
+        std::fs::write(
+            dir.path().join("registry").join("acme").join("alpha.yaml"),
+            "name: alpha\ndescription: pwned\n",
+        )
+        .unwrap();
+        let Reload::Loaded { count, warnings } = store.reload().await else {
+            panic!("a trust failure is not a failed reload");
+        };
+        assert_eq!(count, 0, "the tampered profile must be gone, not stale");
+        assert!(store.get("alpha").await.is_none());
+        assert!(warnings[0].contains("invalid"), "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn dev_mode_loads_an_unverified_profile_and_marks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        publish(dir.path(), "alpha.yaml", "name: alpha\n", None);
+        let store = Arc::new(ProfileStore::new(
+            dir.path(),
+            Registry::discover(),
+            Trust {
+                roots: Vec::new(),
+                dev_mode: true,
+            },
+        ));
+
+        let Reload::Loaded { count, warnings } = store.reload().await else {
+            panic!("dev_mode must load it");
+        };
+        assert_eq!(count, 1);
+        assert!(warnings[0].contains("dev_mode"), "{warnings:?}");
+        assert!(store.has_dev_mode_profiles().await);
+        let loaded = store.get_loaded("alpha").await.unwrap();
+        assert_eq!(
+            loaded.signature,
+            briefcred_core::distribution::SignatureStatus::DevMode
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_profile_overrides_a_registry_one_and_says_which() {
+        use briefcred_core::distribution::ProfileSource;
+        let dir = tempfile::tempdir().unwrap();
+        let (key, _) = briefcred_core::minisign::SecretKey::generate().unwrap();
+        publish(
+            dir.path(),
+            "alpha.yaml",
+            "name: alpha\ndescription: theirs\n",
+            Some(&key),
+        );
+        std::fs::write(
+            dir.path().join("alpha.yaml"),
+            "name: alpha\ndescription: mine\n",
+        )
+        .unwrap();
+        let store = trusting_store(dir.path(), &key);
+        store.reload().await;
+
+        let loaded = store.get_loaded("alpha").await.unwrap();
+        assert_eq!(loaded.source, ProfileSource::Local);
+        assert_eq!(loaded.overrides.as_deref(), Some("acme"));
+        assert_eq!(loaded.profile.description.as_deref(), Some("mine"));
+        assert_eq!(store.len().await, 1, "an override is not a second profile");
+    }
+
+    #[tokio::test]
+    async fn the_watcher_notices_a_sync_into_the_registry_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, _) = briefcred_core::minisign::SecretKey::generate().unwrap();
+        // The subtree exists before the watch starts; what is under test is
+        // that a file appearing *inside* it is noticed, which a non-recursive
+        // watch on the profiles directory would miss.
+        std::fs::create_dir_all(dir.path().join("registry").join("acme")).unwrap();
+        let store = trusting_store(dir.path(), &key);
+        store.reload().await;
+
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(watch(Arc::clone(&store), shutdown.subscribe(), |_| {}));
+
+        publish(dir.path(), "alpha.yaml", "name: alpha\n", Some(&key));
+        eventually("the synced profile to be loaded", || async {
+            store.get("alpha").await.is_some()
+        })
+        .await;
+
+        shutdown.send_replace(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     /// Wait for `check` to hold, polling rather than sleeping a fixed time so
@@ -219,7 +427,7 @@ mod tests {
         let store = store(dir.path());
 
         assert!(store.is_empty().await);
-        assert_eq!(store.reload().await, Reload::Loaded { count: 1 });
+        assert_eq!(store.reload().await, loaded(1));
         assert_eq!(store.len().await, 1);
         assert_eq!(store.get("alpha").await.unwrap().name, "alpha");
         assert!(store.get("absent").await.is_none());
@@ -229,7 +437,7 @@ mod tests {
     async fn a_missing_directory_loads_as_empty_rather_than_failing() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir.path().join("profiles"));
-        assert_eq!(store.reload().await, Reload::Loaded { count: 0 });
+        assert_eq!(store.reload().await, loaded(0));
     }
 
     #[tokio::test]
@@ -278,7 +486,7 @@ mod tests {
         assert!(matches!(store.reload().await, Reload::Failed { .. }));
 
         std::fs::write(dir.path().join("a.yaml"), "name: alpha\n").unwrap();
-        assert_eq!(store.reload().await, Reload::Loaded { count: 1 });
+        assert_eq!(store.reload().await, loaded(1));
     }
 
     #[tokio::test]

@@ -240,6 +240,23 @@ pub enum AuditEntry {
         /// The complaint, naming the offending file. Never file contents.
         message: String,
     },
+    /// A registry profile could not be verified against any trust root.
+    ///
+    /// Written whether the file was dropped or loaded anyway: an operator who
+    /// turns `dev_mode` on has to be able to find, afterwards, exactly which
+    /// unverified profiles their daemon was running.
+    ProfileTrustWarning {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The file, so the row names something an operator can go and look at.
+        path: String,
+        /// `dropped` when the profile was refused, `loaded_dev_mode` when
+        /// `dev_mode` let it through anyway.
+        action: String,
+        /// Why it did not verify. Never file contents.
+        reason: String,
+    },
     /// A session was opened after a successful unlock.
     SessionOpen {
         /// When it happened.
@@ -348,6 +365,7 @@ impl AuditEntry {
             | AuditEntry::DaemonStop { .. }
             | AuditEntry::AuthReject { .. }
             | AuditEntry::ProfileLoadError { .. }
+            | AuditEntry::ProfileTrustWarning { .. }
             | AuditEntry::Reconcile { .. }
             | AuditEntry::SessionOpen { .. }
             | AuditEntry::SessionClose { .. }

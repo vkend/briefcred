@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use briefcred_core::ca::CaConfig;
+use briefcred_core::distribution::ProfilesConfig;
 use briefcred_core::SourceKind;
 use serde::Deserialize;
 
@@ -155,6 +156,12 @@ pub struct Config {
     /// to be asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_source: Option<SourceKind>,
+    /// Which profile registries to fetch, and whose signatures to believe.
+    ///
+    /// Owned by `briefcred_core::distribution` rather than parsed twice: the
+    /// CLI reads the same table out of this file to run `profile sync`,
+    /// without needing the rest of the daemon's schema.
+    pub profiles: ProfilesConfig,
     /// Where the root CA's private key is kept.
     ///
     /// Owned by `briefcred_core::ca` rather than parsed twice: the CLI reads
@@ -179,6 +186,7 @@ impl Default for Config {
             audit: AuditConfig::default(),
             pgproxy: PgProxyConfig::default(),
             master_source: None,
+            profiles: ProfilesConfig::default(),
             ca: CaConfig::default(),
         }
     }
@@ -233,6 +241,10 @@ impl Config {
                     .to_string(),
             );
         }
+        // A trust root that does not parse is refused at startup rather than
+        // at the first reload: the daemon would otherwise come up believing it
+        // had a trust root, and silently drop every registry profile.
+        config.profiles.trust_keys().map_err(|e| e.to_string())?;
         Ok(config)
     }
 
@@ -378,6 +390,29 @@ mod tests {
             config.upstream_roots.as_deref(),
             Some(std::path::Path::new("/tmp/roots.pem"))
         );
+    }
+
+    #[test]
+    fn the_profiles_table_carries_the_registries_and_the_trust_roots() {
+        let config = Config::from_toml_str("").unwrap();
+        assert!(config.profiles.trust_roots.is_empty());
+        assert!(config.profiles.registries.is_empty());
+        assert!(!config.profiles.dev_mode, "dev_mode must be opted into");
+
+        let config = Config::from_toml_str(
+            "[profiles]\ndev_mode = true\n\
+             registries = [{ name = \"acme\", url = \"file:///srv/p\" }]\n",
+        )
+        .unwrap();
+        assert!(config.profiles.dev_mode);
+        assert_eq!(config.profiles.registries[0].name, "acme");
+        assert!(Config::from_toml_str("[profiles]\ndev_modes = true\n").is_err());
+    }
+
+    #[test]
+    fn a_trust_root_that_is_not_a_key_stops_the_daemon_starting() {
+        let err = Config::from_toml_str("[profiles]\ntrust_roots = [\"nonsense\"]\n").unwrap_err();
+        assert!(err.contains("trust_roots"), "{err}");
     }
 
     #[test]

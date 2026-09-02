@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use briefcred_core::audit::AuditEntry;
+use briefcred_core::distribution::LoadedProfile;
 use briefcred_core::paths::Paths;
 use briefcred_core::types::MintId;
 use briefcred_core::MasterSource;
@@ -345,7 +346,13 @@ async fn handle_shutdown(_request: Request, state: Arc<State>) -> Response {
 
 async fn handle_list_profiles(_request: Request, state: Arc<State>) -> Response {
     Response::Profiles {
-        profiles: state.profiles.list().await.iter().map(summarise).collect(),
+        profiles: state
+            .profiles
+            .list_loaded()
+            .await
+            .iter()
+            .map(summarise)
+            .collect(),
     }
 }
 
@@ -353,9 +360,9 @@ async fn handle_show_profile(request: Request, state: Arc<State>) -> Response {
     let Request::ShowProfile { name } = request else {
         return mismatched(&request);
     };
-    match state.profiles.get(&name).await {
-        Some(profile) => Response::Profile {
-            profile: summarise(&profile),
+    match state.profiles.get_loaded(&name).await {
+        Some(loaded) => Response::Profile {
+            profile: summarise(&loaded),
         },
         None => Response::Error {
             message: SessionError::NoSuchProfile(name).to_string(),
@@ -836,12 +843,21 @@ fn decode_session_pubkey(encoded: Option<&str>) -> std::result::Result<Option<[u
 }
 
 /// Reduce a loaded profile to the shape a client is allowed to see.
-fn summarise(profile: &briefcred_core::Profile) -> ProfileSummary {
+///
+/// Provenance travels with it: where the profile came from, what its signature
+/// was worth, and what it shadows. A client deciding whether to run a profile
+/// is asking who chose its allowlist, and that is the answer.
+fn summarise(loaded: &LoadedProfile) -> ProfileSummary {
+    let profile = &loaded.profile;
     ProfileSummary {
         name: profile.name.clone(),
         description: profile.description.clone(),
         unlock_policy: policy_name(profile.unlock.policy).to_string(),
         unlock_cache_secs: profile.unlock.cache_secs,
+        source: loaded.source.to_string(),
+        signature: loaded.signature.to_string(),
+        signer_key_id: loaded.signer_key_id.clone(),
+        overrides: loaded.overrides.clone(),
         credentials: profile
             .credentials
             .iter()
@@ -1089,6 +1105,7 @@ mod tests {
         let profiles = Arc::new(ProfileStore::new(
             profiles_dir,
             briefcred_core::Registry::discover(),
+            briefcred_core::distribution::Trust::none(),
         ));
         profiles.reload().await;
 

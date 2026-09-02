@@ -190,7 +190,11 @@ mod tests {
             "name: dev\ncredentials:\n  - name: db\n    kind: postgres-dynamic\n    config:\n      host: 127.0.0.1\n      dbname: app\n      user: m\n      sslmode: disable\n      role_template: {}\n",
         )
         .unwrap();
-        let profiles = ProfileStore::new(profiles_dir, briefcred_core::Registry::discover());
+        let profiles = ProfileStore::new(
+            profiles_dir,
+            briefcred_core::Registry::discover(),
+            briefcred_core::distribution::Trust::none(),
+        );
         profiles.reload().await;
 
         let audit = crate::audit::spawn(
@@ -223,6 +227,7 @@ mod tests {
         let profiles = Arc::new(ProfileStore::new(
             dir.path().join("profiles"),
             briefcred_core::Registry::discover(),
+            briefcred_core::distribution::Trust::none(),
         ));
         let audit = crate::audit::spawn(
             crate::audit::AuditLog::open(&dir.path().join("audit"), 90).unwrap(),
