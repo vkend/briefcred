@@ -21,6 +21,7 @@ pub mod metrics;
 pub mod pgproxy;
 pub mod profiles;
 pub mod proxy;
+pub mod quota;
 pub mod reconcile;
 pub mod revoke;
 pub mod server;
