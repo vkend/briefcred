@@ -35,18 +35,31 @@ pub enum AuditEntry {
         ttl_secs: u64,
     },
     /// A wrapped subprocess started.
+    ///
+    /// One row per `briefcred exec`, not one per credential: a run may carry
+    /// several mints, and splitting the row per mint would make one command
+    /// look like several.
     ExecStart {
         /// When it happened.
         #[serde(with = "time::serde::rfc3339")]
         ts: OffsetDateTime,
-        /// The principal handed to the subprocess.
-        mint_id: MintId,
+        /// The session the run belongs to, so it can be tied to its unlock.
+        session_id: String,
+        /// The principals handed to the subprocess, in declaration order.
+        mint_ids: Vec<MintId>,
         /// Profile that authorised it.
         profile: String,
         /// `argv[0]`, recorded verbatim because the allowlist is literal.
         argv0: String,
         /// SHA-256 of each remaining argument, in order.
         args_sha256: Vec<String>,
+        /// The arguments themselves, only when `audit.raw_args` is on.
+        ///
+        /// Off by default, and the one place an audit row is allowed to hold
+        /// text a user typed. An operator turns it on knowingly, and the
+        /// digests stay alongside so the two are always correlatable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<Vec<String>>,
         /// Operating system process id.
         pid: u32,
     },
@@ -55,8 +68,10 @@ pub enum AuditEntry {
         /// When it happened.
         #[serde(with = "time::serde::rfc3339")]
         ts: OffsetDateTime,
-        /// The principal that was in use.
-        mint_id: MintId,
+        /// The session the run belonged to.
+        session_id: String,
+        /// The principals that were in use.
+        mint_ids: Vec<MintId>,
         /// Profile that authorised it.
         profile: String,
         /// Exit status, absent when the child was killed by a signal.
@@ -148,6 +163,24 @@ pub enum AuditEntry {
         /// One of `cancelled`, `failed`, `no_aqua_session`, `unsupported`.
         reason: String,
     },
+    /// A reconciliation sweep ran against one minter kind.
+    ///
+    /// Written even when the sweep found nothing, because "the reconciler is
+    /// alive and the backend is clean" is exactly what an operator needs to be
+    /// able to see. Each principal it removed also gets its own `Revoke` row.
+    Reconcile {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The minter kind that was swept.
+        kind: String,
+        /// The profile whose configuration named the backend.
+        profile: String,
+        /// How many stranded principals the sweep removed.
+        revoked: usize,
+        /// How many it found but could not remove.
+        failed: usize,
+    },
     /// A connection was refused because the peer is not the owning user.
     ///
     /// The socket lives in a `0700` directory at mode `0600`, so this row is
@@ -183,23 +216,28 @@ impl AuditEntry {
         }
     }
 
-    /// The identifier this row is about, for the rows that are about one.
+    /// Every principal this row is about, in the order the row records them.
     ///
-    /// Daemon-lifecycle and authentication rows describe the daemon rather
-    /// than a minted principal, so they return `None`.
-    pub fn mint_id(&self) -> Option<&MintId> {
+    /// A `Mint` or a `Revoke` is about exactly one. An `ExecStart` or an
+    /// `ExecEnd` is about however many that run carried. Daemon-lifecycle,
+    /// session, and authentication rows describe the daemon rather than a
+    /// principal, so they are about none.
+    pub fn mint_ids(&self) -> &[MintId] {
         match self {
-            AuditEntry::Mint { mint_id, .. }
-            | AuditEntry::ExecStart { mint_id, .. }
-            | AuditEntry::ExecEnd { mint_id, .. }
-            | AuditEntry::Revoke { mint_id, .. } => Some(mint_id),
+            AuditEntry::Mint { mint_id, .. } | AuditEntry::Revoke { mint_id, .. } => {
+                std::slice::from_ref(mint_id)
+            }
+            AuditEntry::ExecStart { mint_ids, .. } | AuditEntry::ExecEnd { mint_ids, .. } => {
+                mint_ids
+            }
             AuditEntry::DaemonStart { .. }
             | AuditEntry::DaemonStop { .. }
             | AuditEntry::AuthReject { .. }
             | AuditEntry::ProfileLoadError { .. }
+            | AuditEntry::Reconcile { .. }
             | AuditEntry::SessionOpen { .. }
             | AuditEntry::SessionClose { .. }
-            | AuditEntry::UnlockDenied { .. } => None,
+            | AuditEntry::UnlockDenied { .. } => &[],
         }
     }
 }
@@ -264,10 +302,12 @@ mod tests {
     fn exec_rows_record_argument_digests_not_arguments() {
         let entry = AuditEntry::ExecStart {
             ts: OffsetDateTime::UNIX_EPOCH,
-            mint_id: MintId::generate(),
+            session_id: "s-1".into(),
+            mint_ids: vec![MintId::generate()],
             profile: "dev".into(),
             argv0: "psql".into(),
             args_sha256: vec![hash_arg("-c"), hash_arg("SELECT * FROM salaries")],
+            args: None,
             pid: 42,
         };
         let json = serde_json::to_string(&entry).unwrap();
@@ -275,6 +315,50 @@ mod tests {
         assert!(!json.contains("SELECT"), "{json}");
         assert!(json.contains(&hash_arg("SELECT * FROM salaries")), "{json}");
         assert!(json.contains("\"argv0\":\"psql\""), "{json}");
+        // The raw-args field is absent, not null, when nobody opted in.
+        assert!(!json.contains("\"args\""), "{json}");
+    }
+
+    #[test]
+    fn raw_args_are_recorded_only_when_they_were_asked_for() {
+        let entry = AuditEntry::ExecStart {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            session_id: "s-1".into(),
+            mint_ids: vec![],
+            profile: "dev".into(),
+            argv0: "psql".into(),
+            args_sha256: vec![hash_arg("SELECT * FROM salaries")],
+            args: Some(vec!["SELECT * FROM salaries".into()]),
+            pid: 42,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("salaries"), "{json}");
+        // The digests stay alongside, so a log with raw args on and one with it
+        // off can still be correlated.
+        assert!(json.contains(&hash_arg("SELECT * FROM salaries")), "{json}");
+    }
+
+    #[test]
+    fn an_exec_row_is_about_every_principal_the_run_carried() {
+        let ids = vec![MintId::generate(), MintId::generate()];
+        let entry = AuditEntry::ExecEnd {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            session_id: "s-1".into(),
+            mint_ids: ids.clone(),
+            profile: "dev".into(),
+            exit_code: Some(0),
+            duration_ms: 12,
+        };
+        assert_eq!(entry.mint_ids(), ids.as_slice());
+        assert!(AuditEntry::Reconcile {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            kind: "postgres-dynamic".into(),
+            profile: "dev".into(),
+            revoked: 0,
+            failed: 0,
+        }
+        .mint_ids()
+        .is_empty());
     }
 
     #[test]
@@ -300,7 +384,7 @@ mod tests {
         assert!(!line.contains('\n'));
         let back: AuditEntry = serde_json::from_str(&line).unwrap();
         assert_eq!(back, entry);
-        assert_eq!(back.mint_id(), entry.mint_id());
+        assert_eq!(back.mint_ids(), entry.mint_ids());
     }
 
     #[test]
@@ -314,7 +398,7 @@ mod tests {
         assert_eq!(json["event"], "auth_reject");
         assert_eq!(json["peer_uid"], 502);
         assert_eq!(json["expected_uid"], 501);
-        assert!(entry.mint_id().is_none());
+        assert!(entry.mint_ids().is_empty());
     }
 
     #[test]
@@ -336,7 +420,7 @@ mod tests {
             assert!(!line.contains('\n'));
             let back: AuditEntry = serde_json::from_str(&line).unwrap();
             assert_eq!(back, entry);
-            assert!(back.mint_id().is_none());
+            assert!(back.mint_ids().is_empty());
         }
     }
 
@@ -350,7 +434,6 @@ mod tests {
             kind: "postgres-dynamic".into(),
             ttl_secs: 900,
         };
-        assert_eq!(entry.mint_id(), Some(entry.mint_id().unwrap()));
-        assert!(entry.mint_id().is_some());
+        assert_eq!(entry.mint_ids().len(), 1);
     }
 }

@@ -356,7 +356,8 @@ mod tests {
 
     #[test]
     fn an_error_response_carries_no_result() {
-        let response = HelperResponse::err(3, CODE_BACKEND, "28P01: password authentication failed");
+        let response =
+            HelperResponse::err(3, CODE_BACKEND, "28P01: password authentication failed");
         assert!(response.result.is_none());
         let json = serde_json::to_value(&response).unwrap();
         assert!(json.get("result").is_none(), "{json}");

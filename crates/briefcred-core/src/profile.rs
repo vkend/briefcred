@@ -45,6 +45,14 @@ pub struct Profile {
     /// Environment handed to the subprocess, with `${...}` templates.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Extra variables the subprocess may inherit from the caller.
+    ///
+    /// The child starts with a cleared environment, so anything it needs has to
+    /// be named. [`crate::exec::DEFAULT_PASSTHROUGH`] is always included; this
+    /// list adds to it. Naming a variable here says only "copy it if the caller
+    /// has it", never "set it".
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
     /// Which of [`crate::ca::TRUST_ENV_VARS`] to set for the subprocess.
     ///
     /// Absent means all of them, which is what almost every profile wants. An

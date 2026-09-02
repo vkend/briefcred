@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use briefcred_proto::{
-    decode_frame, encode_frame, read_frame, write_frame, CredentialSummary, FrameError, MintSummary,
-    ProfileSummary, Request, Response, SecretString, MAX_FRAME_BYTES,
+    decode_frame, encode_frame, read_frame, write_frame, CredentialSummary, FrameError,
+    MintSummary, ProfileSummary, Request, Response, SecretString, MAX_FRAME_BYTES,
 };
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;

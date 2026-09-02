@@ -20,6 +20,7 @@
 pub mod audit;
 pub mod ca;
 pub mod error;
+pub mod exec;
 pub mod keystore;
 pub mod minters;
 pub mod paths;
