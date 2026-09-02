@@ -171,9 +171,9 @@ fn default_port() -> u16 {
 
 impl PostgresConfig {
     /// Interpret a credential spec's `config` block.
-    pub fn from_value(value: &serde_yaml::Value) -> Result<PostgresConfig> {
+    pub fn from_value(value: &serde_yaml_ng::Value) -> Result<PostgresConfig> {
         let config: PostgresConfig =
-            serde_yaml::from_value(value.clone()).map_err(|e| Error::MinterConfig {
+            serde_yaml_ng::from_value(value.clone()).map_err(|e| Error::MinterConfig {
                 kind: KIND,
                 message: e.to_string(),
             })?;
@@ -741,7 +741,7 @@ role_template:
     - privileges: [SELECT]
       on: ALL TABLES IN SCHEMA public
 ";
-        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
         let config = PostgresConfig::from_value(&value).unwrap();
         assert_eq!(config.port, 5432);
         assert_eq!(config.sslmode, SslMode::Require);
@@ -750,7 +750,7 @@ role_template:
 
     #[test]
     fn config_rejects_an_unknown_key() {
-        let value: serde_yaml::Value = serde_yaml::from_str(
+        let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(
             "host: h\ndbname: d\nuser: u\npassword: oops\nrole_template: {grants: []}\n",
         )
         .unwrap();

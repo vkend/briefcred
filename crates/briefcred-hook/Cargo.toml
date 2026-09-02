@@ -21,7 +21,7 @@ briefcred-proto.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+serde_yaml_ng.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt"] }
 
 [dev-dependencies]

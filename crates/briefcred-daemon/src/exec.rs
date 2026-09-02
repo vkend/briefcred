@@ -585,7 +585,7 @@ pub async fn revoke_one(
     // The queue persists a credential's config as JSON; a minter reads YAML,
     // and an in-daemon one is built from it. Every JSON document is a YAML
     // document, so a config that does not survive this was never valid.
-    let config = match serde_yaml::to_value(&entry.config) {
+    let config = match serde_yaml_ng::to_value(&entry.config) {
         Ok(config) => config,
         Err(err) => return RevokeOutcome::failed(err.to_string()),
     };
@@ -639,7 +639,7 @@ pub fn outcome_of(result: RevokeResult) -> RevokeOutcome {
 }
 
 /// Convert a credential's YAML `config` to the JSON the helper wire carries.
-fn to_json(config: &serde_yaml::Value) -> Result<serde_json::Value, String> {
+fn to_json(config: &serde_yaml_ng::Value) -> Result<serde_json::Value, String> {
     serde_json::to_value(config).map_err(|e| format!("config is not representable as JSON: {e}"))
 }
 

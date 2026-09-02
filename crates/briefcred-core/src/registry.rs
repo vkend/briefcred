@@ -61,7 +61,7 @@ pub struct MinterFactory {
     /// Called from [`crate::Profile::validate`] whenever the daemon loads its
     /// profile directory, so it must return [`Error::MinterConfig`] rather
     /// than panicking or deferring the failure to the first mint.
-    pub validate: fn(&serde_yaml::Value) -> Result<()>,
+    pub validate: fn(&serde_yaml_ng::Value) -> Result<()>,
     /// Construct the minter, where this binary is the one that runs it.
     ///
     /// `None` says "the implementation is not linked here". A minter whose
@@ -119,7 +119,7 @@ impl Registry {
     /// [`Registry::build`]: every binary that reads profiles must be able to
     /// reject a bad one, but only the binary that actually mints needs the
     /// minter itself.
-    pub fn validate(&self, kind: &str, config: &serde_yaml::Value) -> Result<()> {
+    pub fn validate(&self, kind: &str, config: &serde_yaml_ng::Value) -> Result<()> {
         (self.factory(kind)?.validate)(config)
     }
 
@@ -134,7 +134,7 @@ impl Registry {
     }
 
     /// Build the minter for `kind` from `config`, after validating it.
-    pub fn build(&self, kind: &str, config: &serde_yaml::Value) -> Result<Arc<dyn Minter>> {
+    pub fn build(&self, kind: &str, config: &serde_yaml_ng::Value) -> Result<Arc<dyn Minter>> {
         let factory = self.factory(kind)?;
         (factory.validate)(config)?;
         if factory.hosting == Hosting::Proxy {
@@ -229,14 +229,14 @@ mod tests {
     #[test]
     fn building_an_unregistered_kind_is_a_profile_error() {
         let err = Registry::empty()
-            .build("nope", &serde_yaml::Value::Null)
+            .build("nope", &serde_yaml_ng::Value::Null)
             .unwrap_err();
         assert!(err.to_string().contains("unknown minter kind"), "{err}");
     }
 
     #[test]
     fn building_a_registered_kind_returns_a_minter_of_that_kind() {
-        let config: serde_yaml::Value = serde_yaml::from_str(
+        let config: serde_yaml_ng::Value = serde_yaml_ng::from_str(
             "host: 127.0.0.1\ndbname: app\nuser: master\nsslmode: disable\nrole_template: {}\n",
         )
         .unwrap();
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn building_a_registered_kind_with_a_bad_config_fails_at_build_time() {
-        let config: serde_yaml::Value = serde_yaml::from_str("host: 127.0.0.1\n").unwrap();
+        let config: serde_yaml_ng::Value = serde_yaml_ng::from_str("host: 127.0.0.1\n").unwrap();
         let err = Registry::discover()
             .build(crate::minters::postgres::KIND, &config)
             .unwrap_err();

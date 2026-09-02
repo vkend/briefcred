@@ -107,9 +107,9 @@ fn default_duration_secs() -> u64 {
 
 impl AwsStsConfig {
     /// Interpret a credential spec's `config` block.
-    pub fn from_value(value: &serde_yaml::Value) -> Result<AwsStsConfig> {
+    pub fn from_value(value: &serde_yaml_ng::Value) -> Result<AwsStsConfig> {
         let config: AwsStsConfig =
-            serde_yaml::from_value(value.clone()).map_err(|e| Error::MinterConfig {
+            serde_yaml_ng::from_value(value.clone()).map_err(|e| Error::MinterConfig {
                 kind: KIND,
                 message: e.to_string(),
             })?;
@@ -249,11 +249,11 @@ mod tests {
 
     const ROLE: &str = "arn:aws:iam::123456789012:role/briefcred-dev";
 
-    fn config(yaml: &str) -> serde_yaml::Value {
-        serde_yaml::from_str(yaml).unwrap()
+    fn config(yaml: &str) -> serde_yaml_ng::Value {
+        serde_yaml_ng::from_str(yaml).unwrap()
     }
 
-    fn minimal() -> serde_yaml::Value {
+    fn minimal() -> serde_yaml_ng::Value {
         config(&format!("role_arn: {ROLE}\nregion: eu-west-1\n"))
     }
 

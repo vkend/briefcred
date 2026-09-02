@@ -378,7 +378,7 @@ impl MinterSet {
     pub async fn get(
         &self,
         kind: &str,
-        config: &serde_yaml::Value,
+        config: &serde_yaml_ng::Value,
     ) -> Result<Arc<dyn MintChannel>, HelperFailure> {
         let mut channels = self.channels.lock().await;
         if let Some(channel) = channels.get(kind) {
@@ -644,13 +644,13 @@ done"#,
         );
 
         let set = MinterSet::new(dirs);
-        let first = set.get("one", &serde_yaml::Value::Null).await.unwrap();
-        let again = set.get("one", &serde_yaml::Value::Null).await.unwrap();
+        let first = set.get("one", &serde_yaml_ng::Value::Null).await.unwrap();
+        let again = set.get("one", &serde_yaml_ng::Value::Null).await.unwrap();
         assert!(
             Arc::ptr_eq(&first, &again),
             "a second call must reuse the running process"
         );
-        set.get("two", &serde_yaml::Value::Null).await.unwrap();
+        set.get("two", &serde_yaml_ng::Value::Null).await.unwrap();
         assert_eq!(set.kinds().await, vec!["one", "two"]);
 
         set.stop_all().await;
@@ -666,9 +666,9 @@ done"#,
             r#"while read -r line; do printf '{"jsonrpc":"2.0","id":1,"result":{"stopping":true}}\n'; done"#,
         );
         let set = MinterSet::new(dirs);
-        let first = set.get("one", &serde_yaml::Value::Null).await.unwrap();
+        let first = set.get("one", &serde_yaml_ng::Value::Null).await.unwrap();
         set.discard("one").await;
-        let second = set.get("one", &serde_yaml::Value::Null).await.unwrap();
+        let second = set.get("one", &serde_yaml_ng::Value::Null).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         set.stop_all().await;
         first.stop().await;
@@ -679,7 +679,7 @@ done"#,
         // No helper directories: if this were routed to a process it could
         // only fail, which is exactly what makes the assertion meaningful.
         let set = MinterSet::new(Vec::new());
-        let config = serde_yaml::from_str("principals: [ubuntu]\n").unwrap();
+        let config = serde_yaml_ng::from_str("principals: [ubuntu]\n").unwrap();
         let channel = set
             .get(briefcred_core::minters::ssh_cert::KIND, &config)
             .await
@@ -694,7 +694,7 @@ done"#,
     #[tokio::test]
     async fn a_kind_nobody_registered_is_looked_for_as_a_binary() {
         let err = MinterSet::new(vec![PathBuf::from("/nowhere")])
-            .get("not-a-registered-kind", &serde_yaml::Value::Null)
+            .get("not-a-registered-kind", &serde_yaml_ng::Value::Null)
             .await
             .unwrap_err();
         assert!(matches!(err, HelperFailure::NotFound { .. }), "{err}");

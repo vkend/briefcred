@@ -104,7 +104,7 @@ pub struct MintCtx {
     /// Credential name within that profile.
     pub credential: String,
     /// The credential spec's `config` block, as written in the profile.
-    pub config: serde_yaml::Value,
+    pub config: serde_yaml_ng::Value,
     /// The master credential, fetched from a [`crate::MasterSource`].
     pub master: Zeroizing<String>,
     /// Requested lifetime.
@@ -129,7 +129,7 @@ pub struct RevokeCtx {
     /// The principal to remove.
     pub mint_id: MintId,
     /// The same `config` block the mint ran against.
-    pub config: serde_yaml::Value,
+    pub config: serde_yaml_ng::Value,
     /// The master credential.
     pub master: Zeroizing<String>,
     /// Opaque state the mint recorded so revoke can be exactly symmetric.
@@ -183,7 +183,7 @@ impl fmt::Debug for MintedCredential {
 /// to clean up.
 pub struct ReconcileCtx {
     /// A `config` block naming the backend to sweep.
-    pub config: serde_yaml::Value,
+    pub config: serde_yaml_ng::Value,
     /// The master credential.
     pub master: Zeroizing<String>,
 }
@@ -306,7 +306,7 @@ mod tests {
             mint_id: MintId::generate(),
             profile: "dev".into(),
             credential: "db".into(),
-            config: serde_yaml::from_str("password: hunter2").unwrap(),
+            config: serde_yaml_ng::from_str("password: hunter2").unwrap(),
             master: Zeroizing::new("s3cret-master".into()),
             ttl: Duration::from_secs(900),
         };
@@ -317,7 +317,7 @@ mod tests {
 
         let revoke = RevokeCtx {
             mint_id: MintId::generate(),
-            config: serde_yaml::Value::Null,
+            config: serde_yaml_ng::Value::Null,
             master: Zeroizing::new("s3cret-master".into()),
             revoke_token: "tok-abc".into(),
         };

@@ -43,7 +43,7 @@ impl InDaemonMinter {
     /// minter is constructed.
     pub fn build(
         kind: &str,
-        config: &serde_yaml::Value,
+        config: &serde_yaml_ng::Value,
         registry: &Registry,
     ) -> Result<InDaemonMinter, HelperFailure> {
         let minter = registry
@@ -88,7 +88,7 @@ mod tests {
     fn ssh_cert_channel() -> InDaemonMinter {
         InDaemonMinter::build(
             ssh_cert::KIND,
-            &serde_yaml::from_str("principals: [ubuntu]\n").unwrap(),
+            &serde_yaml_ng::from_str("principals: [ubuntu]\n").unwrap(),
             &Registry::discover(),
         )
         .unwrap()
@@ -109,7 +109,7 @@ mod tests {
     fn a_config_the_minter_rejects_fails_when_the_channel_is_built() {
         let err = InDaemonMinter::build(
             ssh_cert::KIND,
-            &serde_yaml::from_str("principals: []\n").unwrap(),
+            &serde_yaml_ng::from_str("principals: []\n").unwrap(),
             &Registry::discover(),
         )
         .unwrap_err();
@@ -123,7 +123,7 @@ mod tests {
         // rather than produce something that fails later.
         let err = InDaemonMinter::build(
             briefcred_core::minters::aws_sts::KIND,
-            &serde_yaml::from_str(
+            &serde_yaml_ng::from_str(
                 "role_arn: arn:aws:iam::123456789012:role/dev\nregion: eu-west-1\n",
             )
             .unwrap(),

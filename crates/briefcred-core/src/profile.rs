@@ -198,7 +198,7 @@ pub struct CredentialSpec {
     pub source_key: Option<String>,
     /// Minter-specific configuration, interpreted by the minter for `kind`.
     #[serde(default)]
-    pub config: serde_yaml::Value,
+    pub config: serde_yaml_ng::Value,
 }
 
 impl CredentialSpec {
@@ -326,7 +326,7 @@ impl Profile {
     /// minters, and the daemon runs [`Profile::validate`] on top.
     pub fn from_yaml_str(yaml: &str) -> Result<Profile> {
         let profile: Profile =
-            serde_yaml::from_str(yaml).map_err(|e| Error::profile(e.to_string()))?;
+            serde_yaml_ng::from_str(yaml).map_err(|e| Error::profile(e.to_string()))?;
         profile.validate_schema()?;
         Ok(profile)
     }
@@ -683,7 +683,7 @@ credentials:
         let spec = profile.credential("db").unwrap();
         assert_eq!(spec.ttl_secs, 900);
         assert_eq!(spec.ttl(), Duration::from_secs(900));
-        assert_eq!(spec.config, serde_yaml::Value::Null);
+        assert_eq!(spec.config, serde_yaml_ng::Value::Null);
     }
 
     #[test]

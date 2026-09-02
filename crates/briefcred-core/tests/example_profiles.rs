@@ -445,7 +445,7 @@ fn the_warehouse_example_hands_the_agent_a_token_where_a_password_would_be() {
     // The role the daemon authenticates as must not be the superuser: it is the
     // only thing bounding what the agent can do, since no policy applies.
     let config: briefcred_core::minters::postgres_proxy::PgProxyConfig =
-        serde_yaml::from_value(credential.config.clone()).unwrap();
+        serde_yaml_ng::from_value(credential.config.clone()).unwrap();
     assert_ne!(
         config.user, "postgres",
         "an example must not model a superuser"

@@ -84,7 +84,7 @@ impl HttpKind {
     ///
     /// `None` for a kind that is not one of the HTTP kinds, which is how every
     /// caller asks "is this credential the proxy's business" in one step.
-    pub fn parse(kind: &str, config: &serde_yaml::Value) -> Option<Result<HttpKind>> {
+    pub fn parse(kind: &str, config: &serde_yaml_ng::Value) -> Option<Result<HttpKind>> {
         match kind {
             BEARER_KIND => Some(no_config(BEARER_KIND, config).map(|()| HttpKind::Bearer)),
             BASIC_KIND => Some(no_config(BASIC_KIND, config).map(|()| HttpKind::Basic)),
@@ -131,7 +131,7 @@ impl HttpKind {
 ///
 /// Silently ignoring a `config` block would let a profile that meant
 /// `http-header` write `http-bearer` with a `name:` and never find out.
-fn no_config(kind: &'static str, config: &serde_yaml::Value) -> Result<()> {
+fn no_config(kind: &'static str, config: &serde_yaml_ng::Value) -> Result<()> {
     if config.is_null() {
         return Ok(());
     }
@@ -146,9 +146,9 @@ fn no_config(kind: &'static str, config: &serde_yaml::Value) -> Result<()> {
     })
 }
 
-fn header_config(config: &serde_yaml::Value) -> Result<HeaderConfig> {
+fn header_config(config: &serde_yaml_ng::Value) -> Result<HeaderConfig> {
     let parsed: HeaderConfig =
-        serde_yaml::from_value(config.clone()).map_err(|e| Error::MinterConfig {
+        serde_yaml_ng::from_value(config.clone()).map_err(|e| Error::MinterConfig {
             kind: HEADER_KIND,
             message: e.to_string(),
         })?;
@@ -177,7 +177,7 @@ fn header_config(config: &serde_yaml::Value) -> Result<HeaderConfig> {
 }
 
 /// Validate one HTTP credential's `config` block, for the registry.
-fn validate(kind: &'static str) -> impl Fn(&serde_yaml::Value) -> Result<()> {
+fn validate(kind: &'static str) -> impl Fn(&serde_yaml_ng::Value) -> Result<()> {
     move |config| match HttpKind::parse(kind, config) {
         Some(result) => result.map(|_| ()),
         None => unreachable!("`{kind}` is registered by this module"),
@@ -216,8 +216,8 @@ mod tests {
     use super::*;
     use crate::registry::{Hosting, Registry};
 
-    fn yaml(text: &str) -> serde_yaml::Value {
-        serde_yaml::from_str(text).unwrap()
+    fn yaml(text: &str) -> serde_yaml_ng::Value {
+        serde_yaml_ng::from_str(text).unwrap()
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn a_proxy_kind_cannot_be_built_as_a_minter() {
         let err = Registry::discover()
-            .build(BEARER_KIND, &serde_yaml::Value::Null)
+            .build(BEARER_KIND, &serde_yaml_ng::Value::Null)
             .unwrap_err();
         assert!(err.to_string().contains("HTTP proxy"), "{err}");
         assert!(
@@ -244,13 +244,13 @@ mod tests {
 
     #[test]
     fn a_kind_that_is_not_one_of_ours_parses_as_none() {
-        assert!(HttpKind::parse("postgres-dynamic", &serde_yaml::Value::Null).is_none());
+        assert!(HttpKind::parse("postgres-dynamic", &serde_yaml_ng::Value::Null).is_none());
     }
 
     #[test]
     fn bearer_and_basic_take_no_configuration() {
         assert_eq!(
-            HttpKind::parse(BEARER_KIND, &serde_yaml::Value::Null)
+            HttpKind::parse(BEARER_KIND, &serde_yaml_ng::Value::Null)
                 .unwrap()
                 .unwrap(),
             HttpKind::Bearer
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn a_header_credential_without_a_name_is_rejected() {
-        assert!(HttpKind::parse(HEADER_KIND, &serde_yaml::Value::Null)
+        assert!(HttpKind::parse(HEADER_KIND, &serde_yaml_ng::Value::Null)
             .unwrap()
             .is_err());
         assert!(HttpKind::parse(HEADER_KIND, &yaml("name: ''\n"))

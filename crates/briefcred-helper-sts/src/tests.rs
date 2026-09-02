@@ -17,11 +17,11 @@ use super::*;
 const ROLE: &str = "arn:aws:iam::123456789012:role/briefcred-dev";
 const MASTER: &str = "AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
-fn config(yaml: &str) -> serde_yaml::Value {
-    serde_yaml::from_str(yaml).unwrap()
+fn config(yaml: &str) -> serde_yaml_ng::Value {
+    serde_yaml_ng::from_str(yaml).unwrap()
 }
 
-fn minimal() -> serde_yaml::Value {
+fn minimal() -> serde_yaml_ng::Value {
     config(&format!("role_arn: {ROLE}\nregion: eu-west-1\n"))
 }
 
@@ -109,7 +109,7 @@ fn sent_uri(client: &StaticReplayClient, index: usize) -> String {
         .to_string()
 }
 
-fn mint_ctx(config: serde_yaml::Value) -> MintCtx {
+fn mint_ctx(config: serde_yaml_ng::Value) -> MintCtx {
     MintCtx {
         mint_id: MintId::generate(),
         profile: "dev".into(),

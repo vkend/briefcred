@@ -406,7 +406,7 @@ fn ask_config(kind: &str) -> Result<Vec<(String, String)>> {
 
 /// Build the profile document.
 ///
-/// Emitted as text rather than through `serde_yaml` so the file a user opens
+/// Emitted as text rather than through `serde_yaml_ng` so the file a user opens
 /// afterwards has the comments that tell them what to change. A generated
 /// config with no comments is one nobody edits.
 pub fn render_profile(

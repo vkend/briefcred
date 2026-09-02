@@ -167,8 +167,8 @@ fn mint_id(raw: &str) -> Result<MintId, HelperError> {
 ///
 /// Every JSON document is a YAML document, so this is a re-encoding rather
 /// than a conversion, and a config that does not survive it was never valid.
-fn to_yaml(value: serde_json::Value) -> Result<serde_yaml::Value, HelperError> {
-    serde_yaml::to_value(value).map_err(|e| HelperError {
+fn to_yaml(value: serde_json::Value) -> Result<serde_yaml_ng::Value, HelperError> {
+    serde_yaml_ng::to_value(value).map_err(|e| HelperError {
         code: CODE_INVALID_PARAMS,
         message: format!("config is not a usable document: {e}"),
     })

@@ -71,7 +71,7 @@ impl Rules {
     /// error the operator sees when the hook first runs, rather than a rule
     /// that silently never matches.
     pub fn from_yaml_str(yaml: &str) -> Result<Rules, String> {
-        let rules: Rules = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+        let rules: Rules = serde_yaml_ng::from_str(yaml).map_err(|e| e.to_string())?;
         for rule in &rules.rules {
             regex::Regex::new(&rule.pattern)
                 .map_err(|e| format!("`match: {}` is not a valid regex: {e}", rule.pattern))?;

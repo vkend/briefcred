@@ -10,8 +10,8 @@ fn ca_key() -> Zeroizing<String> {
     Zeroizing::new(key.to_openssh(LineEnding::LF).unwrap().to_string())
 }
 
-fn config(yaml: &str) -> serde_yaml::Value {
-    serde_yaml::from_str(yaml).unwrap()
+fn config(yaml: &str) -> serde_yaml_ng::Value {
+    serde_yaml_ng::from_str(yaml).unwrap()
 }
 
 const PRINCIPALS: &str = "principals: [ubuntu]\n";

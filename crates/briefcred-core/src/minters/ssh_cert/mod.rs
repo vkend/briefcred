@@ -110,9 +110,9 @@ pub struct SshCertConfig {
 
 impl SshCertConfig {
     /// Interpret a credential spec's `config` block.
-    pub fn from_value(value: &serde_yaml::Value) -> Result<SshCertConfig> {
+    pub fn from_value(value: &serde_yaml_ng::Value) -> Result<SshCertConfig> {
         let config: SshCertConfig =
-            serde_yaml::from_value(value.clone()).map_err(|e| Error::MinterConfig {
+            serde_yaml_ng::from_value(value.clone()).map_err(|e| Error::MinterConfig {
                 kind: KIND,
                 message: e.to_string(),
             })?;

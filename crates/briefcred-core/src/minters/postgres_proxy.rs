@@ -123,13 +123,13 @@ impl PgProxyConfig {
     ///
     /// `None` for any other kind, which is how a caller asks "is this the
     /// Postgres proxy's business" in one step.
-    pub fn parse(kind: &str, config: &serde_yaml::Value) -> Option<Result<PgProxyConfig>> {
+    pub fn parse(kind: &str, config: &serde_yaml_ng::Value) -> Option<Result<PgProxyConfig>> {
         (kind == KIND).then(|| PgProxyConfig::from_yaml(config))
     }
 
-    fn from_yaml(config: &serde_yaml::Value) -> Result<PgProxyConfig> {
+    fn from_yaml(config: &serde_yaml_ng::Value) -> Result<PgProxyConfig> {
         let parsed: PgProxyConfig =
-            serde_yaml::from_value(config.clone()).map_err(|e| Error::MinterConfig {
+            serde_yaml_ng::from_value(config.clone()).map_err(|e| Error::MinterConfig {
                 kind: KIND,
                 message: e.to_string(),
             })?;
@@ -187,8 +187,8 @@ mod tests {
     use super::*;
     use crate::registry::{Hosting, Registry};
 
-    fn yaml(text: &str) -> serde_yaml::Value {
-        serde_yaml::from_str(text).unwrap()
+    fn yaml(text: &str) -> serde_yaml_ng::Value {
+        serde_yaml_ng::from_str(text).unwrap()
     }
 
     const FULL: &str = "host: db.internal\nport: 6432\ndbname: analytics\nuser: reporting\n";
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn another_kind_parses_as_none() {
         assert!(PgProxyConfig::parse("postgres-dynamic", &yaml(FULL)).is_none());
-        assert!(PgProxyConfig::parse("http-bearer", &serde_yaml::Value::Null).is_none());
+        assert!(PgProxyConfig::parse("http-bearer", &serde_yaml_ng::Value::Null).is_none());
     }
 
     #[test]
@@ -251,7 +251,7 @@ mod tests {
                 "{partial}"
             );
         }
-        assert!(PgProxyConfig::parse(KIND, &serde_yaml::Value::Null)
+        assert!(PgProxyConfig::parse(KIND, &serde_yaml_ng::Value::Null)
             .unwrap()
             .is_err());
     }
@@ -274,11 +274,11 @@ mod tests {
     fn a_value_with_a_nul_in_it_is_refused_rather_than_silently_truncated() {
         // The startup packet writes these NUL-terminated. A `dbname` with an
         // embedded NUL would connect to the prefix and nobody would be told.
-        let mut config = serde_yaml::Mapping::new();
+        let mut config = serde_yaml_ng::Mapping::new();
         config.insert("host".into(), "h".into());
         config.insert("dbname".into(), "app\0other".into());
         config.insert("user".into(), "u".into());
-        let err = PgProxyConfig::parse(KIND, &serde_yaml::Value::Mapping(config))
+        let err = PgProxyConfig::parse(KIND, &serde_yaml_ng::Value::Mapping(config))
             .unwrap()
             .unwrap_err();
         assert!(err.to_string().contains("NUL"), "{err}");
