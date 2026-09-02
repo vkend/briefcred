@@ -23,6 +23,7 @@ pub mod issuer;
 pub mod listener;
 pub mod policy;
 pub mod revocation;
+pub mod stream;
 pub mod swap;
 pub mod tls;
 pub mod token;

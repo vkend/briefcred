@@ -1,9 +1,10 @@
 //! The Prometheus text endpoint, on loopback only.
 //!
-//! Six series, all of them operational: how long the daemon has been up, how
-//! many IPC requests it has handled by kind, how many audit rows it failed to
-//! write, how long mints and revokes take by minter kind, and how many revokes
-//! have failed. Nothing here is derived from credential material — a histogram
+//! Everything here is operational: how long the daemon has been up, how many
+//! IPC requests it has handled by kind, how many audit rows it failed to write,
+//! how long mints and revokes take by minter kind, how many revokes have
+//! failed, and what each of the two proxies has carried. Nothing is derived
+//! from credential material — a histogram
 //! records how long a mint took and which kind served it, never what was
 //! minted — and the listener is bound to `127.0.0.1` so it is not reachable
 //! off the machine.
@@ -33,21 +34,40 @@ const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 /// bucket is implied and emitted from the total count.
 pub const LATENCY_BUCKETS: [f64; 9] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
 
-/// One latency histogram, keyed by minter kind.
+/// The upper bounds of the stream-duration histogram buckets, in seconds.
 ///
-/// Hand-rolled rather than pulled from a metrics crate: three series is not
-/// enough to justify a dependency that would also want to own the registry,
+/// A separate scale because a stream is not a latency. A proxied request that
+/// takes five seconds is slow; an event stream that stays open for five seconds
+/// is short, and one that holds a WebSocket for an hour is a session somebody
+/// left running. Measured on [`LATENCY_BUCKETS`] every stream would fall in
+/// `+Inf` and the histogram would say nothing at all, so these run from a
+/// second to two hours.
+pub const STREAM_DURATION_BUCKETS: [f64; 9] =
+    [1.0, 5.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0];
+
+/// One duration histogram, keyed by whatever the caller labels a `kind`.
+///
+/// Hand-rolled rather than pulled from a metrics crate: a handful of series is
+/// not enough to justify a dependency that would also want to own the registry,
 /// the exposition format, and the process's global state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Histogram {
+    /// The bucket bounds this histogram observes against, ascending.
+    bounds: &'static [f64],
     /// Per kind: one cumulative counter per bucket, plus count and sum.
     by_kind: BTreeMap<String, Series>,
 }
 
+impl Default for Histogram {
+    fn default() -> Histogram {
+        Histogram::new(&LATENCY_BUCKETS)
+    }
+}
+
 #[derive(Debug)]
 struct Series {
-    /// Non-cumulative observation counts, one per bound in [`LATENCY_BUCKETS`].
-    buckets: [u64; LATENCY_BUCKETS.len()],
+    /// Non-cumulative observation counts, one per bound of the histogram.
+    buckets: Vec<u64>,
     /// Observations above the last bound.
     overflow: u64,
     /// Total observations.
@@ -56,21 +76,27 @@ struct Series {
     sum: f64,
 }
 
-impl Default for Series {
-    fn default() -> Series {
-        Series {
-            buckets: [0; LATENCY_BUCKETS.len()],
-            overflow: 0,
-            count: 0,
-            sum: 0.0,
+impl Histogram {
+    /// An empty histogram observing against `bounds`.
+    fn new(bounds: &'static [f64]) -> Histogram {
+        Histogram {
+            bounds,
+            by_kind: BTreeMap::new(),
         }
     }
-}
 
-impl Histogram {
     fn observe(&mut self, kind: &str, seconds: f64) {
-        let series = self.by_kind.entry(kind.to_string()).or_default();
-        match LATENCY_BUCKETS.iter().position(|bound| seconds <= *bound) {
+        let bounds = self.bounds;
+        let series = self
+            .by_kind
+            .entry(kind.to_string())
+            .or_insert_with(|| Series {
+                buckets: vec![0; bounds.len()],
+                overflow: 0,
+                count: 0,
+                sum: 0.0,
+            });
+        match bounds.iter().position(|bound| seconds <= *bound) {
             Some(index) => series.buckets[index] += 1,
             None => series.overflow += 1,
         }
@@ -88,7 +114,7 @@ impl Histogram {
         out.push_str(&format!("# TYPE {name} histogram\n"));
         for (kind, series) in &self.by_kind {
             let mut cumulative = 0u64;
-            for (index, bound) in LATENCY_BUCKETS.iter().enumerate() {
+            for (index, bound) in self.bounds.iter().enumerate() {
                 cumulative += series.buckets[index];
                 out.push_str(&format!(
                     "{name}_bucket{{kind=\"{kind}\",le=\"{bound}\"}} {cumulative}\n"
@@ -118,6 +144,8 @@ pub struct Metrics {
     revoke_failures: Mutex<BTreeMap<String, u64>>,
     proxy_requests: Mutex<BTreeMap<(String, String), u64>>,
     proxy_latency: Mutex<Histogram>,
+    proxy_streams: Mutex<BTreeMap<&'static str, u64>>,
+    proxy_stream_duration: Mutex<Histogram>,
     pgproxy_connections: Mutex<BTreeMap<String, u64>>,
     pgproxy_bytes: Mutex<BTreeMap<&'static str, u64>>,
     quota_saturation: Mutex<BTreeMap<String, f64>>,
@@ -129,6 +157,16 @@ pub struct Metrics {
 /// Seeded at zero so a proxy nobody has connected through is distinguishable
 /// from a scrape that failed.
 const PGPROXY_DIRECTIONS: [&str; 2] = ["client_to_server", "server_to_client"];
+
+/// The `kind` labels on `briefcred_proxy_streams_total`.
+///
+/// Seeded at zero for the same reason the directions above are: "no WebSocket
+/// has ever been opened through this proxy" and "the series is missing" are
+/// different facts, and only one of them is worth waking somebody for.
+const PROXY_STREAM_KINDS: [&str; 2] = [
+    crate::proxy::stream::KIND_SSE,
+    crate::proxy::stream::KIND_WS,
+];
 
 impl Metrics {
     /// Start the clock, with every request series pre-seeded at zero.
@@ -146,6 +184,8 @@ impl Metrics {
             revoke_failures: Mutex::new(BTreeMap::new()),
             proxy_requests: Mutex::new(BTreeMap::new()),
             proxy_latency: Mutex::new(Histogram::default()),
+            proxy_streams: Mutex::new(PROXY_STREAM_KINDS.iter().map(|kind| (*kind, 0)).collect()),
+            proxy_stream_duration: Mutex::new(Histogram::new(&STREAM_DURATION_BUCKETS)),
             pgproxy_connections: Mutex::new(BTreeMap::new()),
             pgproxy_bytes: Mutex::new(PGPROXY_DIRECTIONS.iter().map(|name| (*name, 0)).collect()),
             quota_saturation: Mutex::new(BTreeMap::new()),
@@ -245,6 +285,28 @@ impl Metrics {
             .lock()
             .expect("metrics mutex")
             .observe(decision, elapsed.as_secs_f64());
+    }
+
+    /// Record one long-lived stream that has ended, by kind.
+    ///
+    /// `kind` is `sse` or `ws`. Counted and timed when the stream *closes*
+    /// rather than when it opens, which is the only way the duration can exist
+    /// — and it makes the counter read "streams that have finished", so a
+    /// dashboard that wants the number currently open subtracts it from the
+    /// `101`s and the event-stream responses on
+    /// `briefcred_proxy_requests_total` rather than being told a number that
+    /// was true when the row was written.
+    pub fn record_proxy_stream(&self, kind: &'static str, elapsed: std::time::Duration) {
+        *self
+            .proxy_streams
+            .lock()
+            .expect("metrics mutex")
+            .entry(kind)
+            .or_insert(0) += 1;
+        self.proxy_stream_duration
+            .lock()
+            .expect("metrics mutex")
+            .observe(kind, elapsed.as_secs_f64());
     }
 
     /// Record how long one mint took, successful or not.
@@ -361,6 +423,25 @@ impl Metrics {
             "Time taken by one proxied request, by policy decision.",
             &mut out,
         );
+
+        out.push_str(
+            "# HELP briefcred_proxy_streams_total Long-lived streams through the HTTP proxy that have ended, by kind.\n",
+        );
+        out.push_str("# TYPE briefcred_proxy_streams_total counter\n");
+        for (kind, count) in self.proxy_streams.lock().expect("metrics mutex").iter() {
+            out.push_str(&format!(
+                "briefcred_proxy_streams_total{{kind=\"{kind}\"}} {count}\n"
+            ));
+        }
+
+        self.proxy_stream_duration
+            .lock()
+            .expect("metrics mutex")
+            .render(
+                "briefcred_proxy_stream_duration_seconds",
+                "How long one long-lived stream stayed open, by kind.",
+                &mut out,
+            );
 
         out.push_str(
             "# HELP briefcred_pgproxy_connections_total Connections through the Postgres proxy, by outcome.\n",
@@ -580,6 +661,47 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_appears_with_its_kind_and_on_its_own_bucket_scale() {
+        let metrics = Metrics::new(Arc::new(AtomicU64::new(0)));
+        metrics.record_proxy_stream("sse", Duration::from_secs(45));
+        metrics.record_proxy_stream("ws", Duration::from_secs(2));
+        metrics.record_proxy_stream("ws", Duration::from_secs(4000));
+
+        let text = metrics.render();
+        for expected in [
+            "briefcred_proxy_streams_total{kind=\"sse\"} 1",
+            "briefcred_proxy_streams_total{kind=\"ws\"} 2",
+            // 45 s is over the 30 s bound and at or under the 60 s one.
+            "briefcred_proxy_stream_duration_seconds_bucket{kind=\"sse\",le=\"30\"} 0",
+            "briefcred_proxy_stream_duration_seconds_bucket{kind=\"sse\",le=\"60\"} 1",
+            "briefcred_proxy_stream_duration_seconds_count{kind=\"sse\"} 1",
+            // A stream longer than the last bound is still in the total.
+            "briefcred_proxy_stream_duration_seconds_bucket{kind=\"ws\",le=\"3600\"} 1",
+            "briefcred_proxy_stream_duration_seconds_bucket{kind=\"ws\",le=\"+Inf\"} 2",
+        ] {
+            assert!(text.contains(expected), "{expected} missing from:\n{text}");
+        }
+        // The request latencies keep their own, much shorter, scale.
+        assert!(
+            !text.contains("briefcred_proxy_latency_seconds_bucket{kind=\"allow\",le=\"3600\""),
+            "a stream bound leaked onto the latency histogram:\n{text}"
+        );
+    }
+
+    #[test]
+    fn both_stream_kinds_are_present_from_the_first_scrape() {
+        let text = Metrics::new(Arc::new(AtomicU64::new(0))).render();
+        for kind in PROXY_STREAM_KINDS {
+            assert!(
+                text.contains(&format!(
+                    "briefcred_proxy_streams_total{{kind=\"{kind}\"}} 0"
+                )),
+                "{kind} missing from:\n{text}"
+            );
+        }
+    }
+
+    #[test]
     fn both_postgres_byte_directions_are_present_from_the_first_scrape() {
         // A counter that only appears once it is non-zero cannot be told apart
         // from a scrape that failed.
@@ -718,6 +840,8 @@ mod tests {
             "briefcred_revoke_failures_total",
             "briefcred_pgproxy_connections_total",
             "briefcred_pgproxy_bytes_total",
+            "briefcred_proxy_streams_total",
+            "briefcred_proxy_stream_duration_seconds",
         ] {
             assert!(text.contains(&format!("# HELP {series} ")), "{series}");
             assert!(text.contains(&format!("# TYPE {series} ")), "{series}");
