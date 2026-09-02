@@ -1,0 +1,15 @@
+# Debug information for development builds.
+#
+# The default macOS dev profile emits full DWARF and leaves it "unpacked": the
+# debug info stays in one `.o` file per codegen unit under `target/debug/deps`,
+# and a workspace this size accumulated tens of gigabytes of them. Neither
+# setting below changes what is compiled — only what debug information is kept
+# and where it is put.
+#
+# `line-tables-only` keeps file and line numbers, which is all a backtrace or a
+# panic location needs, and drops the type and variable descriptions that make
+# up most of the bulk. `packed` moves what is left into a single `.dSYM` bundle
+# beside each artifact instead of scattering `.o` files across `deps`.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "packed"
