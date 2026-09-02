@@ -290,12 +290,28 @@ a profile with `unlock.policy: none`.
 A successful unlock is cached per profile for `unlock.cache_secs`, 300 seconds
 by default, so a shell running briefcred in a loop prompts once rather than
 once a second. The cache is per profile, so unlocking a low-value profile never
-opens a high-value one, and a profile reload clears it.
+opens a high-value one, and a profile reload clears it. Within that window a
+local caller running as you opens a session without a prompt. That is the
+trade the cache exists to make; set `cache_secs: 0` to prompt every time.
 
 Over SSH, or anywhere else with no graphical session to draw the prompt in,
-`OpenSession` fails with `no_aqua_session` rather than falling back to
-something weaker. If a profile is genuinely meant to run unattended, say so
-with `unlock.policy: none`; briefcred will not infer it.
+`OpenSession` is refused with `no_aqua_session` rather than falling back to
+something weaker, and the refusal happens before the cache is consulted, so a
+warm cache from a desktop login does not carry an SSH shell through. If a
+profile is genuinely meant to run unattended, say so with
+`unlock.policy: none`; briefcred will not infer it.
+
+That refusal is best-effort, and it is worth knowing exactly how. Two
+independent checks feed it: the daemon inspects its own security session, and
+the client declares its own in the request. Both are needed, because neither
+sees the whole picture — the daemon is started by launchd and cannot tell an
+SSH client from a local one, and the client cannot tell whether the daemon is
+in a background session. The client's half is a declaration rather than a
+proof: a program running as you can send `client_headless: false` and get a
+prompt on the console user's screen. briefcred cannot prevent that, because
+such a program is already inside every boundary briefcred has. What the check
+buys is that an honest client on SSH gets an accurate refusal instead of a
+prompt nobody is standing in front of.
 
 A session is wiped when it is closed, when it has gone `session_idle_secs`
 without being used, and at shutdown. Every one of those writes a

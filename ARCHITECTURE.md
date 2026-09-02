@@ -80,6 +80,7 @@ are the two things every other crate has to agree on.
 | `minters` | Concrete minters, each registering itself with the registry. |
 | `registry` | `MinterFactory` and the `inventory`-collected `Registry` that resolves a profile's `kind`. |
 | `source` | The `MasterSource` backends: keychain, file, and environment. |
+| `session_env` | Whether the calling process has a screen. Read by the daemon *and* the CLI. |
 | `keystore` | The `KeyStore` trait, the macOS keychain backend, and the file backend. |
 | `ca` | The root CA, leaf issuance, and the runtime trust environment. |
 
@@ -172,7 +173,11 @@ whole layout, including the socket; tests always set it.
 8. The unlock gate runs before any master is fetched. A refused prompt leaves
    no master in the daemon's memory at all.
 9. A gate that cannot run fails closed. With no graphical session there is no
-   weaker fallback, only `NoAquaSession`.
+   weaker fallback, only `NoAquaSession` — and that check runs before the
+   unlock cache, so a warm cache cannot carry a headless caller through it.
+   The check is the union of the daemon's own and the client's declared
+   answer, because neither process can see the other's session. The client's
+   half is advisory; see `THREAT_MODEL.md`.
 10. A session is the lifetime of the masters it holds. There is no "closed"
     flag: closing, evicting, and shutting down all drop the session, and
     dropping it zeroises every master in it.
@@ -204,13 +209,14 @@ open sessions. Everything about the session model exists to bound how long that
 state lives.
 
 ```
-OpenSession(profile)
+OpenSession(profile, client_headless)
   |
   |-- profile loaded?            no -> Error
+  |-- policy != none AND (client_headless OR daemon has no screen)?
+  |        yes -> Locked{no_aqua_session}, audit UnlockDenied
   |-- unlock cached for it?      no -> UnlockGate::unlock
-  |                                     |-- no graphical session -> Locked{no_aqua_session}
-  |                                     |-- cancelled / failed    -> Locked{...}, audit UnlockDenied
-  |                                     `-- ok                    -> cache for unlock.cache_secs
+  |                                     |-- cancelled / failed -> Locked{...}, audit UnlockDenied
+  |                                     `-- ok                 -> cache for unlock.cache_secs
   |-- fetch a master per distinct source_key   (any failure -> Error, nothing retained)
   `-- Session { masters: Zeroizing<String> }   -> SessionOpened{session_id, expires_at}
 

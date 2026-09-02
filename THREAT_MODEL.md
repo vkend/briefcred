@@ -119,14 +119,15 @@ What bounds it:
 - **The gate runs before the master is fetched.** `OpenSession` prompts first
   and reads the keychain second, so a refused prompt leaves nothing behind.
   The refusal is audited as `unlock_denied` with the reason.
-- **The gate fails closed.** With no graphical session — over SSH, or in a
-  `launchd` background session — there is nothing to draw a prompt in, and
-  briefcred returns `no_aqua_session` rather than falling back to something an
-  attacker could satisfy. Detection is `SessionGetInfo`'s
-  `sessionHasGraphicAccess`, plus `SSH_CONNECTION` and `SSH_TTY`. Turning the
-  gate off is possible, but only by editing the profile to say
-  `unlock.policy: none`, which is a visible, auditable choice rather than an
-  inference.
+- **The gate fails closed, on a best-effort check.** With no graphical session
+  — over SSH, or in a `launchd` background session — there is nothing to draw a
+  prompt in, and briefcred returns `no_aqua_session` rather than falling back
+  to something an attacker could satisfy. The refusal runs *before* the unlock
+  cache, so a warm cache from a desktop login cannot carry an SSH shell
+  through. Turning the gate off is possible, but only by editing the profile to
+  say `unlock.policy: none`, which is a visible, auditable choice rather than
+  an inference. The limits of the check are spelled out under residual risks
+  below; it is not a boundary against a hostile same-uid caller.
 - **The cache is per profile and time-bounded.** A cached unlock lasts
   `unlock.cache_secs`, 300 seconds by default. Unlocking a low-value profile
   never opens a high-value one, and a profile reload clears the cache, so
@@ -145,9 +146,23 @@ What bounds it:
 Residual risks, stated plainly:
 
 - **The cache window is a real window.** For up to `unlock.cache_secs` after a
-  successful unlock, a local process running as the user can open a session
-  without a prompt. Setting `cache_secs: 0` closes it at the cost of prompting
-  every time. This is the deliberate trade, not an oversight.
+  successful unlock, any local process running as the user can open a session
+  for that profile without a prompt, and read the masters it holds. It is a
+  window on the *profile*, not on the terminal that unlocked it: briefcred
+  cannot distinguish the shell the human typed into from any other same-uid
+  caller. Setting `cache_secs: 0` closes it at the cost of prompting every
+  time. This is the deliberate trade, and it is the single largest gap between
+  "malware cannot mint without a human" as a slogan and what the code enforces.
+- **The headless refusal is advisory, not enforced.** It is the union of two
+  checks, and neither is a boundary. The daemon's own `SessionGetInfo` check is
+  honest but blind: the daemon lives in launchd's session and cannot tell who
+  is connecting. The client's `client_headless` flag closes that blind spot for
+  honest clients, but it is a self-declaration — a program running as the user
+  can simply send `false`. briefcred cannot verify it and does not pretend to.
+  The value is real but narrow: an honest client on SSH gets an accurate
+  refusal instead of a prompt drawn on the console user's screen. Against a
+  hostile same-uid caller the refusal buys nothing, which is consistent with
+  every other guarantee on this page.
 - **An open session is an exposed master.** Anything that can read the daemon's
   memory — a debugger attached as the same user, root, a core dump — can read
   every master of every open session. `session_idle_secs` bounds how long that

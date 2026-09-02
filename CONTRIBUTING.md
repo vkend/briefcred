@@ -154,7 +154,13 @@ socket means the next field somebody adds to it is exposed by default.
 - Networking in tests is localhost only.
 - Never call the biometric prompt from a test that is not `#[ignore]`. It puts
   a sheet on the developer's screen and blocks until somebody answers it. Force
-  the headless path with `BRIEFCRED_FORCE_NO_AQUA=1` instead.
+  the headless path with `briefcred_core::session_env::testing::ForceNoAqua`,
+  which sets `BRIEFCRED_FORCE_NO_AQUA=1` under a shared mutex and always
+  restores the environment on drop.
+- Test doubles that stand in for a secret-bearing type obey the same rules as
+  the real one: `Zeroizing`, a redacting `Debug`, and `cfg(any(test, feature =
+  "test-util"))` so they cannot reach a production binary. `MemorySource` is
+  the worked example.
 - Time-based behaviour is tested against `clock::TestClock`, not a `sleep`.
 
 ## Commits

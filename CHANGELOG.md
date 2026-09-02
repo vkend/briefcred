@@ -201,3 +201,27 @@ All notable changes to briefcred are recorded here. The format follows
   `Request::NAMES` exactly.
 - `Profile::load_dir` takes a `&Registry` and validates every profile against
   it.
+- `briefcred_core::session_env`: the "does this process have a screen?" check,
+  shared because two processes have to answer it and they get different
+  answers. The daemon sits in launchd's session and cannot tell an SSH client
+  from a local one; the client can. So `Request::OpenSession` carries
+  `client_headless`, the client fills it in from its own check, and the daemon
+  refuses when either side reports headless. The field has no serde default: a
+  client that has not considered the question fails to serialise rather than
+  quietly declaring it has a screen.
+- The headless refusal now runs before the unlock cache is consulted, so a warm
+  cache from a desktop login cannot carry an SSH shell through it. `README.md`
+  and `THREAT_MODEL.md` now state what the check is and is not: it is
+  best-effort and advisory, worth real money against an honest client on SSH
+  and nothing at all against a hostile same-uid caller.
+
+### Changed
+
+- `briefcred-core` uses `deny(unsafe_code)` rather than `forbid`, for the one
+  `extern "C"` call into the Security framework in `session_env`. Every other
+  module is unsafe-free, and `deny` still fails the build on any `unsafe` not
+  explicitly allowed and justified at the site.
+- `source::MemorySource` is compiled only under `cfg(test)` or the new
+  `test-util` feature, holds its masters in `Zeroizing<String>`, and redacts
+  its own `Debug`. It is test scaffolding and can no longer reach a production
+  binary.
