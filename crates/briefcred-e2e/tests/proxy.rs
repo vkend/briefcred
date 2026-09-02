@@ -57,6 +57,39 @@ env:
     )
 }
 
+/// The byte budget `a_websocket_spends_the_sessions_byte_budget` runs against.
+///
+/// Small enough that a handful of echoed frames passes it, large enough that
+/// the `exec` and the first `/v1/models` do not.
+const BYTE_BUDGET: usize = 4096;
+
+/// A profile whose policy is a per-session byte budget.
+///
+/// `context.resp_bytes_so_far` counts what the session has already been given.
+/// A WebSocket that did not feed it would be a budget any agent could step
+/// around by asking for a socket instead of a response.
+fn byte_budget_profile() -> String {
+    format!(
+        "\
+name: openai
+unlock:
+  policy: none
+credentials:
+  - name: openai
+    kind: http-bearer
+    ttl_secs: 300
+policy_mode: enforce
+policy: |
+  permit(principal, action == Action::\"GET\", resource)
+  when {{ resource.host == \"{UPSTREAM_HOST}\" &&
+    [\"/v1/models\", \"/ws\"].contains(resource.path) &&
+    context.resp_bytes_so_far < {BYTE_BUDGET} }};
+env:
+  OPENAI_API_KEY: ${{minted.openai.TOKEN}}
+"
+    )
+}
+
 /// The same, with a `quota:` block spliced in.
 ///
 /// `quota` is the whole YAML block or the empty string, rather than a rate and
@@ -1342,6 +1375,75 @@ async fn a_websocket_reaches_the_upstream_with_the_real_key_and_echoes_both_ways
 }
 
 #[tokio::test]
+async fn a_websocket_spends_the_sessions_byte_budget_while_it_is_still_open() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // The bypass this test exists for: a WebSocket that never fed
+    // `resp_bytes_so_far` would let an agent pull unlimited bytes through a
+    // socket while a Cedar byte budget went on believing it had spent almost
+    // nothing.
+    let fixture = start_with(&byte_budget_profile()).await;
+
+    let (status, _, _) = fixture
+        .client
+        .get("/v1/models", &bearer(&fixture.token))
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+    assert_eq!(
+        status,
+        200,
+        "the budget starts unspent\n{}",
+        fixture.daemon.log()
+    );
+
+    let mut socket = fixture
+        .client
+        .websocket("/ws", &bearer(&fixture.token))
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{}", fixture.daemon.log()));
+
+    // Well past the budget, echoed back, so it is the *downstream* direction
+    // that spends it.
+    let payload = "x".repeat(256);
+    for _ in 0..40 {
+        socket
+            .send(Message::Text(payload.clone().into()))
+            .await
+            .unwrap();
+        socket.next().await.expect("an echo").unwrap();
+    }
+
+    // The socket is still open. The reporter flushes on a one-second timer as
+    // well as on a byte threshold, so a stream that never reaches the
+    // threshold is still visible to the policy while it runs — which is the
+    // half of the fix that a close-time flush would not give.
+    let denied = briefcred_e2e::daemon_harness::wait_until(Duration::from_secs(5), || {
+        let client = &fixture.client;
+        let token = fixture.token.clone();
+        async move {
+            client
+                .get("/v1/models", &bearer(&token))
+                .await
+                .map(|(status, _, _)| status == 403)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+    assert!(
+        denied,
+        "the bytes a websocket carried must count against the session's budget:\n{}",
+        fixture.daemon.log()
+    );
+
+    // And the socket really was still open throughout.
+    socket
+        .send(Message::Text("still open".into()))
+        .await
+        .expect("the websocket must not have been closed by the denial");
+}
+
+#[tokio::test]
 async fn a_websocket_handshake_the_policy_does_not_permit_is_refused() {
     // `enforce`, and the profile names `/ws` and not `/nope`. A handshake is a
     // `GET`, so the policy decides it exactly as it decides any other.
@@ -1357,6 +1459,47 @@ async fn a_websocket_handshake_the_policy_does_not_permit_is_refused() {
     assert!(
         fixture.upstream.ws_seen.lock().unwrap().is_empty(),
         "a denied handshake must not reach the upstream"
+    );
+}
+
+#[tokio::test]
+async fn a_handshake_with_no_key_is_recorded_as_malformed_and_not_as_a_denial() {
+    // Nothing refused this: the policy was never given a chance to have an
+    // opinion, so counting it as `deny` would put a client's own bug in the
+    // series an operator reads to find a profile that is too narrow.
+    let fixture = start_with(&stream_profile()).await;
+    let mut headers = bearer(&fixture.token);
+    headers.push(("upgrade", "websocket".to_string()));
+    headers.push(("connection", "Upgrade".to_string()));
+
+    let (status, _, _) = fixture.client.get("/ws", &headers).await.unwrap();
+    assert_eq!(status, 400);
+    assert!(fixture.upstream.ws_seen.lock().unwrap().is_empty());
+
+    assert!(
+        proxy_row_written(&fixture.daemon).await,
+        "a malformed handshake must still be audited:\n{}",
+        fixture.daemon.log()
+    );
+    let rows = fixture.daemon.audit_rows();
+    let row = rows.iter().find(|r| r["event"] == "proxy_request").unwrap();
+    assert_eq!(row["decision"], "bad_request");
+    assert!(
+        row["status"].is_null(),
+        "nothing reached an upstream, so there is no upstream status: {row}"
+    );
+    assert_eq!(row["path"], "/ws");
+
+    let scrape = scrape(&fixture.daemon).await;
+    assert!(
+        scrape.contains(
+            "briefcred_proxy_requests_total{decision=\"bad_request\",status_class=\"none\"} 1"
+        ),
+        "{scrape}"
+    );
+    assert!(
+        !scrape.contains("briefcred_proxy_requests_total{decision=\"deny\""),
+        "a malformed request must not be counted as a policy denial:\n{scrape}"
     );
 }
 

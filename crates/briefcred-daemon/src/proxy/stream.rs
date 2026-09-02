@@ -43,6 +43,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::proxy::issuer::ProxyIssuer;
 use crate::server::State;
+use crate::session::HttpCounters;
 
 /// How often a live stream re-checks that its grant is still a grant.
 ///
@@ -51,6 +52,22 @@ use crate::server::State;
 /// how long a revoked credential keeps delivering that can be stated in
 /// seconds rather than argued from three modules at once.
 const LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many bytes a relay accumulates before telling the session's counters.
+///
+/// The counters are what a Cedar `context.resp_bytes_so_far` reads, so a
+/// WebSocket that only reported at close would be a byte budget a long-lived
+/// socket could sit underneath indefinitely. Reported in batches rather than
+/// per read because the counter is shared across a session's requests and a
+/// per-read atomic add on a busy socket is contention for no extra accuracy.
+const REPORT_BYTES: u64 = 64 * 1024;
+
+/// How long a relay waits before telling the session's counters anyway.
+///
+/// The other half of the same bound: a socket trickling a few bytes a second
+/// would never reach [`REPORT_BYTES`], and a budget it is quietly spending is
+/// one the policy cannot see it spend.
+const REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long the second half of a WebSocket gets to finish once the first ended.
 ///
@@ -366,7 +383,10 @@ pub struct StreamRow {
 
 impl StreamRow {
     /// Write the row and count the stream. Called exactly once per stream.
-    fn write(self, events_or_frames: u64, bytes_up: u64, bytes_down: u64) {
+    ///
+    /// `self` by value so that "exactly once" is the type system's problem
+    /// rather than a rule somebody has to remember.
+    pub fn write(self, events_or_frames: u64, bytes_up: u64, bytes_down: u64) {
         self.state.audit(&AuditEntry::ProxyStream {
             ts: OffsetDateTime::now_utc(),
             mint_id: self.mint_id,
@@ -623,8 +643,13 @@ pub const HANDSHAKE_HEADERS: [&str; 5] = [
 /// close went past; no payload is unmasked, read, or kept. A policy therefore
 /// has nothing to say about what crosses a WebSocket after the handshake, which
 /// is a limit worth stating plainly rather than papering over.
-pub async fn relay<C, U>(client: C, upstream: U, row: StreamRow, watch: WatchHandle)
-where
+pub async fn relay<C, U>(
+    client: C,
+    upstream: U,
+    row: StreamRow,
+    watch: WatchHandle,
+    counters: Arc<HttpCounters>,
+) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -641,12 +666,16 @@ where
         upstream_write,
         Arc::clone(&bytes_up),
         Arc::clone(&frames_up),
+        // Nothing to report: `resp_bytes_so_far` is what the session was
+        // *given*, and this direction is what it sent.
+        None,
     );
     let down = pump(
         upstream_read,
         client_write,
         Arc::clone(&bytes_down),
         Arc::clone(&frames_down),
+        Some(counters),
     );
 
     tokio::pin!(up, down);
@@ -679,23 +708,53 @@ where
 }
 
 /// Copy one direction, counting frames, until it ends.
-async fn pump<R, W>(mut reader: R, mut writer: W, bytes: Arc<AtomicU64>, frames: Arc<AtomicU64>)
-where
+///
+/// `report`, on the direction that runs towards the client, is the session's
+/// own counters: what a policy's `context.resp_bytes_so_far` will read on the
+/// session's *next* request. Fed as the socket runs rather than at close, so a
+/// WebSocket that stays open for an hour is visible to a byte budget while it
+/// is spending one.
+async fn pump<R, W>(
+    mut reader: R,
+    mut writer: W,
+    bytes: Arc<AtomicU64>,
+    frames: Arc<AtomicU64>,
+    report: Option<Arc<HttpCounters>>,
+) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut counter = FrameCounter::new();
+    let mut reporter = report.map(Reporter::new);
     let mut buffer = vec![0u8; 16 * 1024];
+    // The tick has to be independent of the reads. A reporter that only
+    // flushed when the next byte arrived would leave a socket that has gone
+    // quiet holding bytes the session was already given — and "quiet" is
+    // exactly the state a client sits in between one burst and the next.
+    // `AsyncReadExt::read` is cancel-safe, so losing the race loses nothing.
+    let mut ticker = tokio::time::interval(REPORT_INTERVAL);
+    ticker.tick().await;
     loop {
-        let read = match reader.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
+        let read = tokio::select! {
+            read = reader.read(&mut buffer) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            },
+            _ = ticker.tick(), if reporter.is_some() => {
+                if let Some(reporter) = reporter.as_mut() {
+                    reporter.flush();
+                }
+                continue;
+            }
         };
         counter.push(&buffer[..read]);
         bytes.fetch_add(read as u64, Ordering::Relaxed);
         // Published as the stream runs rather than returned at the end, so the
         // row is right even when the stream was ended from underneath.
         frames.store(counter.frames(), Ordering::Relaxed);
+        if let Some(reporter) = reporter.as_mut() {
+            reporter.saw(read as u64);
+        }
         if writer.write_all(&buffer[..read]).await.is_err() {
             break;
         }
@@ -704,6 +763,51 @@ where
     // side that stopped sending is reported to the other as end-of-stream, and
     // its own pump then reads zero and follows.
     let _ = writer.shutdown().await;
+}
+
+/// Feeds bytes into a session's counters in batches, and never loses a tail.
+///
+/// The `Drop` is the point. A relay ended by [`until_stale`] has its pumps
+/// dropped mid-await, so a flush written after the read loop would never run
+/// for exactly the connections briefcred cut off — and a byte budget that a
+/// revoked socket could spend without ever being charged for is not a budget.
+struct Reporter {
+    counters: Arc<HttpCounters>,
+    /// Bytes seen but not yet added to the session's total.
+    pending: u64,
+    last: std::time::Instant,
+}
+
+impl Reporter {
+    fn new(counters: Arc<HttpCounters>) -> Reporter {
+        Reporter {
+            counters,
+            pending: 0,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// Record `bytes`, flushing once enough of them or enough time has passed.
+    fn saw(&mut self, bytes: u64) {
+        self.pending += bytes;
+        if self.pending >= REPORT_BYTES || self.last.elapsed() >= REPORT_INTERVAL {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending > 0 {
+            self.counters.add_resp_bytes(self.pending);
+            self.pending = 0;
+        }
+        self.last = std::time::Instant::now();
+    }
+}
+
+impl Drop for Reporter {
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 #[cfg(test)]

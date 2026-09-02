@@ -54,6 +54,7 @@
 //! | `deny` | the policy refused it, or the token did not authorise |
 //! | `would_deny` | the policy refused it and the profile is observing |
 //! | `quota` | the session's budget was spent; the policy was never asked |
+//! | `bad_request` | the request was malformed; **nothing** decided it |
 //! | `swap_error` | the policy **allowed** it; the credential would not go in |
 //! | `upstream_error` | the policy **allowed** it; the upstream was unreachable |
 //!
@@ -122,6 +123,16 @@ const DECISION_UPSTREAM_ERROR: &str = "upstream_error";
 /// permits: a profile whose `deny` count is climbing has a policy that is too
 /// narrow, and one whose `quota` count is climbing has an agent doing too much.
 const DECISION_QUOTA: &str = "quota";
+
+/// The request was not one briefcred could act on, so nothing decided it.
+///
+/// Distinct from `deny` because nothing refused it: the policy was never given
+/// a chance to have an opinion, and counting a malformed request as a denial
+/// would put a client's own bug in the series an operator reads to find out
+/// which profile is too narrow. Today the only way to reach it is a WebSocket
+/// handshake with no `Sec-WebSocket-Key`, or one on a connection that cannot
+/// be upgraded.
+const DECISION_BAD_REQUEST: &str = "bad_request";
 
 /// The body a throttled client gets back.
 ///
@@ -544,7 +555,7 @@ async fn forward(
                 &method,
                 &host,
                 &path,
-                DECISION_DENY,
+                DECISION_BAD_REQUEST,
             );
         }
     };
@@ -643,6 +654,7 @@ async fn forward(
                 key,
                 client_upgrade,
                 live,
+                counters: Arc::clone(&session.http),
             },
         );
     }
@@ -728,6 +740,9 @@ struct Handshake {
     key: String,
     client_upgrade: hyper::upgrade::OnUpgrade,
     live: stream::Liveness,
+    /// The session's running totals, so what the relay carries downstream
+    /// reaches the Cedar `context` of the session's next request.
+    counters: Arc<HttpCounters>,
 }
 
 /// Validate the upstream's `101`, answer the client with one, and relay.
@@ -753,6 +768,7 @@ fn upgrade_websocket(response: Response<Incoming>, hand: Handshake) -> Response<
         key,
         client_upgrade,
         live,
+        counters,
     } = hand;
 
     let expected = stream::accept_key(&key);
@@ -816,10 +832,21 @@ fn upgrade_websocket(response: Response<Incoming>, hand: Handshake) -> Response<
             Ok(both) => both,
             Err(err) => {
                 eprintln!("briefcred-daemon: a websocket to `{host}` was not upgraded: {err}");
+                // Still a row. Both sides were told the handshake succeeded, so
+                // a stream that carried nothing is a different fact from one
+                // that never appears in the log at all.
+                row.write(0, 0, 0);
                 return;
             }
         };
-        stream::relay(TokioIo::new(client), TokioIo::new(upstream), row, watch).await;
+        stream::relay(
+            TokioIo::new(client),
+            TokioIo::new(upstream),
+            row,
+            watch,
+            counters,
+        )
+        .await;
     });
 
     // The `101` the client gets is built from the upstream's, field by field:
