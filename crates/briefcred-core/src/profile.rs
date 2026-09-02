@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::policy::PolicyMode;
 
 /// Default credential lifetime when a spec does not set `ttl_secs`.
 pub const DEFAULT_TTL_SECS: u64 = 900;
@@ -61,6 +62,40 @@ pub struct Profile {
     /// must keep talking to the real internet through its own trust store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_env: Option<Vec<String>>,
+    /// Cedar policy source governing this profile's HTTP traffic.
+    ///
+    /// Parsed and validated against [`crate::policy::SCHEMA_SOURCE`] when the
+    /// profile is loaded. Absent is not "allow everything": the proxy denies by
+    /// default, so a profile with HTTP credentials and no policy forwards
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// Whether a policy denial stops the request or is only recorded.
+    #[serde(default)]
+    pub policy_mode: PolicyMode,
+    /// When the subprocess is pointed at briefcred's HTTP proxy.
+    #[serde(default)]
+    pub proxy: ProxyMode,
+}
+
+/// When `briefcred exec` sets `HTTPS_PROXY` and friends for a profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    /// Only when the profile declares at least one HTTP credential.
+    ///
+    /// The right answer almost always: a profile that mints nothing the proxy
+    /// serves has nothing to gain from routing its traffic through it, and
+    /// routing it anyway would break a subprocess whose upstream briefcred has
+    /// no leaf for.
+    #[default]
+    Auto,
+    /// Always, even when the profile declares no HTTP credential.
+    ///
+    /// For a profile whose value is the *policy* rather than a credential:
+    /// pointing a subprocess at the proxy with a Cedar allowlist and no
+    /// credentials at all is a usable egress control.
+    Always,
 }
 
 /// Per-profile unlock policy.
@@ -338,6 +373,31 @@ impl Profile {
         self.credentials.iter().find(|c| c.name == name)
     }
 
+    /// Compile this profile's `policy`, or `None` when it has none.
+    ///
+    /// Called once when the profile is loaded and again by the proxy when it
+    /// caches the compiled form. Both go through here so there is one answer to
+    /// "does this policy compile", and a profile that would fail at request
+    /// time fails at load time instead.
+    pub fn compiled_policy(&self) -> Result<Option<crate::policy::CompiledPolicy>> {
+        self.policy
+            .as_deref()
+            .map(crate::policy::CompiledPolicy::parse)
+            .transpose()
+    }
+
+    /// Whether this profile declares any credential the HTTP proxy serves.
+    pub fn has_http_credentials(&self) -> bool {
+        self.credentials
+            .iter()
+            .any(|spec| crate::minters::http::KINDS.contains(&spec.kind.as_str()))
+    }
+
+    /// Whether the subprocess should be pointed at the HTTP proxy.
+    pub fn wants_proxy(&self) -> bool {
+        self.proxy == ProxyMode::Always || self.has_http_credentials()
+    }
+
     /// Check every invariant the type system does not already enforce and
     /// that does not need the minter registry.
     fn validate_schema(&self) -> Result<()> {
@@ -401,6 +461,11 @@ impl Profile {
             }
         }
 
+        // Compiled here rather than at the first request: a Cedar typo has to
+        // be an error next to the file that has it, not a request the proxy
+        // silently denies once the profile is already in production.
+        self.compiled_policy()?;
+
         for (key, value) in &self.env {
             for segment in parse_env_template(value)? {
                 if let EnvSegment::Minted { credential, .. } = segment {
@@ -439,6 +504,80 @@ mod tests {
         assert!(profile.credentials.is_empty());
         assert!(profile.exec.allow_argv0.is_empty());
         assert!(profile.env.is_empty());
+        assert_eq!(profile.policy, None);
+        assert_eq!(profile.policy_mode, crate::policy::PolicyMode::Enforce);
+        assert_eq!(profile.proxy, ProxyMode::Auto);
+        assert!(!profile.wants_proxy());
+    }
+
+    const OPENAI: &str = "\
+name: openai
+credentials:
+  - name: openai
+    kind: http-bearer
+";
+
+    #[test]
+    fn a_profile_with_an_http_credential_wants_the_proxy() {
+        let profile = Profile::from_yaml_str(OPENAI).unwrap();
+        assert!(profile.has_http_credentials());
+        assert!(profile.wants_proxy());
+    }
+
+    #[test]
+    fn a_profile_without_one_wants_the_proxy_only_if_it_asks() {
+        let profile = Profile::from_yaml_str(MINIMAL).unwrap();
+        assert!(!profile.wants_proxy());
+        let always = Profile::from_yaml_str("name: dev\nproxy: always\n").unwrap();
+        assert_eq!(always.proxy, ProxyMode::Always);
+        assert!(always.wants_proxy(), "`proxy: always` means always");
+        assert!(!always.has_http_credentials());
+    }
+
+    #[test]
+    fn a_policy_is_compiled_when_the_profile_is_parsed() {
+        let yaml = format!(
+            "{OPENAI}policy: |\n  permit(principal, action in [Action::\"http\"], resource)\n  when {{ resource.host == \"api.openai.com\" }};\npolicy_mode: observe\n"
+        );
+        let profile = Profile::from_yaml_str(&yaml).unwrap();
+        assert_eq!(profile.policy_mode, crate::policy::PolicyMode::Observe);
+        assert!(profile.compiled_policy().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_policy_that_does_not_compile_fails_the_profile_rather_than_the_request() {
+        let yaml = format!("{OPENAI}policy: |\n  permit(principal\n");
+        let err = Profile::from_yaml_str(&yaml).unwrap_err();
+        assert!(err.to_string().contains("not valid Cedar"), "{err}");
+    }
+
+    #[test]
+    fn a_policy_naming_something_the_schema_lacks_fails_the_profile() {
+        let yaml = format!(
+            "{OPENAI}policy: |\n  permit(principal, action in [Action::\"http\"], resource)\n  when {{ resource.querystring == \"x\" }};\n"
+        );
+        let err = Profile::from_yaml_str(&yaml).unwrap_err();
+        assert!(err.to_string().contains("Cedar schema"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_policy_mode_is_rejected() {
+        assert!(Profile::from_yaml_str("name: dev\npolicy_mode: maybe\n").is_err());
+        assert!(Profile::from_yaml_str("name: dev\nproxy: sometimes\n").is_err());
+    }
+
+    #[test]
+    fn an_http_header_credential_must_name_its_header() {
+        let yaml = "name: dev\ncredentials:\n  - name: k\n    kind: http-header\n";
+        let profile = Profile::from_yaml_str(yaml).unwrap();
+        let err = profile.validate(&registry()).unwrap_err();
+        assert!(matches!(err, Error::MinterConfig { .. }), "{err}");
+
+        let good = "name: dev\ncredentials:\n  - name: k\n    kind: http-header\n    config:\n      name: X-Api-Key\n";
+        Profile::from_yaml_str(good)
+            .unwrap()
+            .validate(&registry())
+            .unwrap();
     }
 
     #[test]

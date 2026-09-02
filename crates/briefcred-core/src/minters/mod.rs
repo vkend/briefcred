@@ -7,12 +7,15 @@
 //! [`postgres`] runs in a helper process, which is where a minter that opens a
 //! network connection with a master credential belongs. [`ssh_cert`] runs
 //! inside the daemon, because it talks to nothing; its module documentation
-//! says what that costs.
+//! says what that costs. [`http`] runs nowhere at all: its credentials are
+//! served by the daemon's HTTP proxy, and it registers only their schema.
 
 pub mod aws_sts;
+pub mod http;
 pub mod postgres;
 pub mod ssh_cert;
 
 pub use aws_sts::AwsStsConfig;
+pub use http::HttpKind;
 pub use postgres::PostgresDynamicMinter;
 pub use ssh_cert::SshCertMinter;

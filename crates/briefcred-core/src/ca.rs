@@ -178,13 +178,59 @@ pub struct CaInfo {
     pub fingerprint_sha256: String,
 }
 
+/// How many issued leaves are kept before the least recently used is dropped.
+///
+/// The cache exists so a burst of requests to one host pays one key generation
+/// rather than one per connection. It is bounded because the key is the
+/// hostname list and the hostnames come from whatever the subprocess connects
+/// to: an agent that walks a wildcard domain would otherwise grow the map, and
+/// every entry holds a private key.
+pub const LEAF_CACHE_CAPACITY: usize = 256;
+
+/// A bounded, least-recently-used cache of issued leaves.
+///
+/// Keyed on the whole hostname list rather than on a joined string: joining
+/// with a separator makes `["a,b"]` and `["a", "b"]` the same key, which would
+/// hand out a certificate for one host to a connection asking for another.
+///
+/// A `VecDeque` scanned linearly rather than a map plus a recency list: at
+/// [`LEAF_CACHE_CAPACITY`] entries the scan is far cheaper than the key
+/// generation it avoids, and a cache that is obviously correct beats one that
+/// is fast in a way nothing measures.
+#[derive(Debug, Default)]
+struct LeafCache {
+    /// Least recently used first, most recently used last.
+    entries: std::collections::VecDeque<(Vec<String>, Leaf)>,
+}
+
+impl LeafCache {
+    /// The cached leaf for `hostnames`, marking it as most recently used.
+    fn get(&mut self, hostnames: &[String]) -> Option<&Leaf> {
+        let index = self.entries.iter().position(|(key, _)| key == hostnames)?;
+        let entry = self.entries.remove(index)?;
+        self.entries.push_back(entry);
+        self.entries.back().map(|(_, leaf)| leaf)
+    }
+
+    /// Store `leaf` for `hostnames`, evicting the least recently used if full.
+    fn insert(&mut self, hostnames: Vec<String>, leaf: Leaf) {
+        if let Some(index) = self.entries.iter().position(|(key, _)| *key == hostnames) {
+            self.entries.remove(index);
+        }
+        self.entries.push_back((hostnames, leaf));
+        while self.entries.len() > LEAF_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+}
+
 /// The root CA: its certificate, its signing key, and its leaf cache.
 pub struct CertificateAuthority {
     cert_pem: String,
     cert_der: CertificateDer<'static>,
     issuer: Issuer<'static, KeyPair>,
     key_pem: Zeroizing<String>,
-    leaves: Mutex<BTreeMap<String, Leaf>>,
+    leaves: Mutex<LeafCache>,
 }
 
 impl fmt::Debug for CertificateAuthority {
@@ -232,7 +278,7 @@ impl CertificateAuthority {
             cert_der,
             issuer: Issuer::new(params, key_pair),
             key_pem,
-            leaves: Mutex::new(BTreeMap::new()),
+            leaves: Mutex::new(LeafCache::default()),
         })
     }
 
@@ -249,7 +295,7 @@ impl CertificateAuthority {
             cert_der,
             issuer,
             key_pem: key_pem.clone(),
-            leaves: Mutex::new(BTreeMap::new()),
+            leaves: Mutex::new(LeafCache::default()),
         })
     }
 
@@ -357,7 +403,6 @@ impl CertificateAuthority {
                 "a leaf needs at least one hostname to be valid for".to_string(),
             ));
         }
-        let key = hostnames.join(",");
         let now = seconds_precision(OffsetDateTime::now_utc());
 
         let mut cache = self
@@ -366,7 +411,7 @@ impl CertificateAuthority {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Reissue a little before expiry rather than at it, so a leaf handed
         // out now is still valid when the handshake it is for happens.
-        if let Some(leaf) = cache.get(&key) {
+        if let Some(leaf) = cache.get(hostnames) {
             if leaf.expires_at > now + TimeDuration::minutes(5) {
                 return Ok(leaf.clone());
             }
@@ -401,7 +446,7 @@ impl CertificateAuthority {
             hostnames: hostnames.to_vec(),
             expires_at: params.not_after,
         };
-        cache.insert(key, leaf.clone());
+        cache.insert(hostnames.to_vec(), leaf.clone());
         Ok(leaf)
     }
 
@@ -659,6 +704,60 @@ mod tests {
         let first = ca.issue_leaf(&["a.test".to_string()]).unwrap();
         let second = ca.issue_leaf(&["b.test".to_string()]).unwrap();
         assert_ne!(first.cert_pem(), second.cert_pem());
+    }
+
+    #[test]
+    fn one_hostname_list_is_never_confused_with_another_that_joins_the_same() {
+        let ca = CertificateAuthority::generate("mac.local").unwrap();
+        let joined = ca.issue_leaf(&["a.test,b.test".to_string()]).unwrap();
+        let split = ca
+            .issue_leaf(&["a.test".to_string(), "b.test".to_string()])
+            .unwrap();
+        assert_ne!(
+            joined.cert_pem(),
+            split.cert_pem(),
+            "a comma in a hostname must not collide with a two-hostname list"
+        );
+    }
+
+    #[test]
+    fn the_leaf_cache_stops_growing_at_its_capacity() {
+        let ca = CertificateAuthority::generate("mac.local").unwrap();
+        for i in 0..LEAF_CACHE_CAPACITY + 10 {
+            ca.issue_leaf(&[format!("host{i}.test")]).unwrap();
+        }
+        let cached = ca
+            .leaves
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .len();
+        assert_eq!(cached, LEAF_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn the_least_recently_used_leaf_is_the_one_evicted() {
+        let ca = CertificateAuthority::generate("mac.local").unwrap();
+        let first = ca.issue_leaf(&["first.test".to_string()]).unwrap();
+        for i in 0..LEAF_CACHE_CAPACITY - 1 {
+            ca.issue_leaf(&[format!("host{i}.test")]).unwrap();
+        }
+        // Touching it again makes it the most recent, so the next insert
+        // evicts something else and this one survives.
+        assert_eq!(
+            ca.issue_leaf(&["first.test".to_string()])
+                .unwrap()
+                .cert_pem(),
+            first.cert_pem()
+        );
+        ca.issue_leaf(&["last.test".to_string()]).unwrap();
+        assert_eq!(
+            ca.issue_leaf(&["first.test".to_string()])
+                .unwrap()
+                .cert_pem(),
+            first.cert_pem(),
+            "a recently used leaf must not be the one evicted"
+        );
     }
 
     #[test]

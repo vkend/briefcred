@@ -17,6 +17,7 @@ test-util = []
 briefcred-proto.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+cedar-policy.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 inventory.workspace = true

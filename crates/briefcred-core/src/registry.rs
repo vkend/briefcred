@@ -35,6 +35,16 @@ pub enum Hosting {
     /// it signs a certificate and writes two files, and a helper would buy
     /// nothing but the cost of a process.
     Daemon,
+    /// The daemon's HTTP proxy issues and retires this credential itself.
+    ///
+    /// Not a minter at all. An `http-*` credential's "mint" is signing a
+    /// synthetic token that names a session, and its "revoke" is the daemon
+    /// refusing that token from then on. Both need the proxy's signing key and
+    /// the session the request arrived on, neither of which exists behind the
+    /// [`crate::Minter`] contract — so these kinds register their *schema*
+    /// here, so a profile that names one is validated at load, and leave
+    /// [`MinterFactory::construct`] `None`.
+    Proxy,
 }
 
 /// One registered minter kind and the function that builds it.
@@ -113,10 +123,29 @@ impl Registry {
         (self.factory(kind)?.validate)(config)
     }
 
+    /// Whether `kind` is served by the daemon's HTTP proxy rather than a minter.
+    ///
+    /// The one question the mint and revoke paths ask before they reach for a
+    /// helper: a [`Hosting::Proxy`] kind has no minter to run and no process to
+    /// start, so trying either would fail with a message about a missing helper
+    /// binary that does not and should not exist.
+    pub fn is_proxy(&self, kind: &str) -> bool {
+        self.hosting(kind) == Some(Hosting::Proxy)
+    }
+
     /// Build the minter for `kind` from `config`, after validating it.
     pub fn build(&self, kind: &str, config: &serde_yaml::Value) -> Result<Arc<dyn Minter>> {
         let factory = self.factory(kind)?;
         (factory.validate)(config)?;
+        if factory.hosting == Hosting::Proxy {
+            return Err(Error::MinterConfig {
+                kind: factory.kind,
+                message: format!(
+                    "`{kind}` is served by the daemon's HTTP proxy, which signs its token \
+                     directly; there is no minter to build"
+                ),
+            });
+        }
         let construct = factory.construct.ok_or_else(|| Error::MinterConfig {
             kind: factory.kind,
             message: format!(

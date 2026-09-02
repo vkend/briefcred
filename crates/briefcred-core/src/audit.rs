@@ -118,6 +118,37 @@ pub enum AuditEntry {
         /// How long the call took.
         duration_ms: u64,
     },
+    /// One HTTP request crossed the proxy.
+    ///
+    /// Metadata only, and the omissions are the point. There are no headers
+    /// here, because one of them is the credential; no body, because a body is
+    /// whatever the agent decided to send; and **no query string**, because a
+    /// query string routinely carries an API key and would turn the audit log
+    /// into the secret store this row exists to make unnecessary.
+    ProxyRequest {
+        /// When the response finished.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The synthetic token's mint, tying the request to its `Mint` row.
+        mint_id: MintId,
+        /// The HTTP method, uppercase.
+        method: String,
+        /// The upstream host, without the port.
+        host: String,
+        /// The request path, with any query string already stripped.
+        path: String,
+        /// The upstream's status code, absent when the request never reached it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        /// Bytes of request body forwarded upstream.
+        req_bytes: u64,
+        /// Bytes of response body forwarded back.
+        resp_bytes: u64,
+        /// How long the whole exchange took.
+        latency_ms: u64,
+        /// One of `allow`, `deny`, or `would_deny`.
+        decision: String,
+    },
     /// A revoke attempt finished.
     Revoke {
         /// When it happened.
@@ -263,9 +294,9 @@ impl AuditEntry {
     /// principal, so they are about none.
     pub fn mint_ids(&self) -> &[MintId] {
         match self {
-            AuditEntry::Mint { mint_id, .. } | AuditEntry::Revoke { mint_id, .. } => {
-                std::slice::from_ref(mint_id)
-            }
+            AuditEntry::Mint { mint_id, .. }
+            | AuditEntry::Revoke { mint_id, .. }
+            | AuditEntry::ProxyRequest { mint_id, .. } => std::slice::from_ref(mint_id),
             AuditEntry::ExecStart { mint_ids, .. }
             | AuditEntry::ExecEnd { mint_ids, .. }
             | AuditEntry::McpCall { mint_ids, .. } => mint_ids,

@@ -30,6 +30,15 @@ pub const KEYCHAIN_SERVICE: &str = "dev.briefcred.ca";
 /// [`KEYCHAIN_SERVICE`].
 pub const CA_KEY_ITEM: &str = "ca";
 
+/// The item the proxy's synthetic-token signing key is stored under.
+///
+/// Per machine, not per session: a token has to stay verifiable for its whole
+/// lifetime, and a key that changed with every daemon restart would invalidate
+/// every token in flight. It is an Ed25519 private key, hex-encoded, and it
+/// never leaves the daemon — the proxy is the only thing that signs with it and
+/// the only thing that verifies against it.
+pub const TOKEN_SIGNER_ITEM: &str = "token-signer";
+
 /// `errSecItemNotFound`: the keychain has no such item.
 #[cfg(target_os = "macos")]
 const ITEM_NOT_FOUND: i32 = -25300;
