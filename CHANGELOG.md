@@ -16,6 +16,10 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Fixed
 
+- **Concurrent HTTP/2 requests to one upstream share one connection again.**
+  The cache's sweep removed a slot that one request had just been handed but
+  not yet locked, so a second request for the same host got a fresh slot and
+  dialled a second connection beside the first.
 - **The daemon no longer reloads its profiles in a loop on Linux.** inotify
   reports a file being opened and read, a reload reads every profile, and the
   watcher counted those reads as changes, so each reload scheduled the next

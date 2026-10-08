@@ -263,10 +263,16 @@ impl Upstreams {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Entries whose connection has closed and which nobody is dialling go
-        // now. A slot that is locked is a dial in flight and is left alone.
-        slots.retain(|_, slot| match slot.try_lock() {
-            Ok(held) => held.as_ref().is_some_and(|sender| !sender.is_closed()),
-            Err(_) => true,
+        // now. A slot anyone else still holds is left alone: that is a dial in
+        // flight, or a request that has just been handed the slot and not yet
+        // locked it. Judging that second case by the lock alone would sweep the
+        // slot from under it, and the next request for the same key would get
+        // a fresh one and dial a second connection beside the first.
+        slots.retain(|_, slot| {
+            Arc::strong_count(slot) > 1
+                || slot
+                    .try_lock()
+                    .is_ok_and(|held| held.as_ref().is_some_and(|sender| !sender.is_closed()))
         });
         Arc::clone(
             slots
@@ -428,6 +434,19 @@ mod tests {
 
         upstreams.close_session("s2");
         assert_eq!(upstreams.len(), 0);
+    }
+
+    #[test]
+    fn a_slot_handed_out_but_not_yet_locked_is_the_one_the_next_request_gets() {
+        let upstreams = Upstreams::default();
+        let first = upstreams.slot(key("s1", "openai"));
+        // `first` is empty and unlocked, exactly as it is between a request
+        // being handed it and that request's dial taking the lock.
+        let second = upstreams.slot(key("s1", "openai"));
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two requests for one key must wait on one slot, or each dials"
+        );
     }
 
     #[test]
