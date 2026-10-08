@@ -14,6 +14,17 @@ All notable changes to briefcred are recorded here. The format follows
   The handshake transcript was still authenticated, so this did not let a
   network attacker alter or complete a handshake.
 
+### Added
+
+- **A `proxy_token_rejected` audit row** whenever the HTTP proxy refuses a
+  token: missing, malformed, badly signed, expired, revoked, for a session
+  that is gone, or with a failing DPoP proof. Until now these were only
+  counted in metrics, so a stolen token replayed through the proxy left no
+  trace in the audit log. The row carries the method, host, path and reason,
+  never the token. (The Postgres proxy's refusals are still logged only.)
+- **`briefcred audit` renders proxy rows as lines** instead of raw JSON:
+  `proxy_request`, `proxy_token_rejected` and `proxy_h2_connection`.
+
 ### Fixed
 
 - **Concurrent HTTP/2 requests to one upstream share one connection again.**

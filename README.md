@@ -1038,6 +1038,10 @@ briefcred's proxy on this machine.
    `briefcred exec` set the CA-bundle variables (see **Trust environment**).
 3. The proxy reads the inner HTTP/1.1 request and finds the synthetic token.
    It checks the signature, the expiry, and whether the grant has been revoked.
+   A token that fails any of these is refused with a `proxy_token_rejected`
+   audit row naming the method, host, path and reason (`revoked`, `expired`,
+   `bad_signature` and so on), so a replayed or stolen token leaves a trace.
+   The row never holds the token.
 4. It takes one token off the session's quota bucket, if the profile set one.
    Before the policy, so a denied request is still counted.
 5. It asks the profile's Cedar policy whether this session may make this
