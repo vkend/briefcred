@@ -15,8 +15,8 @@
 # those two lines and leaves every other byte alone.
 class Briefcred < Formula
   desc "Local credential broker for AI agents and developer tooling"
-  homepage "https://github.com/briefcred/briefcred"
-  url "https://github.com/briefcred/briefcred/releases/download/v0.1.0/briefcred-0.1.0-macos-universal.tar.gz"
+  homepage "https://github.com/vkend/briefcred"
+  url "https://github.com/vkend/briefcred/releases/download/v0.1.0/briefcred-0.1.0-macos-universal.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license any_of: ["MIT", "Apache-2.0"]
   version "0.1.0"

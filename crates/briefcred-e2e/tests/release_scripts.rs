@@ -96,7 +96,7 @@ fn stamping_rewrites_the_url_and_the_checksum_and_leaves_everything_else_alone()
     );
     assert_eq!(
         differing[0].2.trim(),
-        "url \"https://github.com/briefcred/briefcred/releases/download/\
+        "url \"https://github.com/vkend/briefcred/releases/download/\
          v9.9.9/briefcred-9.9.9-macos-universal.tar.gz\""
     );
 

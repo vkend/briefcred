@@ -57,7 +57,7 @@ fn the_systemd_unit_is_exactly_this() {
     let expected = "\
 [Unit]
 Description=briefcred credential broker
-Documentation=https://github.com/briefcred/briefcred
+Documentation=https://github.com/vkend/briefcred
 After=default.target
 
 [Service]
@@ -122,7 +122,7 @@ fn the_systemd_socket_unit_is_exactly_this() {
     let expected = "\
 [Unit]
 Description=briefcred credential broker sockets
-Documentation=https://github.com/briefcred/briefcred
+Documentation=https://github.com/vkend/briefcred
 
 [Socket]
 ListenStream=/tmp/bc/sock

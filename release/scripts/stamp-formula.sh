@@ -21,7 +21,7 @@ TARBALL="${2:?usage: stamp-formula.sh <version> <tarball> <formula-in> <formula-
 IN="${3:?usage: stamp-formula.sh <version> <tarball> <formula-in> <formula-out>}"
 OUT="${4:?usage: stamp-formula.sh <version> <tarball> <formula-in> <formula-out>}"
 
-REPO="${BRIEFCRED_REPO:-briefcred/briefcred}"
+REPO="${BRIEFCRED_REPO:-vkend/briefcred}"
 
 if [[ ! -f "$TARBALL" ]]; then
   echo "stamp-formula: no tarball at $TARBALL" >&2

@@ -185,7 +185,7 @@ pub fn systemd_unit(spec: &ServiceSpec) -> String {
         "\
 [Unit]
 Description=briefcred credential broker
-Documentation=https://github.com/briefcred/briefcred
+Documentation=https://github.com/vkend/briefcred
 After=default.target
 
 [Service]
@@ -224,7 +224,7 @@ pub fn systemd_socket_unit(spec: &ServiceSpec) -> String {
         "\
 [Unit]
 Description=briefcred credential broker sockets
-Documentation=https://github.com/briefcred/briefcred
+Documentation=https://github.com/vkend/briefcred
 
 [Socket]
 ListenStream={sock}
