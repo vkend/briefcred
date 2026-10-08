@@ -869,7 +869,7 @@ credentials:
         let profile = one_credential("postgres-proxy", PG_CONFIG);
         let (_summary, values, _pending) =
             mint_proxy_credential(&profile, Some("127.0.0.1:9319")).unwrap();
-        let userinfo = format!("{}:{}", &*values["PGUSER"], &*values["PGPASSWORD"]);
+        let userinfo = format!("{}:{}", *values["PGUSER"], *values["PGPASSWORD"]);
         assert!(
             userinfo
                 .bytes()

@@ -409,7 +409,7 @@ mod tests {
     fn the_token_has_the_documented_three_part_shape() {
         let token = signer().sign(&claims("s1", "openai", 0));
         let parts: Vec<&str> = token.split('.').collect();
-        assert_eq!(parts.len(), 3, "{}", &*token);
+        assert_eq!(parts.len(), 3, "{}", *token);
         assert_eq!(parts[0], "bc");
         // Base64url, no padding, in both tail parts.
         for part in &parts[1..] {
