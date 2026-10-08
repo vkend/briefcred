@@ -201,8 +201,9 @@ fn read_certificates_section(body: &[u8], serials: &mut BTreeSet<u64>) -> Result
                 "a serial list is not a whole number of 8-byte serials",
             ));
         }
-        for chunk in subsection.chunks_exact(8) {
-            serials.insert(u64::from_be_bytes(chunk.try_into().expect("8 bytes")));
+        let (chunks, _) = subsection.as_chunks::<8>();
+        for chunk in chunks {
+            serials.insert(u64::from_be_bytes(*chunk));
         }
     }
     Ok(())
