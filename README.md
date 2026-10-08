@@ -5,6 +5,41 @@ It hands subprocesses short-lived, narrowly scoped credentials, swaps
 placeholder keys for real ones at a local proxy, and records every mint,
 request, and revoke in an append-only audit log.
 
+## Why
+
+An agent that can run commands can read its own environment, and an API key
+in an environment variable is a key the agent can send anywhere. briefcred
+keeps the real credential in a daemon on your machine and gives the agent
+something that is only useful on your terms:
+
+- **A placeholder, not the key.** The agent's `OPENAI_API_KEY` is a token that
+  only briefcred's local proxy accepts. The proxy swaps in the real key on the
+  way out, and only for requests the profile's Cedar policy allows.
+- **Credentials that end.** Postgres roles, AWS STS sessions and SSH
+  certificates are minted for one session and revoked when it closes. Where a
+  backend cannot withdraw a credential at once, its lifetime is short and
+  [`THREAT_MODEL.md`](THREAT_MODEL.md) says how short.
+- **A fingerprint, and a record.** A profile can require Touch ID before
+  anything is minted, and every mint, request, denial and revoke is a row in an
+  append-only audit log.
+
+## Quick start
+
+macOS, from source (there is no packaged release yet):
+
+```sh
+for crate in cli daemon hook helper-postgres helper-sts; do
+    cargo install --locked --path crates/briefcred-$crate
+done
+briefcred install --trust-ca          # start the daemon, trust its local CA
+briefcred profile bootstrap           # e.g. an "openai" profile for an API key; the key goes in the keychain
+briefcred exec --profile=openai -- python agent.py
+```
+
+[Install and run](#install-and-run) has the details, and
+[`examples/profiles/`](examples/profiles/) has ready-made profiles for OpenAI,
+Anthropic, GitHub, Stripe, a Postgres warehouse and an SSH bastion.
+
 See `ROADMAP.md` for the plan, `ARCHITECTURE.md` for the shape, and
 `THREAT_MODEL.md` for what is and is not guaranteed.
 
