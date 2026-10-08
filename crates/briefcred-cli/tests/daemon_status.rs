@@ -115,8 +115,9 @@ fn status_against_a_running_daemon_reports_its_health() {
     );
 }
 
-#[test]
-fn install_dry_run_touches_nothing_and_names_the_launch_agent() {
+/// Run `briefcred install --dry-run` against a home that does not exist yet,
+/// check it printed a plan and created nothing, and return the plan.
+fn dry_run_install() -> String {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let output = Command::new(env!("CARGO_BIN_EXE_briefcred"))
@@ -126,13 +127,35 @@ fn install_dry_run_touches_nothing_and_names_the_launch_agent() {
         .unwrap();
 
     assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(stdout.starts_with("dry run: briefcred install"), "{stdout}");
-    assert!(stdout.contains("dev.briefcred.daemon.plist"), "{stdout}");
-    assert!(stdout.contains("launchctl bootstrap"), "{stdout}");
     assert!(
         !home.exists(),
         "a dry run must not create {}",
         home.display()
+    );
+    stdout
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn install_dry_run_touches_nothing_and_names_the_launch_agent() {
+    let stdout = dry_run_install();
+    assert!(stdout.contains("dev.briefcred.daemon.plist"), "{stdout}");
+    assert!(stdout.contains("launchctl bootstrap"), "{stdout}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn install_dry_run_touches_nothing_and_names_the_systemd_units() {
+    let stdout = dry_run_install();
+    assert!(
+        stdout.contains("systemd/user/briefcred.service"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("systemd/user/briefcred.socket"), "{stdout}");
+    assert!(
+        stdout.contains("systemctl --user enable --now briefcred.service"),
+        "{stdout}"
     );
 }
