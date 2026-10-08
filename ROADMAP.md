@@ -15,20 +15,22 @@ omitted — sequencing is the load-bearing part.
 - **Local, biometric-gated broker that mints dynamic credentials *and*
   enforces Cedar policy.** Placeholder-key swap over `HTTPS_PROXY` is
   table stakes, not the product.
-- Landscape (reviewed 2026-09-01):
-  - Local placeholder-swap proxies are commoditised (Infisical Agent Proxy,
-    OneCLI, Authsome, AgentSecrets). None mint dynamic DB roles or STS
-    sessions, none ship biometric unlock.
-  - OpenFirma enforces Cedar locally but delegates minting to Vault/STS.
-    The differentiator is minting + policy in one local daemon, not Cedar
+- Landscape, as reviewed on 2026-09-01. Products move quickly, so check each
+  one's current documentation before relying on this:
+  - Local placeholder-swap proxies already exist (Infisical Agent Proxy,
+    OneCLI, Authsome, AgentSecrets, among others). In that review we did not
+    find dynamic DB-role or STS minting, or a biometric unlock, in them; those
+    are where briefcred puts its effort.
+  - OpenFirma enforces Cedar locally and delegates minting to Vault or STS.
+    briefcred's choice is minting and policy in one local daemon, not Cedar
     alone.
-  - Hosted brokers now use the same language: 1Password Credential Broker,
-    HashiCorp Vault MCP 2.0, Teleport, StrongDM. No local/OSS equivalent
-    for DB connection-auth injection.
-  - Anthropic Managed Agents and OpenAI Sandbox Agents ship first-party
-    proxy-outside-sandbox credential injection. briefcred's wedge is
-    local, non-hosted workloads and dynamic DB/STS credentials, not
-    "the agent never sees the key" in isolation.
+  - Hosted brokers cover related ground as services (1Password Credential
+    Broker, HashiCorp Vault MCP, Teleport, StrongDM). briefcred is local and
+    open source, and includes DB connection-auth injection.
+  - Anthropic Managed Agents and OpenAI Sandbox Agents inject credentials from
+    outside the sandbox for agents they host. briefcred is for local,
+    non-hosted workloads and dynamic DB/STS credentials, not only "the agent
+    never sees the key".
 - Two halves, hybrid by backend:
   - **Identity broker** — mints real short-lived credentials (Postgres
     roles, AWS STS sessions, SSH certs) and revokes them after use.
