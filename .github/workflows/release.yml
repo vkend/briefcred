@@ -29,9 +29,9 @@ jobs:
       # what this one built to gain nothing.
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
@@ -113,7 +113,7 @@ jobs:
 
       # Uploaded whether or not a release is created, so a dispatch run leaves
       # something to download and a tag run leaves the same bytes twice.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: briefcred-${{ steps.version.outputs.version }}-macos-universal
           path: dist/
