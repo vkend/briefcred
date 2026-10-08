@@ -166,6 +166,29 @@ pub enum AuditEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         connection_id: Option<String>,
     },
+    /// The HTTP proxy refused a request because its token did not authorise.
+    ///
+    /// A [`AuditEntry::ProxyRequest`] row names the grant it was made under, and
+    /// a token that failed to verify names nothing trustworthy, so a refusal at
+    /// this stage gets this row instead. Without it, a stolen or replayed token
+    /// tried against the proxy would leave no trace in the log at all.
+    ///
+    /// Metadata only, on the same terms as every other proxy row: never the
+    /// token, never a header, and no query string.
+    ProxyTokenRejected {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The HTTP method, uppercase.
+        method: String,
+        /// The upstream host the request was for, without the port.
+        host: String,
+        /// The request path, with any query string already stripped.
+        path: String,
+        /// Why: `missing`, `malformed`, `bad_signature`, `expired`,
+        /// `not_yet_valid`, `revoked`, `no_session`, or `dpop`.
+        reason: String,
+    },
     /// One HTTP/2 connection from a wrapped subprocess closed.
     ///
     /// Written in addition to the [`AuditEntry::ProxyRequest`] row each of its
@@ -485,7 +508,8 @@ impl AuditEntry {
     /// A `Mint` or a `Revoke` is about exactly one. An `ExecStart`, an
     /// `ExecEnd`, or an `McpCall` is about however many that run carried. Daemon-lifecycle,
     /// session, and authentication rows describe the daemon rather than a
-    /// principal, so they are about none.
+    /// principal, so they are about none, and so does a refused proxy token,
+    /// which names nothing that could be trusted.
     pub fn mint_ids(&self) -> &[MintId] {
         match self {
             AuditEntry::Mint { mint_id, .. }
@@ -501,6 +525,7 @@ impl AuditEntry {
             | AuditEntry::DaemonStop { .. }
             | AuditEntry::DaemonHandoff { .. }
             | AuditEntry::AuthReject { .. }
+            | AuditEntry::ProxyTokenRejected { .. }
             | AuditEntry::ProfileLoadError { .. }
             | AuditEntry::ProfileTrustWarning { .. }
             | AuditEntry::Reconcile { .. }

@@ -1137,6 +1137,26 @@ async fn a_revoked_token_stops_working_at_once() {
     })
     .await;
     assert!(refused, "a revoked grant must stop being served");
+
+    // And the replay is on the record, without the token in it.
+    let audited = briefcred_e2e::daemon_harness::wait_until(Duration::from_secs(10), || async {
+        fixture.daemon.audit_rows().iter().any(|row| {
+            row["event"] == "proxy_token_rejected"
+                && row["reason"] == "revoked"
+                && row["path"] == "/v1/models"
+        })
+    })
+    .await;
+    assert!(
+        audited,
+        "a refused token must leave a row:\n{:#?}",
+        fixture.daemon.audit_rows()
+    );
+    let log = serde_json::to_string(&fixture.daemon.audit_rows()).unwrap();
+    assert!(
+        !log.contains(fixture.token.as_str()),
+        "the audit log must never hold the token itself"
+    );
 }
 
 #[tokio::test]

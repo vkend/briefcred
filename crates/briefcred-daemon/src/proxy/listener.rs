@@ -486,30 +486,23 @@ async fn forward(
     // 1. Which session and credential is this?
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let Some(presented) = find_token(request.headers()) else {
-        return attempt.refuse(
-            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-            None,
-            DECISION_DENY,
-        );
+        return attempt.refuse_token(StatusCode::PROXY_AUTHENTICATION_REQUIRED, "missing");
     };
     let claims = match proxy.issuer.authorize(&presented, now) {
         Ok(claims) => claims,
         Err(err) => {
             eprintln!("briefcred-daemon: proxy refused a token for `{host}`: {err}");
-            return attempt.refuse(
-                match err {
-                    TokenError::Revoked => StatusCode::FORBIDDEN,
-                    _ => StatusCode::UNAUTHORIZED,
-                },
-                None,
-                DECISION_DENY,
-            );
+            let code = match err {
+                TokenError::Revoked => StatusCode::FORBIDDEN,
+                _ => StatusCode::UNAUTHORIZED,
+            };
+            return attempt.refuse_token(code, token_rejection(&err));
         }
     };
 
     // 2. The session it names, and everything it holds.
     let Some(session) = resolve_session(&proxy, &claims.sid, &claims.cred).await else {
-        return attempt.refuse(StatusCode::UNAUTHORIZED, None, DECISION_DENY);
+        return attempt.refuse_token(StatusCode::UNAUTHORIZED, "no_session");
     };
     // The connection is named by the first grant a stream of it resolved, and
     // this is the only place one is resolved.
@@ -532,7 +525,7 @@ async fn forward(
         };
         if let Err(err) = outcome {
             eprintln!("briefcred-daemon: proxy refused a DPoP proof for `{host}`: {err}");
-            return attempt.refuse(StatusCode::UNAUTHORIZED, None, DECISION_DENY);
+            return attempt.refuse_token(StatusCode::UNAUTHORIZED, "dpop");
         }
     }
 
@@ -1435,10 +1428,31 @@ impl Attempt<'_> {
         status(code)
     }
 
+    /// Audit and count a request whose token did not authorise, then answer
+    /// with `code` and no body.
+    ///
+    /// Its own row rather than a [`AuditEntry::ProxyRequest`]: that row names
+    /// a grant, and a token that failed here names nothing trustworthy.
+    fn refuse_token(&self, code: StatusCode, reason: &str) -> Response<OutBody> {
+        self.proxy.state.audit(&AuditEntry::ProxyTokenRejected {
+            ts: OffsetDateTime::now_utc(),
+            method: self.method.to_string(),
+            host: self.host.to_string(),
+            path: self.path.to_string(),
+            reason: reason.to_string(),
+        });
+        self.proxy.state.metrics().record_proxy_request(
+            DECISION_DENY,
+            None,
+            self.started.elapsed(),
+        );
+        status(code)
+    }
+
     /// Audit and count a throttled request, then answer `429`.
     ///
-    /// Audited rather than merely counted, unlike the token failures above: the
-    /// session is known, so the row can name a `mint_id`, and "the quota
+    /// A request row rather than a token-rejection row: the session is known,
+    /// so the row can name a `mint_id`, and "the quota
     /// refused this" is exactly the row somebody reading the log to work out
     /// why an agent stalled needs to find.
     fn refuse_quota(&self, refusal: crate::quota::Refusal, mint_id: &MintId) -> Response<OutBody> {
@@ -1661,6 +1675,17 @@ fn empty() -> OutBody {
     Full::new(Bytes::new())
         .map_err(|never| match never {})
         .boxed()
+}
+
+/// The audit spelling of why a token did not authorise.
+fn token_rejection(err: &TokenError) -> &'static str {
+    match err {
+        TokenError::Malformed => "malformed",
+        TokenError::BadSignature => "bad_signature",
+        TokenError::Expired => "expired",
+        TokenError::NotYetValid => "not_yet_valid",
+        TokenError::Revoked => "revoked",
+    }
 }
 
 #[cfg(test)]
