@@ -19,7 +19,9 @@
 //! Its `pg_hba.conf` is `initdb`'s own — `host`, not `hostssl` — so the same
 //! cluster serves all three rows.
 
-use briefcred_e2e::daemon_harness::Daemon;
+use std::time::Duration;
+
+use briefcred_e2e::daemon_harness::{wait_until, Daemon};
 use briefcred_e2e::pg_harness::{cluster_or_skip_with_tls, PgCluster, MASTER_USER};
 use briefcred_proto::{Request, Response};
 
@@ -173,10 +175,16 @@ async fn verify_full_refuses_a_self_signed_certificate_and_says_why() {
     // The client is told only that the database could not be reached; the
     // reason is the daemon's, because it is about a master this client has
     // never held.
-    let log = fixture.daemon.log();
+    // The client can see its connection fail before the daemon's line about
+    // why reaches the log, so wait for it rather than read once.
+    let logged = wait_until(Duration::from_secs(5), || async {
+        fixture.daemon.log().contains("TLS handshake")
+    })
+    .await;
     assert!(
-        log.contains("TLS handshake"),
-        "the daemon's log must name the handshake failure:\n{log}"
+        logged,
+        "the daemon's log must name the handshake failure:\n{}",
+        fixture.daemon.log()
     );
 }
 
@@ -253,9 +261,13 @@ async fn require_refuses_a_server_that_will_not_speak_tls() {
         !output.status.success(),
         "a server that refuses TLS must not be fallen back to in plaintext"
     );
-    let log = daemon.log();
+    let logged = wait_until(Duration::from_secs(5), || async {
+        daemon.log().contains("refused TLS")
+    })
+    .await;
     assert!(
-        log.contains("refused TLS"),
-        "the daemon's log must say the server refused TLS:\n{log}"
+        logged,
+        "the daemon's log must say the server refused TLS:\n{}",
+        daemon.log()
     );
 }
