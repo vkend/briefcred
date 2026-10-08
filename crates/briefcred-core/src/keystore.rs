@@ -15,7 +15,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+#[cfg(target_os = "macos")]
+use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::paths::{ensure_private_dir, Paths, Platform};
