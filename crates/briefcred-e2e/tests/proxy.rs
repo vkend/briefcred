@@ -540,6 +540,7 @@ impl ProxyClient {
         let mut stream = TcpStream::connect(&self.proxy_addr)
             .await
             .map_err(|e| e.to_string())?;
+        stream.set_nodelay(true).map_err(|e| e.to_string())?;
         let authority = format!("{UPSTREAM_HOST}:{port}");
         stream
             .write_all(

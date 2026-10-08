@@ -122,6 +122,9 @@ pub async fn start(leaf: &briefcred_core::ca::Leaf) -> Server {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            // As the daemon does, so the direct side of a latency comparison
+            // is not the one paying Linux's delayed-ACK stall.
+            let _ = stream.set_nodelay(true);
             counted.fetch_add(1, Ordering::Relaxed);
             open_now.fetch_add(1, Ordering::Relaxed);
             let acceptor = acceptor.clone();
@@ -327,6 +330,7 @@ pub async fn direct(port: u16, ca_pem: &str) -> Transport {
     let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
+    stream.set_nodelay(true).unwrap();
     let name = rustls_pki_types::ServerName::try_from(UPSTREAM_HOST).unwrap();
     let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(name, stream)

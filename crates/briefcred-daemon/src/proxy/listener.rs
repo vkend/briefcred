@@ -272,6 +272,9 @@ pub async fn serve(
 
 /// Serve one client connection: a `CONNECT` tunnel, or plain absolute-URI HTTP.
 async fn serve_connection(stream: TcpStream, proxy: Arc<Proxy>) {
+    // HTTP/2 and TLS write in small frames. With Nagle on, Linux holds the
+    // second of two small writes until the peer's delayed ACK, about 40ms.
+    let _ = stream.set_nodelay(true);
     let service = service_fn(move |request: Request<Incoming>| {
         let proxy = Arc::clone(&proxy);
         async move {
@@ -1151,6 +1154,7 @@ async fn dial_upstream(
     let stream = TcpStream::connect((host, port))
         .await
         .map_err(|e| Error::Proxy(format!("cannot connect to `{host}:{port}`: {e}")))?;
+    let _ = stream.set_nodelay(true);
 
     if scheme != "https" {
         return Ok(Connected {
