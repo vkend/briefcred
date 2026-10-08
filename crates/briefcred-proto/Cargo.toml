@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [features]
 # Adds `Request::HeapScan` and `Response::HeapScanned`. Only the memory-hygiene
