@@ -745,6 +745,9 @@ async fn handle_unlock(request: Request, state: Arc<State>) -> Response {
 /// Factored out of [`handle_open_session`] so `Unlock` cannot drift away from
 /// it: two code paths that both decide "may this profile be used now" would be
 /// two chances to get the ordering wrong.
+// The refusal is a protocol `Response`, sent once and dropped; boxing it
+// would only add an allocation to the path that refuses.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn prove_presence(
     state: &Arc<State>,
     profile: &briefcred_core::Profile,
@@ -1165,6 +1168,9 @@ fn handoff_socket_is_ours(state: &Arc<State>, socket: &str) -> std::result::Resu
 /// is deliberately not consulted: a cached unlock was granted for one profile's
 /// own use, and moving every master in the daemon to another process is not
 /// that use.
+// The refusal is a protocol `Response`, sent once and dropped; boxing it
+// would only add an allocation to the path that refuses.
+#[allow(clippy::result_large_err)]
 async fn prove_handoff_presence(state: &Arc<State>) -> std::result::Result<(), Response> {
     use briefcred_core::profile::UnlockPolicy;
 

@@ -313,6 +313,9 @@ impl McpServer {
 }
 
 impl McpServer {
+    // A failure is built once per refused call and turned straight into a reply;
+    // boxing it would only add an allocation to that path.
+    #[allow(clippy::result_large_err)]
     async fn db_query_inner(&self, args: &DbQueryArgs) -> Result<serde_json::Value, ToolFailure> {
         let max_rows = args
             .max_rows
@@ -453,6 +456,9 @@ impl McpServer {
         }))
     }
 
+    // A failure is built once per refused call and turned straight into a reply;
+    // boxing it would only add an allocation to that path.
+    #[allow(clippy::result_large_err)]
     async fn exec_inner(&self, args: &ExecArgs) -> Result<serde_json::Value, ToolFailure> {
         let Some((argv0, rest)) = args.argv.split_first() else {
             return Err(invalid("`argv` must name a program to run").into());
