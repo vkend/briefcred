@@ -8,7 +8,10 @@ request, and revoke in an append-only audit log.
 See `ROADMAP.md` for the plan, `ARCHITECTURE.md` for the shape, and
 `THREAT_MODEL.md` for what is and is not guaranteed.
 
-**Status: every roadmap phase is implemented.** In one sentence each:
+**Status: alpha, unreleased.** Every roadmap phase is implemented and tested,
+but there is no tagged release yet, the configuration format and the CLI may
+still change before 1.0, and it has not had an outside security review. In one
+sentence each, what is implemented:
 
 - **Minting.** `postgres-dynamic` roles, `aws-sts` sessions and `ssh-cert`
   certificates, each minted for one session and revoked when it closes, behind
@@ -103,6 +106,19 @@ BRIEFCRED_PG_BIN=/usr/lib/postgresql/16/bin cargo test --workspace
 ```
 
 ## Install and run
+
+There is no packaged release yet, so install from source. All five binaries
+must land in the same directory, because `briefcred` finds the daemon beside
+itself and the daemon finds its helpers beside itself:
+
+```sh
+for crate in cli daemon hook helper-postgres helper-sts; do
+    cargo install --locked --path crates/briefcred-$crate
+done
+```
+
+A Homebrew formula is ready (see [Releases and packaging](#releases-and-packaging))
+and will be published with the first release.
 
 `briefcred install` provisions the directory layout, writes a starter
 `daemon.toml`, installs the service unit, and starts the daemon. It is
@@ -1402,6 +1418,10 @@ The workflow is the release; this is the order the human part goes in.
    asset and run `brew audit --strict --formula ./briefcred.rb` on a machine
    with a working Homebrew. Then copy it into the tap repository and commit;
    nothing automates that step, and deliberately so.
+
+## Security
+
+Report vulnerabilities privately, as described in [`SECURITY.md`](SECURITY.md).
 
 ## Licence
 
