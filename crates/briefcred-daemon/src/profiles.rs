@@ -215,6 +215,11 @@ fn spawn_watcher(
         // A watch error is reported once and otherwise ignored: it must not
         // stop the daemon, and the next successful event still reloads.
         match event {
+            // Only a change to the directory is a reason to reload. Linux
+            // reports opening and reading a file too, and a reload reads every
+            // profile, so counting those would have each reload schedule the
+            // next one for as long as the daemon runs.
+            Ok(event) if !changes_profiles(&event.kind) => {}
             Ok(_) => {
                 // `try_send` rather than `blocking_send`: this runs on the
                 // notify thread, and a full channel already means a reload is
@@ -226,6 +231,11 @@ fn spawn_watcher(
     })?;
     watcher.watch(dir, notify::RecursiveMode::Recursive)?;
     Ok(watcher)
+}
+
+/// Whether an event of this kind can change what a reload would load.
+fn changes_profiles(kind: &notify::EventKind) -> bool {
+    !matches!(kind, notify::EventKind::Access(_))
 }
 
 #[cfg(test)]
@@ -401,6 +411,55 @@ mod tests {
             store.get("alpha").await.is_some()
         })
         .await;
+
+        shutdown.send_replace(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[test]
+    fn reading_a_profile_is_not_a_change_to_one() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
+        use notify::EventKind;
+
+        assert!(!changes_profiles(&EventKind::Access(AccessKind::Open(
+            AccessMode::Read
+        ))));
+        assert!(!changes_profiles(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        // A write is reported as a modification too; its close adds nothing.
+        assert!(!changes_profiles(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(changes_profiles(&EventKind::Create(CreateKind::File)));
+        assert!(changes_profiles(&EventKind::Modify(ModifyKind::Any)));
+        assert!(changes_profiles(&EventKind::Remove(RemoveKind::File)));
+        assert!(changes_profiles(&EventKind::Any));
+    }
+
+    #[tokio::test]
+    async fn the_watcher_does_not_reload_on_its_own_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alpha.yaml"), "name: alpha\n").unwrap();
+        let store = store(dir.path());
+        store.reload().await;
+
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reloads);
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(watch(Arc::clone(&store), shutdown.subscribe(), move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // The watch reloads once when it starts, and macOS may still deliver
+        // the event for the file written above, so let those settle first.
+        // After that nothing touches the directory, and a count that keeps
+        // rising is a reload triggered by the previous reload's own reads.
+        tokio::time::sleep(DEBOUNCE * 4).await;
+        let settled = reloads.load(Ordering::SeqCst);
+        assert!(settled >= 1, "the watch reloads once when it starts");
+        tokio::time::sleep(DEBOUNCE * 8).await;
+        assert_eq!(reloads.load(Ordering::SeqCst), settled);
 
         shutdown.send_replace(true);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
