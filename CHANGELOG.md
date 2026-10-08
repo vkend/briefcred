@@ -16,6 +16,15 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Fixed
 
+- **The daemon no longer reloads its profiles in a loop on Linux.** inotify
+  reports a file being opened and read, a reload reads every profile, and the
+  watcher counted those reads as changes, so each reload scheduled the next
+  one every 250ms for as long as the daemon ran. Only a change to the
+  directory now triggers a reload.
+- **The HTTP proxy sets `TCP_NODELAY` on both of its connections,** as the
+  Postgres proxy already did. Without it, Linux held the second of two small
+  TLS or HTTP/2 writes until the peer's delayed ACK, adding about 40ms to a
+  request.
 - **`briefcred` refuses to run as root.** `install`, `uninstall`, `daemon
   start|stop|restart|upgrade`, `ca regenerate|untrust`, and `profile bootstrap`
   now exit 2 with a message explaining why if the effective uid is 0, rather
