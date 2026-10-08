@@ -6,6 +6,14 @@ All notable changes to briefcred are recorded here. The format follows
 
 ## Unreleased
 
+### Security
+
+- **rustls 0.23.45.** The lockfile moves off 0.23.43, which accepted TLS 1.3
+  handshake messages sent at the wrong encryption level
+  ([RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285)).
+  The handshake transcript was still authenticated, so this did not let a
+  network attacker alter or complete a handshake.
+
 ### Fixed
 
 - **`briefcred` refuses to run as root.** `install`, `uninstall`, `daemon
