@@ -88,3 +88,14 @@ opt-level = 3
 
 [profile.dev.package.cpufeatures]
 opt-level = 3
+
+# The proxy verifies an Ed25519 token on every request. Unoptimised, the
+# dalek crates' x86_64 AVX2 backend takes about 10ms a signature, which is
+# what a debug build (and so every test) would otherwise measure; release
+# builds were never affected. Apple silicon uses a different backend and
+# hides this. Optimising just these two keeps tests honest about latency.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
