@@ -159,6 +159,32 @@ pub fn render(row: &serde_json::Value) -> String {
             text(row, "policy"),
             text(row, "reason")
         ),
+        "proxy_request" => format!(
+            "{} {} {}{} {}{}",
+            text(row, "mint_id"),
+            text(row, "method"),
+            text(row, "host"),
+            text(row, "path"),
+            text(row, "decision"),
+            row.get("status")
+                .and_then(serde_json::Value::as_u64)
+                .map(|s| format!(" status={s}"))
+                .unwrap_or_default()
+        ),
+        "proxy_token_rejected" => format!(
+            "{} {}{} reason={}",
+            text(row, "method"),
+            text(row, "host"),
+            text(row, "path"),
+            text(row, "reason")
+        ),
+        "proxy_h2_connection" => format!(
+            "{} {} {} streams={}",
+            text(row, "connection_id"),
+            text(row, "mint_id"),
+            text(row, "host"),
+            text(row, "streams")
+        ),
         "daemon_start" | "daemon_stop" => {
             format!("pid={} {}", text(row, "pid"), text(row, "reason"))
         }
@@ -301,6 +327,35 @@ mod tests {
         assert!(
             !line.contains("deadbeef"),
             "digests do not belong in the summary: {line}"
+        );
+    }
+
+    #[test]
+    fn a_proxy_request_row_renders_as_a_line_not_as_json() {
+        let row: serde_json::Value = serde_json::from_str(
+            r#"{"event":"proxy_request","ts":"2026-01-01T00:00:00Z","mint_id":"briefcred_t_1",
+                 "method":"GET","host":"api.openai.com","path":"/v1/models","status":200,
+                 "req_bytes":0,"resp_bytes":48,"latency_ms":3,"decision":"allow"}"#,
+        )
+        .unwrap();
+        let line = render(&row);
+        assert!(
+            line.ends_with("briefcred_t_1 GET api.openai.com/v1/models allow status=200"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_token_row_says_why_and_nothing_about_the_token() {
+        let row: serde_json::Value = serde_json::from_str(
+            r#"{"event":"proxy_token_rejected","ts":"2026-01-01T00:00:00Z","method":"GET",
+                 "host":"api.openai.com","path":"/v1/models","reason":"revoked"}"#,
+        )
+        .unwrap();
+        let line = render(&row);
+        assert!(
+            line.ends_with("GET api.openai.com/v1/models reason=revoked"),
+            "{line}"
         );
     }
 }
