@@ -98,9 +98,9 @@ fn newer_than(row: &serde_json::Value, cutoff: OffsetDateTime) -> bool {
 
 /// One row, rendered as a line for a terminal.
 ///
-/// Fixed-width event name, then the fields that matter for that kind. Rows the
-/// binary does not recognise fall back to their whole JSON, so nothing is ever
-/// silently dropped from the output.
+/// Fixed-width event name, wide enough for the longest, then the fields that
+/// matter for that kind. Rows the binary does not recognise fall back to their
+/// whole JSON, so nothing is ever silently dropped from the output.
 pub fn render(row: &serde_json::Value) -> String {
     let ts = row
         .get("ts")
@@ -190,7 +190,7 @@ pub fn render(row: &serde_json::Value) -> String {
         }
         _ => row.to_string(),
     };
-    format!("{ts}  {event:<14}{}", detail.trim_end())
+    format!("{ts}  {event:<21}{}", detail.trim_end())
 }
 
 fn text(row: &serde_json::Value, key: &str) -> String {
