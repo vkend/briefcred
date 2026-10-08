@@ -844,7 +844,7 @@ The cleartext password is deliberate and is safe for one reason: the listener is
 bound to `127.0.0.1` and nothing else, so it is the same channel the token
 already arrived over in the subprocess's environment. Set `pgproxy.tls = true`
 for a client that will not connect without TLS; it gets a leaf from briefcred's
-own CA, which `briefcred ca trust` has already installed.
+own CA, which `briefcred install --trust-ca` has already installed.
 
 MD5 is refused upstream unless `pgproxy.allow_md5 = true`, which logs a
 deprecation warning once. `SCRAM-SHA-256-PLUS` is never downgraded to its

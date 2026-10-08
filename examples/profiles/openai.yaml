@@ -15,10 +15,13 @@
 #
 # Copy this file into your profiles directory and store the real key:
 #
-#     briefcred profile bootstrap openai
+#     security add-generic-password -s dev.briefcred.master -a openai -w
+#
+# (`-w` last makes `security` prompt for the key rather than take it on the
+# command line.)
 #
 # The proxy terminates TLS with briefcred's own CA, so the machine has to
-# trust it. `briefcred install` generates one; `briefcred ca trust` installs it.
+# trust it. `briefcred install --trust-ca` generates one and installs it.
 # `briefcred exec` also sets the CA-bundle variables for runtimes that ignore
 # the system trust store, so `curl`, Node and Python all work as they are.
 #

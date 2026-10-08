@@ -10,7 +10,10 @@
 # for two thirds of the week, and an agent that wakes up at three in the
 # morning to do something nobody asked for gets a 403 and an audit row.
 #
-#     briefcred profile bootstrap anthropic
+#     security add-generic-password -s dev.briefcred.master -a anthropic -w
+#
+# (`-w` last makes `security` prompt for the key rather than take it on the
+# command line.)
 #
 # See `docs/policy-cookbook.md` for the rest of the recipe, including why the
 # clock is UTC.

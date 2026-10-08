@@ -12,7 +12,10 @@
 #     its own, and a `quota` on top so that twenty refunds cannot happen in
 #     four seconds even if twenty is the right number for a day's work.
 #
-#     briefcred profile bootstrap stripe
+#     security add-generic-password -s dev.briefcred.master -a stripe -w
+#
+# (`-w` last makes `security` prompt for the key rather than take it on the
+# command line.)
 #
 # See the last two sections of `docs/policy-cookbook.md`.
 

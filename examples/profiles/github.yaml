@@ -11,7 +11,10 @@
 # one being decided, so the first sees 0 and `< 500` permits exactly five
 # hundred. Request 501 gets a 403 and a `ProxyRequest { decision: deny }` row.
 #
-#     briefcred profile bootstrap github
+#     security add-generic-password -s dev.briefcred.master -a github -w
+#
+# (`-w` last makes `security` prompt for the key rather than take it on the
+# command line.)
 #
 # The policy is read-only on purpose: `GET` and `HEAD` and nothing else, so no
 # session opened with this profile can push, merge, or delete anything.
