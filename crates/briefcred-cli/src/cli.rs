@@ -985,7 +985,7 @@ mod tests {
             "install".to_string(),
             "--trust-ca".to_string(),
         ];
-        let message = super::refuse_root(0, Some("vishal"), &argv).expect("root must be refused");
+        let message = super::refuse_root(0, Some("ada"), &argv).expect("root must be refused");
         assert!(message.contains("do not run this command as root"));
         assert!(message.contains("You appear to have used sudo; run: briefcred install --trust-ca"));
     }
@@ -997,7 +997,7 @@ mod tests {
             None
         );
         assert_eq!(
-            super::refuse_root(501, Some("vishal"), &["briefcred".to_string()]),
+            super::refuse_root(501, Some("ada"), &["briefcred".to_string()]),
             None
         );
     }
