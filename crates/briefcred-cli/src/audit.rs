@@ -190,7 +190,9 @@ pub fn render(row: &serde_json::Value) -> String {
         }
         _ => row.to_string(),
     };
-    format!("{ts}  {event:<21}{}", detail.trim_end())
+    // RFC 3339 drops trailing zeros from the fraction, so a timestamp can be a
+    // character or two short; padding keeps the columns after it aligned.
+    format!("{ts:<27}  {event:<21}{}", detail.trim_end())
 }
 
 fn text(row: &serde_json::Value, key: &str) -> String {
@@ -357,5 +359,13 @@ mod tests {
             line.ends_with("GET api.openai.com/v1/models reason=revoked"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn a_short_timestamp_does_not_shift_the_columns() {
+        let row = |ts: &str| serde_json::json!({"event":"revoke","ts":ts,"mint_id":"briefcred_t_1","outcome":"revoked"});
+        let long = render(&row("2026-01-01T00:00:00.123456Z"));
+        let short = render(&row("2026-01-01T00:00:00.1234Z"));
+        assert_eq!(long.find("revoke"), short.find("revoke"), "{long}\n{short}");
     }
 }
