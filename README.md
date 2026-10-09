@@ -5,6 +5,10 @@ It hands subprocesses short-lived, narrowly scoped credentials, swaps
 placeholder keys for real ones at a local proxy, and records every mint,
 request, and revoke in an append-only audit log.
 
+![An agent calls the API with a placeholder token; the API server receives the real key.](docs/media/key-swap.gif)
+
+*The agent's key is a placeholder; briefcred's local proxy swaps in the real one (green, below) on the way out.*
+
 ## Why
 
 An agent that can run commands can read its own environment, and an API key
