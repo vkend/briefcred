@@ -468,6 +468,25 @@ pub enum AuditEntry {
         /// How many it found but could not remove.
         failed: usize,
     },
+    /// The Postgres proxy refused a connection before opening one upstream.
+    ///
+    /// The counterpart of [`AuditEntry::ProxyTokenRejected`]: a
+    /// [`AuditEntry::PgConnection`] row names the grant it ran under, and a
+    /// refused connection may name nothing trustworthy, so it gets this row.
+    /// Never the token, and never the startup packet's other parameters.
+    PgConnectionRefused {
+        /// When it happened.
+        #[serde(with = "time::serde::rfc3339")]
+        ts: OffsetDateTime,
+        /// The database the client asked for, if it named one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        database: Option<String>,
+        /// Why: a token reason (`malformed`, `bad_signature`, `expired`,
+        /// `not_yet_valid`, `revoked`), or `wrong_session`, `no_session`,
+        /// `profile_gone`, `wrong_kind`, `wrong_database`, `no_master`,
+        /// `no_mint`.
+        reason: String,
+    },
     /// A connection was refused because the peer is not the owning user.
     ///
     /// The socket lives in a `0700` directory at mode `0600`, so this row is
@@ -526,6 +545,7 @@ impl AuditEntry {
             | AuditEntry::DaemonHandoff { .. }
             | AuditEntry::AuthReject { .. }
             | AuditEntry::ProxyTokenRejected { .. }
+            | AuditEntry::PgConnectionRefused { .. }
             | AuditEntry::ProfileLoadError { .. }
             | AuditEntry::ProfileTrustWarning { .. }
             | AuditEntry::Reconcile { .. }

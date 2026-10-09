@@ -54,6 +54,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use briefcred_core::audit::AuditEntry;
 use briefcred_core::ca::CertificateAuthority;
 use briefcred_core::minters::postgres_proxy::PgProxyConfig;
 use briefcred_core::types::MintId;
@@ -345,7 +346,16 @@ async fn serve_session(
 
     let grant = match authorize(&startup, &presented, proxy).await {
         Ok(grant) => grant,
-        Err(reason) => return refuse(&mut stream, proxy, reason).await,
+        Err(refusal) => {
+            // Audited, not only logged: a stolen token tried against the
+            // Postgres proxy is exactly the attempt somebody needs to find.
+            proxy.state.audit(&AuditEntry::PgConnectionRefused {
+                ts: OffsetDateTime::now_utc(),
+                database: startup.database.clone(),
+                reason: refusal.reason.to_string(),
+            });
+            return refuse(&mut stream, proxy, refusal.detail).await;
+        }
     };
 
     // Before the upstream connect. A connection briefcred is going to refuse
@@ -507,20 +517,43 @@ struct Grant {
     expires_at: i64,
 }
 
+/// Why a connection was refused: a short code for the audit row, and the
+/// detail for the daemon's log.
+#[derive(Debug)]
+struct Refusal {
+    reason: &'static str,
+    detail: String,
+}
+
+impl Refusal {
+    fn new(reason: &'static str, detail: String) -> Refusal {
+        Refusal { reason, detail }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
 /// Check the token and the connection it asks for against the grant it names.
 ///
-/// The `Err` is the reason for the daemon's log, never for the client: the
-/// client gets [`REFUSAL`] whichever of these it hit.
+/// The `Err` is for the audit log and the daemon's log, never for the client:
+/// the client gets [`REFUSAL`] whichever of these it hit.
 async fn authorize(
     startup: &Startup,
     presented: &str,
     proxy: &PgProxy,
-) -> std::result::Result<Grant, String> {
+) -> std::result::Result<Grant, Refusal> {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let claims = proxy.issuer.authorize(presented, now).map_err(|err| {
-        format!(
-            "the token presented for `{}` is not good: {err}",
-            startup.user
+        Refusal::new(
+            err.audit_reason(),
+            format!(
+                "the token presented for `{}` is not good: {err}",
+                startup.user
+            ),
         )
     })?;
 
@@ -528,9 +561,12 @@ async fn authorize(
     // They have to be the same session, or a token from one session could open
     // a connection labelled as another's.
     if claims.sid != startup.user {
-        return Err(format!(
-            "a token for session `{}` was presented as user `{}`",
-            claims.sid, startup.user
+        return Err(Refusal::new(
+            "wrong_session",
+            format!(
+                "a token for session `{}` was presented as user `{}`",
+                claims.sid, startup.user
+            ),
         ));
     }
 
@@ -550,7 +586,7 @@ async fn authorize(
             )
         })
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| Refusal::new("no_session", err.to_string()))?;
     let (profile_name, masters, mint_id, quota) = session;
 
     // Opening a connection is the session being used. A run that only ever
@@ -562,41 +598,62 @@ async fn authorize(
         .profiles()
         .get(&profile_name)
         .await
-        .ok_or_else(|| format!("profile `{profile_name}` is no longer loaded"))?;
+        .ok_or_else(|| {
+            Refusal::new(
+                "profile_gone",
+                format!("profile `{profile_name}` is no longer loaded"),
+            )
+        })?;
     let spec = profile.credential(&claims.cred).ok_or_else(|| {
-        format!(
-            "profile `{profile_name}` no longer declares `{}`",
-            claims.cred
+        Refusal::new(
+            "profile_gone",
+            format!(
+                "profile `{profile_name}` no longer declares `{}`",
+                claims.cred
+            ),
         )
     })?;
     let config = PgProxyConfig::parse(&spec.kind, &spec.config)
-        .ok_or_else(|| format!("`{}` is not a Postgres proxy credential", claims.cred))?
-        .map_err(|err| err.to_string())?;
+        .ok_or_else(|| {
+            Refusal::new(
+                "wrong_kind",
+                format!("`{}` is not a Postgres proxy credential", claims.cred),
+            )
+        })?
+        .map_err(|err| Refusal::new("wrong_kind", err.to_string()))?;
 
     // A token for one database may not open a connection to another. libpq's
     // "an absent database means the user's name" rule is deliberately not
     // applied: a session identifier is not a database name, so an absent
     // `database` fails here rather than resolving to something surprising.
     if startup.database.as_deref() != Some(config.dbname.as_str()) {
-        return Err(format!(
-            "`{}` serves database `{}`; this client asked for `{}`",
-            claims.cred,
-            config.dbname,
-            startup.database.as_deref().unwrap_or("<none>")
+        return Err(Refusal::new(
+            "wrong_database",
+            format!(
+                "`{}` serves database `{}`; this client asked for `{}`",
+                claims.cred,
+                config.dbname,
+                startup.database.as_deref().unwrap_or("<none>")
+            ),
         ));
     }
 
-    let master = masters
-        .get(spec.source_key())
-        .cloned()
-        .ok_or_else(|| format!("the session holds no master for `{}`", spec.source_key()))?;
+    let master = masters.get(spec.source_key()).cloned().ok_or_else(|| {
+        Refusal::new(
+            "no_master",
+            format!("the session holds no master for `{}`", spec.source_key()),
+        )
+    })?;
     // A token whose mint the session no longer remembers is one whose
     // `ExecDone` already went through. The row has to name something, and a
     // fresh identifier would claim a mint that never happened.
     let mint_id = mint_id.ok_or_else(|| {
-        format!(
-            "session `{}` no longer holds a mint for `{}`",
-            claims.sid, claims.cred
+        Refusal::new(
+            "no_mint",
+            format!(
+                "session `{}` no longer holds a mint for `{}`",
+                claims.sid, claims.cred
+            ),
         )
     })?;
 

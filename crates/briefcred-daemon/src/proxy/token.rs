@@ -132,6 +132,19 @@ pub enum TokenError {
     Revoked,
 }
 
+impl TokenError {
+    /// How an audit row spells this refusal.
+    pub fn audit_reason(&self) -> &'static str {
+        match self {
+            TokenError::Malformed => "malformed",
+            TokenError::BadSignature => "bad_signature",
+            TokenError::Expired => "expired",
+            TokenError::NotYetValid => "not_yet_valid",
+            TokenError::Revoked => "revoked",
+        }
+    }
+}
+
 /// The per-machine Ed25519 key the proxy signs tokens with.
 ///
 /// `Debug` is written by hand and prints nothing but the public half: the

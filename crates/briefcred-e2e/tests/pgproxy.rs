@@ -377,6 +377,33 @@ async fn the_master_password_never_crosses_the_wire() {
     );
 }
 
+/// Wait for a `pg_connection_refused` row with one of `reasons`, and check the
+/// audit log never holds the token.
+async fn assert_refusal_audited(fixture: &Fixture, reasons: &[&str]) -> serde_json::Value {
+    let mut found = None;
+    let audited = wait_until(Duration::from_secs(10), || {
+        let rows = fixture.daemon.audit_rows();
+        found = rows.into_iter().find(|row| {
+            row["event"] == "pg_connection_refused"
+                && reasons.iter().any(|reason| row["reason"] == *reason)
+        });
+        let hit = found.is_some();
+        async move { hit }
+    })
+    .await;
+    assert!(
+        audited,
+        "a refused connection must leave a row with one of {reasons:?}:\n{:#?}",
+        fixture.daemon.audit_rows()
+    );
+    let log = serde_json::to_string(&fixture.daemon.audit_rows()).unwrap();
+    assert!(
+        !log.contains(&fixture.token),
+        "the audit log must never hold the token"
+    );
+    found.unwrap()
+}
+
 #[tokio::test]
 async fn a_wrong_token_is_refused_and_never_reaches_the_database() {
     let Some(fixture) = start("a_wrong_token_is_refused_and_never_reaches_the_database").await
@@ -398,6 +425,7 @@ async fn a_wrong_token_is_refused_and_never_reaches_the_database() {
         0,
         "a token that does not authorise must not open an upstream connection"
     );
+    assert_refusal_audited(&fixture, &["malformed", "bad_signature"]).await;
 }
 
 #[tokio::test]
@@ -415,6 +443,7 @@ async fn a_token_presented_as_another_user_is_refused() {
         "{err}"
     );
     assert_eq!(fixture.tap.connections(), 0);
+    assert_refusal_audited(&fixture, &["wrong_session"]).await;
 }
 
 #[tokio::test]
@@ -434,6 +463,8 @@ async fn a_token_for_one_database_cannot_open_another() {
         "{err}"
     );
     assert_eq!(fixture.tap.connections(), 0);
+    let row = assert_refusal_audited(&fixture, &["wrong_database"]).await;
+    assert_eq!(row["database"], "template1");
 }
 
 #[tokio::test]

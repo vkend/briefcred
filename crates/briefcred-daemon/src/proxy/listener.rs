@@ -496,7 +496,7 @@ async fn forward(
                 TokenError::Revoked => StatusCode::FORBIDDEN,
                 _ => StatusCode::UNAUTHORIZED,
             };
-            return attempt.refuse_token(code, token_rejection(&err));
+            return attempt.refuse_token(code, err.audit_reason());
         }
     };
 
@@ -1675,17 +1675,6 @@ fn empty() -> OutBody {
     Full::new(Bytes::new())
         .map_err(|never| match never {})
         .boxed()
-}
-
-/// The audit spelling of why a token did not authorise.
-fn token_rejection(err: &TokenError) -> &'static str {
-    match err {
-        TokenError::Malformed => "malformed",
-        TokenError::BadSignature => "bad_signature",
-        TokenError::Expired => "expired",
-        TokenError::NotYetValid => "not_yet_valid",
-        TokenError::Revoked => "revoked",
-    }
 }
 
 #[cfg(test)]
