@@ -21,12 +21,21 @@ All notable changes to briefcred are recorded here. The format follows
   that is gone, or with a failing DPoP proof. Until now these were only
   counted in metrics, so a stolen token replayed through the proxy left no
   trace in the audit log. The row carries the method, host, path and reason,
-  never the token. (The Postgres proxy's refusals are still logged only.)
+  never the token.
+- **A `pg_connection_refused` audit row** whenever the Postgres proxy refuses a
+  connection before opening one upstream: a bad, expired or revoked token, a
+  token presented for another session, the wrong database, or a grant that no
+  longer exists. Like the HTTP proxy's, these were only logged. The row
+  carries the requested database and a reason, never the token.
 - **`briefcred audit` renders proxy rows as lines** instead of raw JSON:
-  `proxy_request`, `proxy_token_rejected` and `proxy_h2_connection`.
+  `proxy_request`, `proxy_token_rejected`, `pg_connection_refused` and
+  `proxy_h2_connection`, with the columns aligned.
 
 ### Fixed
 
+- **`briefcred` no longer panics when its output pipe closes early.**
+  `briefcred audit | head` and similar ended in a "failed printing to
+  stdout" panic; the CLI now stops quietly, as pipeline readers expect.
 - **Concurrent HTTP/2 requests to one upstream share one connection again.**
   The cache's sweep removed a slot that one request had just been handed but
   not yet locked, so a second request for the same host got a fresh slot and

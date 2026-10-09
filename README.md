@@ -893,6 +893,12 @@ the mint id, the upstream role, when it started and ended, and the bytes each
 way. There is no query in it, and there is no field a query could go in — after
 authentication the proxy does not parse the protocol at all.
 
+A connection the proxy refuses before opening one upstream gets a
+`pg_connection_refused` row instead: the database the client asked for and a
+reason (`revoked`, `expired`, `bad_signature`, `wrong_session`,
+`wrong_database` and so on). The client is only ever told `28000`; the row is
+where the reason goes. It never holds the token.
+
 ### A connection does not outlive its grant
 
 The credential is checked when the connection opens, and a database connection

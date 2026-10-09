@@ -178,6 +178,9 @@ pub fn render(row: &serde_json::Value) -> String {
             text(row, "path"),
             text(row, "reason")
         ),
+        "pg_connection_refused" => {
+            format!("{} reason={}", text(row, "database"), text(row, "reason"))
+        }
         "proxy_h2_connection" => format!(
             "{} {} {} streams={}",
             text(row, "connection_id"),
@@ -367,5 +370,13 @@ mod tests {
         let long = render(&row("2026-01-01T00:00:00.123456Z"));
         let short = render(&row("2026-01-01T00:00:00.1234Z"));
         assert_eq!(long.find("revoke"), short.find("revoke"), "{long}\n{short}");
+    }
+
+    #[test]
+    fn a_refused_postgres_connection_says_which_database_and_why() {
+        let row = serde_json::json!({"event":"pg_connection_refused","ts":"2026-01-01T00:00:00Z",
+                                     "database":"analytics","reason":"revoked"});
+        let line = render(&row);
+        assert!(line.ends_with("analytics reason=revoked"), "{line}");
     }
 }
