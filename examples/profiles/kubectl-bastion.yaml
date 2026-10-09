@@ -17,7 +17,7 @@
 # `CHANGE ME`. The master credential is the CA private key, in OpenSSH format
 # with no passphrase, stored under the key `ssh-ca`:
 #
-#     security add-generic-password -s dev.briefcred.master -a ssh-ca -w "$(cat ca_key)"
+#     security add-generic-password -s io.github.vkend.briefcred.master -a ssh-ca -w "$(cat ca_key)"
 #
 # The bastion has to trust that CA. On the bastion:
 #

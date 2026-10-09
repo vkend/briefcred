@@ -235,7 +235,7 @@ macOS:
 ```
 
 Every directory is mode `0700`. The service unit lives outside this tree, at
-`~/Library/LaunchAgents/dev.briefcred.daemon.plist` or
+`~/Library/LaunchAgents/io.github.vkend.briefcred.plist` or
 `~/.config/systemd/user/briefcred.service`, because launchd and systemd have to
 read it. `BRIEFCRED_HOME` relocates that too, which is what keeps tests out of
 the real `~/Library/LaunchAgents`.
@@ -898,7 +898,7 @@ The certificate goes to `ca/ca.pem`. The private key goes to a `KeyStore`:
 
 | Platform | Backend | Where |
 | --- | --- | --- |
-| macOS | `KeychainKeyStore` | login keychain, generic password, service `dev.briefcred.ca` |
+| macOS | `KeychainKeyStore` | login keychain, generic password, service `io.github.vkend.briefcred.ca` |
 | Linux and fallback | `FileKeyStore` | `ca/ca.key`, mode `0600` |
 
 The choice is made in exactly one place, `ca::CaConfig::open_keystore`, which

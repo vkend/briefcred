@@ -177,7 +177,7 @@ your password itself for that one step, and running the whole thing as root
 provisions root's home instead of yours.
 
 On macOS the unit is a LaunchAgent at
-`~/Library/LaunchAgents/dev.briefcred.daemon.plist` with `RunAtLoad`,
+`~/Library/LaunchAgents/io.github.vkend.briefcred.plist` with `RunAtLoad`,
 `KeepAlive`, and `ProcessType Interactive`, bootstrapped into `gui/<uid>`. It is
 never a system-wide LaunchDaemon: a daemon outside the Aqua session cannot
 show a biometric prompt, so one would hang the moment Phase 3 asks for Touch ID.
@@ -206,7 +206,7 @@ machine trusts. `install` generates one: ECDSA P-256, common name
 leaves and never an intermediate. The certificate is `ca/ca.pem`, mode `0644`
 because every runtime that reads it does so as you. The private key never
 touches that file: it goes to the macOS login keychain as a generic password
-under service `dev.briefcred.ca`, or to `ca/ca.key` at mode `0600` elsewhere.
+under service `io.github.vkend.briefcred.ca`, or to `ca/ca.key` at mode `0600` elsewhere.
 
 ```sh
 briefcred ca show                    # subject, fingerprint, validity, trust state
@@ -680,7 +680,7 @@ several credentials can share one master by naming the same key.
 
 | `master_source` | Where it looks |
 | --- | --- |
-| `keychain` | The login keychain, service `dev.briefcred.master`, key as the account. The default on macOS. |
+| `keychain` | The login keychain, service `io.github.vkend.briefcred.master`, key as the account. The default on macOS. |
 | `file` | `secrets/<key>` under the briefcred home, mode `0600`. The default elsewhere. |
 | `env` | `BRIEFCRED_MASTER_<KEY>`, upper-cased with `-` as `_`. Development only. |
 

@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 pub const HOME_ENV: &str = "BRIEFCRED_HOME";
 
 /// The reverse-DNS label the macOS LaunchAgent is registered under.
-pub const SERVICE_LABEL: &str = "dev.briefcred.daemon";
+pub const SERVICE_LABEL: &str = "io.github.vkend.briefcred";
 
 /// The platforms briefcred knows how to lay itself out on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,7 +240,7 @@ impl Paths {
 
     /// The label the platform's service manager knows the daemon by.
     ///
-    /// `launchctl` addresses it as `gui/<uid>/dev.briefcred.daemon`; systemd
+    /// `launchctl` addresses it as `gui/<uid>/io.github.vkend.briefcred`; systemd
     /// addresses the unit as `briefcred.service`.
     pub fn service_label(&self) -> &'static str {
         match self.platform {
@@ -381,9 +381,9 @@ mod tests {
         );
         assert_eq!(
             paths.service_file(),
-            Path::new("/Users/ada/Library/LaunchAgents/dev.briefcred.daemon.plist")
+            Path::new("/Users/ada/Library/LaunchAgents/io.github.vkend.briefcred.plist")
         );
-        assert_eq!(paths.service_label(), "dev.briefcred.daemon");
+        assert_eq!(paths.service_label(), "io.github.vkend.briefcred");
     }
 
     #[test]

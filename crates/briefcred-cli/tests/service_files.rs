@@ -26,7 +26,7 @@ fn the_launch_agent_plist_is_exactly_this() {
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>dev.briefcred.daemon</string>
+	<string>io.github.vkend.briefcred</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/opt/briefcred/bin/briefcred-daemon</string>
@@ -112,7 +112,7 @@ fn xml_special_characters_in_a_path_are_escaped() {
 fn both_files_point_at_the_same_home_the_paths_resolved() {
     let spec = spec(Platform::MacOs);
     assert_eq!(spec.home(), Path::new("/tmp/bc"));
-    assert_eq!(spec.label(), "dev.briefcred.daemon");
+    assert_eq!(spec.label(), "io.github.vkend.briefcred");
     assert!(spec.stdout_log().ends_with("logs/daemon.out.log"));
     assert!(spec.stderr_log().ends_with("logs/daemon.err.log"));
 }

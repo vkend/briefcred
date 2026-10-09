@@ -224,13 +224,16 @@ mod tests {
         assert_eq!(
             lines[0],
             format!(
-                "launchctl bootstrap gui/{} /tmp/bc/Library/LaunchAgents/dev.briefcred.daemon.plist",
+                "launchctl bootstrap gui/{} /tmp/bc/Library/LaunchAgents/io.github.vkend.briefcred.plist",
                 uid()
             )
         );
         assert_eq!(
             lines[1],
-            format!("launchctl kickstart gui/{}/dev.briefcred.daemon", uid())
+            format!(
+                "launchctl kickstart gui/{}/io.github.vkend.briefcred",
+                uid()
+            )
         );
     }
 
@@ -240,14 +243,14 @@ mod tests {
         assert_eq!(
             stop_plan(&paths).lines(),
             vec![format!(
-                "launchctl bootout gui/{}/dev.briefcred.daemon",
+                "launchctl bootout gui/{}/io.github.vkend.briefcred",
                 uid()
             )]
         );
         assert_eq!(
             restart_plan(&paths).lines(),
             vec![format!(
-                "launchctl kickstart -k gui/{}/dev.briefcred.daemon",
+                "launchctl kickstart -k gui/{}/io.github.vkend.briefcred",
                 uid()
             )]
         );

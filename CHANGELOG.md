@@ -6,6 +6,18 @@ All notable changes to briefcred are recorded here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- **briefcred's macOS identifiers moved to `io.github.vkend.briefcred`.** The
+  LaunchAgent label is now `io.github.vkend.briefcred` (plist
+  `~/Library/LaunchAgents/io.github.vkend.briefcred.plist`), and the keychain
+  services are `io.github.vkend.briefcred.master` and
+  `io.github.vkend.briefcred.ca`, replacing `dev.briefcred.*`, a domain the
+  project does not own. Nothing has been released, so there is no migration.
+  A development install made before this change is not found by the new
+  binary; remove it by hand with `launchctl bootout gui/$UID/dev.briefcred.daemon`
+  and `rm ~/Library/LaunchAgents/dev.briefcred.daemon.plist`, then reinstall.
+
 ### Security
 
 - **rustls 0.23.45.** The lockfile moves off 0.23.43, which accepted TLS 1.3
@@ -810,7 +822,7 @@ All notable changes to briefcred are recorded here. The format follows
   rows describe the daemon rather than a minted principal.
 - `briefcred_core::keystore`: the `KeyStore` trait with two backends.
   `KeychainKeyStore` stores a generic password in the macOS login keychain
-  under service `dev.briefcred.ca`; `FileKeyStore` writes a `0600` file,
+  under service `io.github.vkend.briefcred.ca`; `FileKeyStore` writes a `0600` file,
   created with that mode rather than chmodded afterwards, and `fsync`ed. The
   backend is chosen in exactly one place, `ca::CaConfig::open_keystore`.
   Asking for the keychain off macOS is an error, never a silent fallback to a
@@ -855,7 +867,7 @@ All notable changes to briefcred are recorded here. The format follows
   `curl --cacert ca.pem` accepting it. Skips with a printed reason where there
   is no `curl`.
 - `briefcred_core::source`: the `MasterSource` backends. `KeychainSource`
-  reads generic passwords under the service `dev.briefcred.master` with the
+  reads generic passwords under the service `io.github.vkend.briefcred.master` with the
   key as the account; `FileSource` reads `0600` files under
   `paths::secrets_dir()` and refuses a file that is readable by group or
   other; `EnvSource` reads `BRIEFCRED_MASTER_<KEY>` for development and warns

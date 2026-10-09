@@ -9,7 +9,7 @@ weakens a guarantee has to say so out loud before it ships.
 | --- | --- | --- |
 | Master credentials | macOS Keychain; Linux kernel keyring or an encrypted file | Long-lived, broadly scoped. The whole point of the product is that these never leave the daemon. |
 | Minted credentials | Daemon memory, and under Model B the subprocess environment | Short-lived and narrowly scoped, but real. |
-| Root CA private key | macOS login keychain (`dev.briefcred.ca`), or `ca/ca.key` at 0600 | Signs certificates the machine's TLS clients trust. Compromise means transparent interception of every proxied connection. |
+| Root CA private key | macOS login keychain (`io.github.vkend.briefcred.ca`), or `ca/ca.key` at 0600 | Signs certificates the machine's TLS clients trust. Compromise means transparent interception of every proxied connection. |
 | Audit log | `.../briefcred/audit/*.jsonl` | Tampering hides an incident; reading it reveals what ran and when. |
 | Profiles | `.../briefcred/profiles/*.yaml` | Write access is privilege escalation: a profile decides what gets minted and what may run. |
 | Policy (Cedar, Phase 5) | `.../briefcred` | Same as profiles. |

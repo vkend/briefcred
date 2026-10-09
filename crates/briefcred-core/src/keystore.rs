@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::paths::{ensure_private_dir, Paths, Platform};
 
 /// The keychain service name every briefcred CA item is filed under.
-pub const KEYCHAIN_SERVICE: &str = "dev.briefcred.ca";
+pub const KEYCHAIN_SERVICE: &str = "io.github.vkend.briefcred.ca";
 
 /// The item the root CA's private key is stored under.
 ///
@@ -366,7 +366,7 @@ mod tests {
     #[ignore]
     #[cfg(target_os = "macos")]
     fn the_keychain_backend_round_trips() {
-        let store = KeychainKeyStore::new("dev.briefcred.ca.test");
+        let store = KeychainKeyStore::new("io.github.vkend.briefcred.ca.test");
         let item = "round-trip";
         let secret = Zeroizing::new("keychain-value".to_string());
         store.put(item, &secret).unwrap();

@@ -141,7 +141,10 @@ fn dry_run_install() -> String {
 #[test]
 fn install_dry_run_touches_nothing_and_names_the_launch_agent() {
     let stdout = dry_run_install();
-    assert!(stdout.contains("dev.briefcred.daemon.plist"), "{stdout}");
+    assert!(
+        stdout.contains("io.github.vkend.briefcred.plist"),
+        "{stdout}"
+    );
     assert!(stdout.contains("launchctl bootstrap"), "{stdout}");
 }
 

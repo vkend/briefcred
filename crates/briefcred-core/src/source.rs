@@ -10,7 +10,7 @@
 //!
 //! | backend            | where it looks                                | intended use |
 //! |--------------------|-----------------------------------------------|--------------|
-//! | [`KeychainSource`] | macOS login keychain, service `dev.briefcred.master` | the real one |
+//! | [`KeychainSource`] | macOS login keychain, service `io.github.vkend.briefcred.master` | the real one |
 //! | [`FileSource`]     | `0600` files under [`Paths::secrets_dir`]      | Linux, and dev |
 //! | [`EnvSource`]      | `BRIEFCRED_MASTER_<KEY>`                       | dev only |
 //!
@@ -31,7 +31,7 @@ use crate::traits::MasterSource;
 /// Distinct from [`crate::keystore::KEYCHAIN_SERVICE`]: the CA's private key
 /// and the masters are different classes of secret and must not share a
 /// namespace, or a `key` could name the CA key by accident.
-pub const KEYCHAIN_SERVICE: &str = "dev.briefcred.master";
+pub const KEYCHAIN_SERVICE: &str = "io.github.vkend.briefcred.master";
 
 /// Prefix [`EnvSource`] looks a key up under.
 pub const ENV_PREFIX: &str = "BRIEFCRED_MASTER_";
@@ -596,7 +596,7 @@ mod tests {
     #[ignore]
     #[cfg(target_os = "macos")]
     async fn the_keychain_master_source_round_trips() {
-        let source = KeychainSource::new("dev.briefcred.master.test");
+        let source = KeychainSource::new("io.github.vkend.briefcred.master.test");
         let secret = Zeroizing::new("keychain-master".to_string());
         source.put("round-trip", &secret).unwrap();
         assert_eq!(&*source.fetch("round-trip").await.unwrap(), &*secret);

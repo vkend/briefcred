@@ -15,7 +15,7 @@
 #
 # Copy this file into your profiles directory and store the real key:
 #
-#     security add-generic-password -s dev.briefcred.master -a openai -w
+#     security add-generic-password -s io.github.vkend.briefcred.master -a openai -w
 #
 # (`-w` last makes `security` prompt for the key rather than take it on the
 # command line.)
