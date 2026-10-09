@@ -213,6 +213,11 @@ async fn the_environment_points_at_the_proxy_and_carries_no_credential() {
     // the profile declares no credential, so no substitution can happen and no
     // master is anywhere near this run.
     for (name, value) in &fixture.env {
+        // The token was checked above. Its signature is random base64url, so it
+        // contains "__" by chance in about one run in fifty.
+        if name == "BRIEFCRED_PROXY_TOKEN" {
+            continue;
+        }
         assert!(
             !value.contains("__"),
             "{name} looks like an unsubstituted placeholder: {value}"
