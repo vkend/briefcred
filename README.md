@@ -8,6 +8,7 @@ request, and revoke in an append-only audit log.
 ![An agent calls the API with a placeholder token; the API server receives the real key.](docs/media/key-swap.gif)
 
 *The agent's key is a placeholder; briefcred's local proxy swaps in the real one (green, below) on the way out.*
+[Watch the 4-minute demo](https://youtu.be/7N9MCX-hCrQ): creating a profile, Touch ID, a leaked token, and a Postgres role that lasts one command.
 
 ## Why
 
