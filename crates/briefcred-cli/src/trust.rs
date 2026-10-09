@@ -158,9 +158,9 @@ pub fn run(plan: &Plan) -> Result<()> {
 /// This is the entry point every caller that might prompt should use.
 pub fn run_announced(plan: &Plan) -> Result<()> {
     if plan.needs_sudo() {
-        println!("this needs an administrator password:");
+        outln!("this needs an administrator password:");
         for line in plan.lines() {
-            println!("  {line}");
+            outln!("  {line}");
         }
     }
     run(plan)

@@ -102,9 +102,7 @@ pub async fn run(paths: &Paths, sock: &Path, source_kind: SourceKind) -> Result<
         .into_iter()
         .partition(|kind| GUIDED_KINDS.contains(kind));
     for kind in &unguided {
-        println!(
-            "`{kind}` has no guided setup; write its profile by hand (docs/profile-schema.md)."
-        );
+        outln!("`{kind}` has no guided setup; write its profile by hand (docs/profile-schema.md).");
     }
     if kinds.is_empty() {
         return Err(Error::Refused(
@@ -957,7 +955,7 @@ fn interview(
     } else {
         let env = default_env(kind, name);
         let names: Vec<&str> = env.iter().map(|(var, _)| var.as_str()).collect();
-        println!("The subprocess will see {}.", names.join(", "));
+        outln!("The subprocess will see {}.", names.join(", "));
         (Vec::new(), env)
     };
 
@@ -984,7 +982,7 @@ fn interview(
         .map_err(prompt_failed)?;
     let allow_argv0 = split_list(&programs);
     if allow_argv0.is_empty() {
-        println!("Any program may run with this profile; the file says so where it matters.");
+        outln!("Any program may run with this profile; the file says so where it matters.");
     }
 
     let master = ask_master_choice(&credential, paths, source_kind)?;
@@ -1204,7 +1202,7 @@ fn choose<T: Serialize + Copy>(prompt: &str, options: &[T]) -> Result<T> {
 /// credential and no policy loads, mints, and forwards nothing, which is the
 /// most confusing way a bootstrap could succeed.
 fn ask_policy() -> Result<Vec<PolicyRule>> {
-    println!(
+    outln!(
         "The proxy forwards nothing a policy does not permit. Describe each request \
          this credential may be used for."
     );
@@ -1306,7 +1304,7 @@ fn ask_master_choice(
         .map_err(prompt_failed)?;
     let location = master_location(paths, source_kind, &key);
     match master_exists(paths, source_kind, &key) {
-        Ok(true) => println!("Found `{key}` at {location}."),
+        Ok(true) => outln!("Found `{key}` at {location}."),
         Ok(false) => {
             eprintln!("briefcred: there is no master `{key}` at {location}");
             if !Confirm::new()
@@ -1318,7 +1316,7 @@ fn ask_master_choice(
                 return Err(Error::Refused("nothing was written".to_string()));
             }
         }
-        Err(why) => println!("`{key}` was not checked: {why}."),
+        Err(why) => outln!("`{key}` was not checked: {why}."),
     }
     Ok(MasterChoice::Reuse(key))
 }

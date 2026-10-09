@@ -7,6 +7,9 @@
 
 #![deny(unsafe_code)]
 
+#[macro_use]
+pub mod output;
+
 pub mod audit;
 pub mod bootstrap;
 pub mod ca;

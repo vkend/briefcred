@@ -75,16 +75,16 @@ pub fn keygen(out: &Path) -> Result<()> {
         source,
     })?;
 
-    println!("briefcred profile keygen");
-    println!(
+    outln!("briefcred profile keygen");
+    outln!(
         "  secret     {} (mode 0600, no password)",
         secret_path.display()
     );
-    println!("  public     {}", public_path.display());
-    println!("  key id     {}", public.key_id());
-    println!();
-    println!("add this line to `trust_roots` in daemon.toml:");
-    println!("  {}", public.to_line());
+    outln!("  public     {}", public_path.display());
+    outln!("  key id     {}", public.key_id());
+    outln!();
+    outln!("add this line to `trust_roots` in daemon.toml:");
+    outln!("  {}", public.to_line());
     Ok(())
 }
 
@@ -113,8 +113,8 @@ pub fn sign(file: &Path, key_path: &Path) -> Result<()> {
         path: out.clone(),
         source,
     })?;
-    println!("signed {} with key {}", file.display(), secret.key_id());
-    println!("  wrote {}", out.display());
+    outln!("signed {} with key {}", file.display(), secret.key_id());
+    outln!("  wrote {}", out.display());
     Ok(())
 }
 
@@ -131,9 +131,9 @@ pub fn verify(file: &Path, key_path: &Path) -> Result<()> {
 
     let parsed = briefcred_core::minisign::Signature::parse(&signature)?;
     parsed.verify(&content, &public)?;
-    println!("{}: signature is valid", file.display());
-    println!("  key id     {}", public.key_id());
-    println!("  comment    {}", parsed.trusted_comment());
+    outln!("{}: signature is valid", file.display());
+    outln!("  key id     {}", public.key_id());
+    outln!("  comment    {}", parsed.trusted_comment());
     Ok(())
 }
 
@@ -145,7 +145,7 @@ pub fn verify(file: &Path, key_path: &Path) -> Result<()> {
 pub async fn sync(paths: &Paths) -> Result<u8> {
     let config = ProfilesConfig::from_daemon_toml(&paths.daemon_toml())?;
     if config.registries.is_empty() {
-        println!("no registries configured; add `[profiles] registries` to daemon.toml");
+        outln!("no registries configured; add `[profiles] registries` to daemon.toml");
         return Ok(0);
     }
     let trust = config.trust()?;
@@ -157,16 +157,16 @@ pub async fn sync(paths: &Paths) -> Result<u8> {
         ));
     }
     if trust.dev_mode {
-        println!("!! dev_mode is on: unverified profiles will be accepted");
+        outln!("!! dev_mode is on: unverified profiles will be accepted");
     }
 
-    println!("briefcred profile sync");
+    outln!("briefcred profile sync");
     let mut problems = 0u8;
     for spec in &config.registries {
         problems = problems.saturating_add(sync_one(spec, paths, &trust).await);
     }
-    println!();
-    println!("the daemon reloads profiles by itself; 'briefcred profiles' will show them");
+    outln!();
+    outln!("the daemon reloads profiles by itself; 'briefcred profiles' will show them");
     Ok(u8::from(problems > 0))
 }
 
@@ -178,21 +178,21 @@ async fn sync_one(
 ) -> u8 {
     match distribution::sync_registry(spec, &paths.profiles_dir(), trust).await {
         Ok(outcome) => {
-            println!(
+            outln!(
                 "  {:<16} {} profile(s) into {}",
                 outcome.name,
                 outcome.accepted,
                 outcome.dir.display()
             );
             for skipped in &outcome.skipped {
-                println!("    ! {skipped}");
+                outln!("    ! {skipped}");
             }
             u8::from(!outcome.skipped.is_empty())
         }
         Err(err) => {
             // One unreachable registry must not stop the others: a laptop off
             // the network still wants the registry on its own disk.
-            println!("  {:<16} failed: {err}", spec.name);
+            outln!("  {:<16} failed: {err}", spec.name);
             1
         }
     }

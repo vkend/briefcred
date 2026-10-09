@@ -271,7 +271,7 @@ pub async fn run(cli: Cli) -> Result<u8> {
             .await?;
             // No trailing newline: the value is meant to be captured, and
             // `$(briefcred get ...)` strips one but a file redirect does not.
-            print!("{value}");
+            out!("{value}");
             Ok(0)
         }
         Command::Profiles => {
@@ -292,9 +292,9 @@ pub async fn run(cli: Cli) -> Result<u8> {
             let window = since.as_deref().map(audit::parse_since).transpose()?;
             for row in audit::read_since(&paths.audit_dir(), window)? {
                 if json {
-                    println!("{row}");
+                    outln!("{row}");
                 } else {
-                    println!("{}", audit::render(&row));
+                    outln!("{}", audit::render(&row));
                 }
             }
             Ok(0)
@@ -382,10 +382,10 @@ async fn run_profile(paths: &Paths, action: ProfileAction) -> Result<u8> {
         ProfileAction::Bootstrap => {
             let source_kind = master_source_kind(paths)?;
             let done = bootstrap::run(paths, paths.sock(), source_kind).await?;
-            println!("briefcred profile bootstrap");
-            println!("  wrote      {}", done.path.display());
-            println!("  master     `{}` in {}", done.source_key, done.location);
-            println!(
+            outln!("briefcred profile bootstrap");
+            outln!("  wrote      {}", done.path.display());
+            outln!("  master     `{}` in {}", done.source_key, done.location);
+            outln!(
                 "
 the daemon reloads profiles by itself; 'briefcred profiles' will show it"
             );
@@ -411,7 +411,7 @@ the daemon reloads profiles by itself; 'briefcred profiles' will show it"
         }
         ProfileAction::Sync => signing::sync(paths).await,
         ProfileAction::Schema => {
-            println!("{}", briefcred_core::profile::json_schema());
+            outln!("{}", briefcred_core::profile::json_schema());
             Ok(0)
         }
     }
@@ -423,38 +423,42 @@ the daemon reloads profiles by itself; 'briefcred profiles' will show it"
 /// one-row table: before running a profile, the question worth answering is
 /// who wrote it and who vouched for it.
 fn print_profile_detail(profile: &briefcred_proto::ProfileSummary) {
-    println!("{}", profile.name);
+    outln!("{}", profile.name);
     if let Some(description) = &profile.description {
-        println!("  description  {description}");
+        outln!("  description  {description}");
     }
-    println!(
+    outln!(
         "  unlock       {} ({}s cache)",
-        profile.unlock_policy, profile.unlock_cache_secs
+        profile.unlock_policy,
+        profile.unlock_cache_secs
     );
-    println!("  source       {}", profile.source);
-    println!("  file         {}", profile.path.display());
-    println!("  signature    {}", profile.signature);
+    outln!("  source       {}", profile.source);
+    outln!("  file         {}", profile.path.display());
+    outln!("  signature    {}", profile.signature);
     if let Some(key_id) = &profile.signer_key_id {
-        println!("  signed by    {key_id}");
+        outln!("  signed by    {key_id}");
     }
     if let Some(shadowed) = &profile.overrides {
-        println!(
+        outln!(
             "  overrides    the `{}` profile published by {shadowed}",
             profile.name
         );
     }
     if profile.signature == "dev_mode" {
-        println!("  !! this profile was NOT verified; dev_mode is on");
+        outln!("  !! this profile was NOT verified; dev_mode is on");
     }
     if profile.credentials.is_empty() {
-        println!("  credentials  none");
+        outln!("  credentials  none");
         return;
     }
-    println!("  credentials");
+    outln!("  credentials");
     for credential in &profile.credentials {
-        println!(
+        outln!(
             "    {} ({}, {}s, master `{}`)",
-            credential.name, credential.kind, credential.ttl_secs, credential.source_key
+            credential.name,
+            credential.kind,
+            credential.ttl_secs,
+            credential.source_key
         );
     }
 }
@@ -482,20 +486,24 @@ fn print_profiles(reply: &Response) {
         return;
     };
     if profiles.is_empty() {
-        println!("no profiles; run 'briefcred profile bootstrap' to write one");
+        outln!("no profiles; run 'briefcred profile bootstrap' to write one");
         return;
     }
     // The warning goes above the table rather than in a column: a profile
     // running unverified is not a property to scan a column for.
     for profile in profiles.iter().filter(|p| p.signature == "dev_mode") {
-        println!(
+        outln!(
             "!! `{}` was NOT verified and is loaded only because dev_mode is on",
             profile.name
         );
     }
-    println!(
+    outln!(
         "{:<20}{:<12}{:<8}{:<20}{:<10}CREDENTIALS",
-        "PROFILE", "UNLOCK", "CACHE", "SOURCE", "SIGNATURE"
+        "PROFILE",
+        "UNLOCK",
+        "CACHE",
+        "SOURCE",
+        "SIGNATURE"
     );
     for profile in profiles {
         let credentials = if profile.credentials.is_empty() {
@@ -508,7 +516,7 @@ fn print_profiles(reply: &Response) {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        println!(
+        outln!(
             "{:<20}{:<12}{:<8}{:<20}{:<10}{credentials}",
             profile.name,
             profile.unlock_policy,
@@ -524,7 +532,7 @@ fn print_profiles(reply: &Response) {
 /// Every line is a check somebody has actually been stuck on: the daemon not
 /// running, the CA not trusted, no profiles yet.
 async fn print_health(paths: &Paths) {
-    println!("briefcred health");
+    outln!("briefcred health");
     match client::status(paths.sock()).await {
         Ok(Response::Status {
             version,
@@ -532,36 +540,36 @@ async fn print_health(paths: &Paths) {
             audit_path,
             ..
         }) => {
-            println!(
+            outln!(
                 "  daemon     running, {version}, up {}",
                 human_uptime(uptime_secs)
             );
-            println!("  audit      {}", audit_path.display());
+            outln!("  audit      {}", audit_path.display());
         }
-        Ok(other) => println!("  daemon     answered unexpectedly: {other:?}"),
-        Err(err) => println!("  daemon     {err}"),
+        Ok(other) => outln!("  daemon     answered unexpectedly: {other:?}"),
+        Err(err) => outln!("  daemon     {err}"),
     }
 
     match client::request(paths.sock(), briefcred_proto::Request::ListProfiles).await {
         Ok(Response::Profiles { profiles }) if profiles.is_empty() => {
-            println!("  profiles   none; run 'briefcred profile bootstrap'");
+            outln!("  profiles   none; run 'briefcred profile bootstrap'");
         }
         Ok(Response::Profiles { profiles }) => {
-            println!("  profiles   {} loaded", profiles.len());
+            outln!("  profiles   {} loaded", profiles.len());
         }
-        _ => println!("  profiles   unknown; the daemon is not answering"),
+        _ => outln!("  profiles   unknown; the daemon is not answering"),
     }
 
     if paths.ca_cert().exists() {
         match trust::is_trusted(paths) {
-            Some(true) => println!("  ca         present and trusted"),
+            Some(true) => outln!("  ca         present and trusted"),
             Some(false) => {
-                println!("  ca         present, not trusted; run 'briefcred install --trust-ca'")
+                outln!("  ca         present, not trusted; run 'briefcred install --trust-ca'")
             }
-            None => println!("  ca         present, trust state unknown"),
+            None => outln!("  ca         present, trust state unknown"),
         }
     } else {
-        println!("  ca         missing; run 'briefcred install --trust-ca'");
+        outln!("  ca         missing; run 'briefcred install --trust-ca'");
     }
 
     let queue = paths.state_dir().join("revoke-queue.jsonl");
@@ -569,8 +577,8 @@ async fn print_health(paths: &Paths) {
         .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
         .unwrap_or_default();
     match outstanding {
-        0 => println!("  revokes    none outstanding"),
-        n => println!("  revokes    {n} outstanding in {}", queue.display()),
+        0 => outln!("  revokes    none outstanding"),
+        n => outln!("  revokes    {n} outstanding in {}", queue.display()),
     }
 }
 
@@ -606,19 +614,19 @@ fn run_ca(paths: &Paths, action: CaAction) -> Result<()> {
 
             if trust_ca {
                 trust::run_announced(&trust::trust_plan(paths))?;
-                println!("  trusted    the new CA is in the system trust store");
+                outln!("  trusted    the new CA is in the system trust store");
             } else {
-                println!("\nthe new CA is not trusted yet; run:");
+                outln!("\nthe new CA is not trusted yet; run:");
                 for line in trust::trust_plan(paths).lines() {
-                    println!("  {line}");
+                    outln!("  {line}");
                 }
             }
             Ok(())
         }
         CaAction::Untrust => {
             trust::run_announced(&trust::untrust_plan(paths))?;
-            println!("the CA is no longer in the system trust store");
-            println!(
+            outln!("the CA is no longer in the system trust store");
+            outln!(
                 "  kept       {} (run 'briefcred install --trust-ca' to trust it again)",
                 paths.ca_cert().display()
             );
@@ -690,7 +698,7 @@ async fn run_upgrade(paths: &Paths, binary: Option<std::path::PathBuf>) -> Resul
     };
 
     let socket = paths.handoff_socket();
-    println!("upgrading pid {pid} to {}", binary.display());
+    outln!("upgrading pid {pid} to {}", binary.display());
     let mut child = lifecycle::spawn_takeover(paths, &binary, &socket)?;
     if !lifecycle::wait_until_bound(&socket, install::READY_TIMEOUT) {
         // Nothing has been handed over, so the running daemon is untouched.
@@ -711,8 +719,8 @@ async fn run_upgrade(paths: &Paths, binary: Option<std::path::PathBuf>) -> Resul
     };
     match client::request(paths.sock(), request).await {
         Ok(Response::HandoffComplete { to_pid, sessions }) => {
-            println!("daemon upgraded: pid {pid} handed {sessions} session(s) to pid {to_pid}");
-            println!("the sockets never closed; pid {pid} is draining what it had in flight");
+            outln!("daemon upgraded: pid {pid} handed {sessions} session(s) to pid {to_pid}");
+            outln!("the sockets never closed; pid {pid} is draining what it had in flight");
             Ok(())
         }
         Ok(Response::Error { message }) => {
@@ -742,10 +750,10 @@ async fn run_upgrade(paths: &Paths, binary: Option<std::path::PathBuf>) -> Resul
 /// code rather than by reading the sentence.
 fn report_settled(settled: bool, done: &str, expected: &str) -> u8 {
     if settled {
-        println!("daemon {done}");
+        outln!("daemon {done}");
         return 0;
     }
-    println!(
+    outln!(
         "the service manager accepted the job, but the daemon was not {expected} after {} s",
         install::READY_TIMEOUT.as_secs()
     );
@@ -767,27 +775,27 @@ fn current_exe() -> Result<std::path::PathBuf> {
 
 fn print_install(report: &install::Report, dry_run: bool) {
     let verb = if dry_run { "would " } else { "" };
-    println!(
+    outln!(
         "{}briefcred install",
         if dry_run { "dry run: " } else { "" }
     );
     for dir in &report.directories {
-        println!("  {verb}provision  {} (0700)", dir.display());
+        outln!("  {verb}provision  {} (0700)", dir.display());
     }
     for (path, why) in &report.files {
-        println!("  {verb}write      {} ({why})", path.display());
+        outln!("  {verb}write      {} ({why})", path.display());
     }
     for path in &report.kept {
-        println!("  keep       {} (already present)", path.display());
+        outln!("  keep       {} (already present)", path.display());
     }
     for command in &report.commands {
-        println!("  {verb}run        {command}");
+        outln!("  {verb}run        {command}");
     }
     for command in &report.trust {
-        println!("  {verb}run        {command}");
+        outln!("  {verb}run        {command}");
     }
     if let Some(ca) = &report.ca {
-        println!(
+        outln!(
             "  ca         {} ({}, key in the {} store)",
             ca.fingerprint,
             if ca.generated {
@@ -802,42 +810,42 @@ fn print_install(report: &install::Report, dry_run: bool) {
         return;
     }
     if let Some(detail) = &report.trust_error {
-        println!("\nthe CA could not be trusted: {detail}");
-        println!("run this yourself, then 'briefcred ca show' to confirm:");
+        outln!("\nthe CA could not be trusted: {detail}");
+        outln!("run this yourself, then 'briefcred ca show' to confirm:");
         for line in &report.trust {
-            println!("  {line}");
+            outln!("  {line}");
         }
     }
     if report.ready {
-        println!("\nthe daemon is listening; 'briefcred daemon status' has the details");
+        outln!("\nthe daemon is listening; 'briefcred daemon status' has the details");
     } else {
-        println!(
+        outln!(
             "\nthe service manager accepted the job, but the daemon was not listening after {} s.",
             install::READY_TIMEOUT.as_secs()
         );
-        println!("check the daemon logs, then run 'briefcred daemon status'");
+        outln!("check the daemon logs, then run 'briefcred daemon status'");
     }
 }
 
 fn print_uninstall(removal: &install::Removal) {
-    println!("briefcred uninstall");
+    outln!("briefcred uninstall");
     for path in &removal.removed {
-        println!("  removed    {}", path.display());
+        outln!("  removed    {}", path.display());
     }
     for (path, why) in &removal.retained {
-        println!("  retained   {} ({why})", path.display());
+        outln!("  retained   {} ({why})", path.display());
     }
     if let Some(note) = &removal.note {
-        println!("  note       the service manager said: {note}");
+        outln!("  note       the service manager said: {note}");
     }
 }
 
 fn print_ca(status: &ca::Status) {
     let rfc3339 = &time::format_description::well_known::Rfc3339;
-    println!("briefcred root CA");
-    println!("  subject      {}", status.info.common_name);
-    println!("  fingerprint  sha256:{}", status.info.fingerprint_sha256);
-    println!(
+    outln!("briefcred root CA");
+    outln!("  subject      {}", status.info.common_name);
+    outln!("  fingerprint  sha256:{}", status.info.fingerprint_sha256);
+    outln!(
         "  valid        {} to {}",
         status
             .info
@@ -850,30 +858,31 @@ fn print_ca(status: &ca::Status) {
             .format(rfc3339)
             .unwrap_or_else(|_| status.info.not_after.to_string())
     );
-    println!("  certificate  {}", status.cert.display());
-    println!(
+    outln!("  certificate  {}", status.cert.display());
+    outln!(
         "  private key  {} ({} store)",
-        status.key_location, status.keystore
+        status.key_location,
+        status.keystore
     );
     match status.trusted {
-        Some(true) => println!("  trusted      yes"),
-        Some(false) => println!("  trusted      no; run 'briefcred install --trust-ca' to add it"),
-        None => println!("  trusted      unknown"),
+        Some(true) => outln!("  trusted      yes"),
+        Some(false) => outln!("  trusted      no; run 'briefcred install --trust-ca' to add it"),
+        None => outln!("  trusted      unknown"),
     }
 }
 
 fn print_regenerated(result: &ca::Regenerated, untrust_error: Option<&crate::Error>) {
-    println!("briefcred ca regenerate");
+    outln!("briefcred ca regenerate");
     match &result.previous_fingerprint {
-        Some(old) => println!("  replaced     sha256:{old}"),
-        None => println!("  replaced     nothing; there was no CA"),
+        Some(old) => outln!("  replaced     sha256:{old}"),
+        None => outln!("  replaced     nothing; there was no CA"),
     }
-    println!("  fingerprint  sha256:{}", result.info.fingerprint_sha256);
-    println!("  certificate  {}", result.cert.display());
+    outln!("  fingerprint  sha256:{}", result.info.fingerprint_sha256);
+    outln!("  certificate  {}", result.cert.display());
     if let Some(err) = untrust_error {
-        println!("  note         the old CA could not be untrusted: {err}");
+        outln!("  note         the old CA could not be untrusted: {err}");
     }
-    println!("\nevery certificate the old CA issued is now untrusted.");
+    outln!("\nevery certificate the old CA issued is now untrusted.");
 }
 
 fn print_status(status: &Response, sock: &Path) {
@@ -893,32 +902,32 @@ fn print_status(status: &Response, sock: &Path) {
     };
 
     if *handing_over {
-        println!("briefcred daemon is handing off to a new one");
+        outln!("briefcred daemon is handing off to a new one");
     } else {
-        println!("briefcred daemon is running");
+        outln!("briefcred daemon is running");
     }
-    println!("  version    {version}");
-    println!("  pid        {pid}");
-    println!("  uptime     {}", human_uptime(*uptime_secs));
-    println!(
+    outln!("  version    {version}");
+    outln!("  pid        {pid}");
+    outln!("  uptime     {}", human_uptime(*uptime_secs));
+    outln!(
         "  started    {}",
         started_at
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_else(|_| started_at.to_string())
     );
-    println!("  socket     {}", sock.display());
-    println!("  audit      {}", audit_path.display());
+    outln!("  socket     {}", sock.display());
+    outln!("  audit      {}", audit_path.display());
     match metrics_addr {
-        Some(addr) => println!("  metrics    http://{addr}/metrics"),
-        None => println!("  metrics    disabled"),
+        Some(addr) => outln!("  metrics    http://{addr}/metrics"),
+        None => outln!("  metrics    disabled"),
     }
     match proxy_addr {
-        Some(addr) => println!("  proxy      http://{addr}"),
-        None => println!("  proxy      disabled"),
+        Some(addr) => outln!("  proxy      http://{addr}"),
+        None => outln!("  proxy      disabled"),
     }
     match pg_proxy_addr {
-        Some(addr) => println!("  pg proxy   postgresql://{addr}"),
-        None => println!("  pg proxy   disabled"),
+        Some(addr) => outln!("  pg proxy   postgresql://{addr}"),
+        None => outln!("  pg proxy   disabled"),
     }
 }
 
