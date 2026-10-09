@@ -720,6 +720,13 @@ struct Fixture {
     session_id: String,
     token: String,
     session_key: briefcred_cli::session_key::SessionKey,
+    /// What the daemon minted, from its own answer to `Exec`.
+    ///
+    /// Not read back from the audit log: rows are written by a background
+    /// writer, so a row can still be on its way to disk when a test asks for
+    /// it, and a test that sent `ExecDone` with an empty list would revoke
+    /// nothing and wait for a revocation that was never asked for.
+    mint_ids: Vec<String>,
 }
 
 async fn start(policy_mode: &str) -> Fixture {
@@ -795,6 +802,7 @@ async fn start_with(profile_yaml: &str) -> Fixture {
         panic!("nothing was minted:\n{}", daemon.log());
     };
     let token = mints[0].fields["TOKEN"].expose().to_string();
+    let mint_ids = mints.iter().map(|mint| mint.mint_id.clone()).collect();
     assert_eq!(
         env["OPENAI_API_KEY"].expose(),
         token,
@@ -815,6 +823,7 @@ async fn start_with(profile_yaml: &str) -> Fixture {
         session_id,
         token,
         session_key,
+        mint_ids,
     }
 }
 
@@ -1116,7 +1125,7 @@ async fn a_revoked_token_stops_working_at_once() {
         .daemon
         .request(Request::ExecDone {
             session_id: fixture.session_id.clone(),
-            mint_ids: mint_ids(&fixture.daemon).await,
+            mint_ids: fixture.mint_ids.clone(),
             exit_code: Some(0),
             duration_ms: 1,
             hold_until_expiry: false,
@@ -1416,7 +1425,7 @@ async fn an_event_stream_is_audited_with_the_events_it_carried() {
 #[tokio::test]
 async fn an_event_stream_ends_when_its_grant_is_revoked() {
     let fixture = start_with(&stream_profile()).await;
-    let mint_ids = mint_ids(&fixture.daemon).await;
+    let mint_ids = fixture.mint_ids.clone();
 
     // `/forever` never ends on its own, so a stream that ends at all ended
     // because briefcred ended it.
@@ -1690,7 +1699,7 @@ async fn a_websocket_ends_when_its_grant_is_revoked() {
     use tokio_tungstenite::tungstenite::Message;
 
     let fixture = start_with(&stream_profile()).await;
-    let mint_ids = mint_ids(&fixture.daemon).await;
+    let mint_ids = fixture.mint_ids.clone();
     let mut socket = fixture
         .client
         .websocket("/ws", &bearer(&fixture.token))
@@ -1932,16 +1941,6 @@ async fn row_written(daemon: &Daemon, event: &str) -> bool {
 /// Wait until a `ProxyStream` row has reached the disk.
 async fn stream_row_written(daemon: &Daemon) -> bool {
     row_written(daemon, "proxy_stream").await
-}
-
-/// The mint identifiers the daemon recorded for this session.
-async fn mint_ids(daemon: &Daemon) -> Vec<String> {
-    daemon
-        .audit_rows()
-        .iter()
-        .filter(|row| row["event"] == "mint")
-        .filter_map(|row| row["mint_id"].as_str().map(str::to_string))
-        .collect()
 }
 
 // ------------------------------------------------------------------- HTTP/2
@@ -2484,7 +2483,7 @@ async fn a_grpc_stream_ends_when_its_grant_is_revoked() {
         .daemon
         .request(Request::ExecDone {
             session_id: fixture.session_id.clone(),
-            mint_ids: mint_ids(&fixture.daemon).await,
+            mint_ids: fixture.mint_ids.clone(),
             exit_code: Some(0),
             duration_ms: 1,
             hold_until_expiry: false,

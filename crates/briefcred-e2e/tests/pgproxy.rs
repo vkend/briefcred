@@ -125,6 +125,9 @@ struct Fixture {
     session_id: String,
     database_url: String,
     token: String,
+    /// What the daemon minted, from its own answer to `Exec` rather than the
+    /// audit log, whose rows a background writer may not have flushed yet.
+    mint_ids: Vec<String>,
     /// Kept alive for the length of the test; dropping it stops the cluster.
     _cluster: PgCluster,
 }
@@ -212,6 +215,7 @@ async fn start_with(test: &str, ttl_secs: u64, quota: &str) -> Option<Fixture> {
 
     let database_url = env["DATABASE_URL"].expose().to_string();
     let token = mints[0].fields["PGPASSWORD"].expose().to_string();
+    let mint_ids = mints.iter().map(|mint| mint.mint_id.clone()).collect();
     assert!(
         token.starts_with("bc."),
         "the password handed to the subprocess must be a synthetic token"
@@ -227,6 +231,7 @@ async fn start_with(test: &str, ttl_secs: u64, quota: &str) -> Option<Fixture> {
         session_id,
         database_url,
         token,
+        mint_ids,
         _cluster: cluster,
     })
 }
@@ -268,16 +273,6 @@ impl Fixture {
             .await
             .expect("the proxy accepts a good token");
         (client, tokio::spawn(connection))
-    }
-
-    /// The mint identifiers the daemon recorded for this session.
-    fn mint_ids(&self) -> Vec<String> {
-        self.daemon
-            .audit_rows()
-            .iter()
-            .filter(|row| row["event"] == "mint")
-            .filter_map(|row| row["mint_id"].as_str().map(str::to_string))
-            .collect()
     }
 
     /// Connect through the proxy as a driver would, with an explicit password.
@@ -576,7 +571,7 @@ async fn a_revoked_grant_stops_opening_connections() {
         .daemon
         .request(Request::ExecDone {
             session_id: fixture.session_id.clone(),
-            mint_ids: fixture.mint_ids(),
+            mint_ids: fixture.mint_ids.clone(),
             exit_code: Some(0),
             duration_ms: 1,
             hold_until_expiry: false,
@@ -644,7 +639,7 @@ async fn revoking_a_grant_closes_the_connection_it_already_opened() {
         .daemon
         .request(Request::ExecDone {
             session_id: fixture.session_id.clone(),
-            mint_ids: fixture.mint_ids(),
+            mint_ids: fixture.mint_ids.clone(),
             exit_code: Some(0),
             duration_ms: 1,
             hold_until_expiry: false,
