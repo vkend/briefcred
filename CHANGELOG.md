@@ -6,6 +6,8 @@ All notable changes to briefcred are recorded here. The format follows
 
 ## Unreleased
 
+## 0.1.0 - 2026-10-17
+
 ### Changed
 
 - **briefcred's macOS identifiers moved to `io.github.vkend.briefcred`.** The
