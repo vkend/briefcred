@@ -136,15 +136,44 @@ pub fn run_tolerantly(plan: &Plan) -> Option<String> {
 }
 
 /// Whether the `briefcred-daemon` binary sits next to this executable.
+///
+/// The path is what the LaunchAgent records, so it has to survive a package
+/// upgrade. See [`version_independent`].
 pub fn daemon_binary(next_to: &Path) -> Result<std::path::PathBuf> {
     let candidate = next_to
         .parent()
         .unwrap_or(Path::new("."))
         .join("briefcred-daemon");
     if candidate.is_file() {
-        Ok(candidate)
+        Ok(version_independent(&candidate))
     } else {
         Err(Error::DaemonBinaryMissing(candidate))
+    }
+}
+
+/// The Homebrew `opt` path for a binary inside a versioned Cellar directory.
+///
+/// `brew upgrade` installs into a new `Cellar/<formula>/<version>` and
+/// `brew cleanup` deletes the old one, so a unit naming the Cellar path points
+/// at a file that is gone one upgrade later. `<prefix>/opt/<formula>` is the
+/// symlink Homebrew keeps pointed at the current version. A path that is not
+/// in a Cellar, or whose `opt` twin does not exist, comes back unchanged.
+pub fn version_independent(binary: &Path) -> std::path::PathBuf {
+    let parts: Vec<_> = binary.components().collect();
+    let Some(cellar) = parts.iter().rposition(|c| c.as_os_str() == "Cellar") else {
+        return binary.to_path_buf();
+    };
+    // Cellar, formula, version, then at least one component below it.
+    if parts.len() < cellar + 4 {
+        return binary.to_path_buf();
+    }
+    let prefix: std::path::PathBuf = parts[..cellar].iter().collect();
+    let below: std::path::PathBuf = parts[cellar + 3..].iter().collect();
+    let opt = prefix.join("opt").join(parts[cellar + 1]).join(below);
+    if opt.is_file() {
+        opt
+    } else {
+        binary.to_path_buf()
     }
 }
 
@@ -302,5 +331,45 @@ mod tests {
         std::fs::write(temp.path().join("briefcred-daemon"), b"#!/bin/sh\n").unwrap();
         let found = daemon_binary(&temp.path().join("briefcred")).unwrap();
         assert_eq!(found, temp.path().join("briefcred-daemon"));
+    }
+
+    /// A Homebrew prefix with `briefcred-daemon` in one Cellar version and
+    /// the `opt` symlink pointed at it.
+    fn homebrew_prefix() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("Cellar/briefcred/0.1.0/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("briefcred-daemon"), b"#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(temp.path().join("opt")).unwrap();
+        std::os::unix::fs::symlink(
+            temp.path().join("Cellar/briefcred/0.1.0"),
+            temp.path().join("opt/briefcred"),
+        )
+        .unwrap();
+        (temp, bin)
+    }
+
+    #[test]
+    fn a_daemon_in_a_cellar_is_recorded_by_its_opt_path() {
+        let (temp, bin) = homebrew_prefix();
+        let found = daemon_binary(&bin.join("briefcred")).unwrap();
+        assert_eq!(
+            found,
+            temp.path().join("opt/briefcred/bin/briefcred-daemon")
+        );
+    }
+
+    #[test]
+    fn a_cellar_path_with_no_opt_twin_is_left_alone() {
+        let (temp, bin) = homebrew_prefix();
+        std::fs::remove_file(temp.path().join("opt/briefcred")).unwrap();
+        let found = daemon_binary(&bin.join("briefcred")).unwrap();
+        assert_eq!(found, bin.join("briefcred-daemon"));
+    }
+
+    #[test]
+    fn a_path_outside_a_cellar_is_left_alone() {
+        let path = Path::new("/opt/homebrew/bin/briefcred-daemon");
+        assert_eq!(version_independent(path), path);
     }
 }

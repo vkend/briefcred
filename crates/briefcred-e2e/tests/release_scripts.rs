@@ -152,3 +152,27 @@ fn the_committed_formula_still_has_the_two_lines_the_stamp_targets() {
         );
     }
 }
+
+/// The formula carries nothing that goes stale or competes with `install`.
+///
+/// A literal `version` is a line the stamp does not rewrite, so every release
+/// after the first would ship a formula naming the wrong version. A `service`
+/// block lets `brew services` load a second LaunchAgent beside the one
+/// `briefcred install` writes, and two daemons cannot share one socket.
+#[test]
+fn the_committed_formula_has_no_version_literal_and_no_service_block() {
+    let formula = std::fs::read_to_string(
+        workspace_root()
+            .join("release")
+            .join("Formula")
+            .join("briefcred.rb"),
+    )
+    .expect("read the formula");
+
+    for key in ["  version ", "  service do"] {
+        assert!(
+            !formula.lines().any(|l| l.starts_with(key)),
+            "the formula must not have a line starting `{key}`"
+        );
+    }
+}
