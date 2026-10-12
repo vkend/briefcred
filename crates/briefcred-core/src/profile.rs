@@ -237,7 +237,7 @@ pub struct CredentialSpec {
     /// minter but one.
     #[serde(default)]
     #[schemars(with = "serde_json::Value")]
-    pub config: serde_yaml_ng::Value,
+    pub config: serde_json::Value,
 }
 
 impl CredentialSpec {
@@ -376,7 +376,7 @@ impl Profile {
     /// minters, and the daemon runs [`Profile::validate`] on top.
     pub fn from_yaml_str(yaml: &str) -> Result<Profile> {
         let profile: Profile =
-            serde_yaml_ng::from_str(yaml).map_err(|e| Error::profile(e.to_string()))?;
+            crate::yaml::from_str(yaml).map_err(|e| Error::profile(e.to_string()))?;
         profile.validate_schema()?;
         Ok(profile)
     }
@@ -755,7 +755,7 @@ credentials:
         let spec = profile.credential("db").unwrap();
         assert_eq!(spec.ttl_secs, 900);
         assert_eq!(spec.ttl(), Duration::from_secs(900));
-        assert_eq!(spec.config, serde_yaml_ng::Value::Null);
+        assert_eq!(spec.config, serde_json::Value::Null);
     }
 
     #[test]

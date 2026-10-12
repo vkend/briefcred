@@ -12,7 +12,6 @@ publish = false
 briefcred-core.workspace = true
 briefcred-proto.workspace = true
 serde_json.workspace = true
-serde_yaml_ng.workspace = true
 getrandom.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true

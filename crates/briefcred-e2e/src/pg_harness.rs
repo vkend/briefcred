@@ -268,12 +268,12 @@ impl PgCluster {
     ///
     /// `user` selects which master role the minter authenticates as; `grants`
     /// is the YAML body of `role_template.grants`.
-    pub fn minter_config(&self, user: &str, grants: &str) -> serde_yaml_ng::Value {
+    pub fn minter_config(&self, user: &str, grants: &str) -> serde_json::Value {
         let yaml = format!(
             "host: 127.0.0.1\nport: {}\ndbname: {DBNAME}\nuser: {user}\nsslmode: disable\nrole_template:\n  grants:\n{grants}",
             self.port
         );
-        serde_yaml_ng::from_str(&yaml).expect("harness minter config is valid YAML")
+        briefcred_core::yaml::from_str(&yaml).expect("harness minter config is valid YAML")
     }
 
     /// How many `briefcred_t_%` roles the cluster still has.
