@@ -504,6 +504,27 @@ mod tests {
         vec![dir.to_path_buf()]
     }
 
+    /// [`Helper::start`], retried while Linux says the script is busy.
+    ///
+    /// A test thread that forks between [`script_helper`] writing its file and
+    /// closing it leaves a child holding the file open for writing until that
+    /// child execs, and `exec` of a file open for writing fails with
+    /// `ETXTBSY`. The race is in the test, which writes a binary and runs it
+    /// at once; a shipping daemon runs helpers that were installed long ago.
+    fn start(kind: &str, dirs: &[PathBuf]) -> Helper {
+        for _ in 0..50 {
+            match Helper::start(kind, dirs) {
+                Err(HelperFailure::Spawn { source, .. })
+                    if source.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => return other.unwrap(),
+            }
+        }
+        panic!("{kind} stayed busy for a second");
+    }
+
     #[tokio::test]
     async fn a_helper_that_answers_is_read_back_on_the_matching_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -515,7 +536,7 @@ mod tests {
 done"#,
         );
 
-        let helper = Helper::start("echo", &dirs).unwrap();
+        let helper = start("echo", &dirs);
         let result = helper
             .call(HelperParams::Shutdown(ShutdownParams {}))
             .await
@@ -535,7 +556,7 @@ done"#,
 done"#,
         );
 
-        let helper = Helper::start("confused", &dirs).unwrap();
+        let helper = start("confused", &dirs);
         let err = helper
             .call(HelperParams::Shutdown(ShutdownParams {}))
             .await
@@ -555,7 +576,7 @@ done"#,
 done"#,
         );
 
-        let helper = Helper::start("grumpy", &dirs).unwrap();
+        let helper = start("grumpy", &dirs);
         let err = helper
             .call(HelperParams::Shutdown(ShutdownParams {}))
             .await
@@ -579,7 +600,7 @@ done"#,
 done"#,
         );
 
-        let helper = Helper::start("flood", &dirs).unwrap();
+        let helper = start("flood", &dirs);
         let err = helper
             .call(HelperParams::Shutdown(ShutdownParams {}))
             .await
@@ -606,7 +627,7 @@ done"#,
 done"#,
         );
 
-        let helper = Helper::start("chatty", &dirs).unwrap();
+        let helper = start("chatty", &dirs);
         let err = helper
             .call(HelperParams::Shutdown(ShutdownParams {}))
             .await
@@ -621,7 +642,7 @@ done"#,
         let dir = tempfile::tempdir().unwrap();
         let dirs = script_helper(dir.path(), "quitter", "exit 0");
 
-        let helper = Helper::start("quitter", &dirs).unwrap();
+        let helper = start("quitter", &dirs);
         let err = helper
             .call(HelperParams::Shutdown(ShutdownParams {}))
             .await

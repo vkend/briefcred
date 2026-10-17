@@ -19,7 +19,6 @@ class Briefcred < Formula
   url "https://github.com/vkend/briefcred/releases/download/v0.1.0/briefcred-0.1.0-macos-universal.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license any_of: ["MIT", "Apache-2.0"]
-  version "0.1.0"
 
   # A bottle would be a second copy of the same universal binaries. The release
   # tarball is already built for both architectures and notarised, so pouring
@@ -42,35 +41,34 @@ class Briefcred < Formula
     doc.install "CHANGELOG.md" if File.exist?("CHANGELOG.md")
   end
 
-  # The LaunchAgent, expressed the way Homebrew wants it. `brew services start
-  # briefcred` writes a plist equivalent to the one `briefcred service install`
-  # generates: same program, same label shape, same log destinations.
+  # No `service` block, on purpose. `brew services` would load a second
+  # LaunchAgent, `homebrew.mxcl.briefcred`, beside the
+  # `io.github.vkend.briefcred` one `briefcred install` writes, and the two
+  # daemons would fight over one socket. `briefcred install` is the only way in
+  # because it also does what a `service` block cannot: the CA, the starter
+  # config, and waiting until the daemon is actually listening.
   #
-  # `run_type :immediate` with `keep_alive` is the LaunchAgent's `RunAtLoad`
-  # plus `KeepAlive`: the daemon has to be up before the first agent asks it
-  # for a credential, and a broker that stays down after a crash is one whose
-  # every profile has silently stopped working.
-  service do
-    run [opt_bin/"briefcred-daemon"]
-    keep_alive true
-    run_type :immediate
-    log_path "#{Dir.home}/Library/Application Support/briefcred/logs/daemon.log"
-    error_log_path "#{Dir.home}/Library/Application Support/briefcred/logs/daemon.log"
-  end
+  # No `version` either: Homebrew reads it from the `url`, which the release
+  # workflow stamps. A literal here would be a third line the stamp does not
+  # touch, left saying 0.1.0 forever.
 
   def caveats
     <<~EOS
-      briefcred needs two things before it can broker anything:
+      Start the daemon and trust its root CA (it asks for your password once):
 
-        briefcred install --trust-ca    # installs the per-machine root CA
-        briefcred profile bootstrap     # writes a profile and stores its master
+        briefcred install --trust-ca
+        briefcred profile bootstrap
 
-      Installing the CA needs sudo, and is what lets the proxy terminate TLS
-      for the subprocesses you wrap. Nothing else on the machine trusts it.
+      The CA is what lets the proxy terminate TLS for the subprocesses you
+      wrap. Nothing else on the machine trusts it.
 
-      Start the daemon with `brew services start briefcred`, or let
-      `briefcred install` write the LaunchAgent itself if you would rather it
-      were not managed by Homebrew.
+      After `brew upgrade briefcred`, move the running daemon onto the new
+      binary without dropping a session:
+
+        briefcred daemon upgrade
+
+      Do not use `brew services` for briefcred; `briefcred install` manages
+      the LaunchAgent.
     EOS
   end
 

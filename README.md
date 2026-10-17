@@ -1430,9 +1430,15 @@ it runs.
 
 `release/Formula/briefcred.rb` is the Homebrew formula. It installs all five
 binaries — `briefcred` and `briefcred-daemon`, the two helper processes the
-daemon spawns to mint, and `briefcred-hook` for the agent — and carries a
-`service` block so `brew services start briefcred` runs the daemon as a
-LaunchAgent, equivalently to what `briefcred install` writes.
+daemon spawns to mint, and `briefcred-hook` for the agent. It deliberately has
+no `service` block: `brew services` would load a second LaunchAgent beside the
+one `briefcred install` writes, and two daemons cannot share one socket. After
+`brew install`, run `briefcred install --trust-ca`; after `brew upgrade`, run
+`briefcred daemon upgrade` to move the running daemon onto the new binary.
+`briefcred install` writes the daemon's `opt` path
+(`$(brew --prefix)/opt/briefcred/bin/briefcred-daemon`) into the LaunchAgent
+rather than its versioned Cellar path, so `brew cleanup` cannot delete the
+binary the agent runs.
 
 Its `url` and `sha256` in the tree are placeholders, because the checksum of a
 release that has not been built yet does not exist. The workflow runs
