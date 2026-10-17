@@ -177,8 +177,9 @@ pub async fn run_with(startup: Startup) -> Result<()> {
     let bound_metrics = if config.metrics_enabled {
         Some(match adopted.remove(&Slot::Metrics) {
             Some(fd) => adopt_tcp(fd, "metrics")?,
-            None => metrics::bind(config.metrics_port)
-                .map_err(|e| Error::io("bind the metrics listener on", paths.root(), e))?,
+            None => metrics::bind(config.metrics_port).map_err(|e| {
+                Error::bind("metrics listener", config.metrics_port, "metrics_port", e)
+            })?,
         })
     } else {
         None
@@ -217,7 +218,7 @@ pub async fn run_with(startup: Startup) -> Result<()> {
         let (listener, addr) = match adopted.remove(&Slot::Proxy) {
             Some(fd) => adopt_tcp(fd, "proxy")?,
             None => proxy::listener::bind(config.proxy_port)
-                .map_err(|e| Error::io("bind the proxy listener on", paths.root(), e))?,
+                .map_err(|e| Error::bind("proxy listener", config.proxy_port, "proxy_port", e))?,
         };
         // The key store is opened but not read: see `ProxyIssuer`, which loads
         // the signing key on the first token rather than at startup, so a
@@ -256,7 +257,12 @@ pub async fn run_with(startup: Startup) -> Result<()> {
             let (listener, addr) = match adopted.remove(&Slot::PgProxy) {
                 Some(fd) => adopt_tcp(fd, "pg_proxy")?,
                 None => pgproxy::listener::bind(config.pg_proxy_port).map_err(|e| {
-                    Error::io("bind the postgres proxy listener on", paths.root(), e)
+                    Error::bind(
+                        "postgres proxy listener",
+                        config.pg_proxy_port,
+                        "pg_proxy_port",
+                        e,
+                    )
                 })?,
             };
             Some((listener, addr, Arc::clone(issuer)))
