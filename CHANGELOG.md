@@ -38,11 +38,22 @@ All notable changes to briefcred are recorded here. The format follows
   A parse error is now worded differently, on one line ending
   `at line L, column C`. And a bare number with a leading zero, such as `0755`,
   inside a `config` block reads as a float; quote it if it is meant as text.
-- **rustls 0.23.45.** The lockfile moves off 0.23.43, which accepted TLS 1.3
+- **rustls 0.23.46.** The lockfile moves off 0.23.43, which accepted TLS 1.3
   handshake messages sent at the wrong encryption level
   ([RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285)).
   The handshake transcript was still authenticated, so this did not let a
-  network attacker alter or complete a handshake.
+  network attacker alter or complete a handshake. 0.23.46 also fixes four
+  advisories against 0.23.45:
+  [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346)
+  (`Debug` output of client session values exposed TLS secrets),
+  [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347)
+  (buffered data sent to the outer server after an ECH rejection),
+  [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348)
+  (Brotli certificate decompression could allocate up to 1 GiB before
+  authentication) and
+  [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349)
+  (an unauthenticated ServerHello could downgrade later connections to
+  classical key exchange).
 
 ### Added
 
