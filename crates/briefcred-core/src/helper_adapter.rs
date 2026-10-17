@@ -73,7 +73,7 @@ impl MinterAdapter {
             mint_id: mint_id(&params.mint_id)?,
             profile: params.profile,
             credential: params.credential,
-            config: to_yaml(params.config)?,
+            config: params.config,
             master: params.master.into_zeroizing(),
             ttl: std::time::Duration::from_secs(params.ttl_secs),
         };
@@ -101,7 +101,7 @@ impl MinterAdapter {
     async fn revoke(&self, params: RevokeParams) -> Result<RevokeResult, HelperError> {
         let ctx = RevokeCtx {
             mint_id: mint_id(&params.mint_id)?,
-            config: to_yaml(params.config)?,
+            config: params.config,
             master: params.master.into_zeroizing(),
             revoke_token: params.revoke_token,
         };
@@ -110,7 +110,7 @@ impl MinterAdapter {
 
     async fn reconcile(&self, params: ReconcileParams) -> Result<ReconcileResult, HelperError> {
         let ctx = ReconcileCtx {
-            config: to_yaml(params.config)?,
+            config: params.config,
             master: params.master.into_zeroizing(),
         };
         let report = self.minter.reconcile(ctx).await.map_err(backend)?;
@@ -160,17 +160,6 @@ fn mint_id(raw: &str) -> Result<MintId, HelperError> {
     raw.parse().map_err(|e| HelperError {
         code: CODE_INVALID_PARAMS,
         message: format!("{e}"),
-    })
-}
-
-/// The wire carries a credential's `config` as JSON and a minter reads YAML.
-///
-/// Every JSON document is a YAML document, so this is a re-encoding rather
-/// than a conversion, and a config that does not survive it was never valid.
-fn to_yaml(value: serde_json::Value) -> Result<serde_yaml_ng::Value, HelperError> {
-    serde_yaml_ng::to_value(value).map_err(|e| HelperError {
-        code: CODE_INVALID_PARAMS,
-        message: format!("config is not a usable document: {e}"),
     })
 }
 

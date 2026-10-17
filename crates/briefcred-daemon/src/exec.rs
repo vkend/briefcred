@@ -448,7 +448,7 @@ fn issue(
     grant: ProxyGrant<'_>,
     fields: HttpFields,
 ) -> Result<MintOutcome, String> {
-    let config = to_json(&spec.config)?;
+    let config = spec.config.clone();
     let mint_id = MintId::generate();
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let issued = grant
@@ -569,7 +569,7 @@ async fn mint_one(
     master: &Zeroizing<String>,
     helpers: &MinterSet,
 ) -> Result<MintOutcome, String> {
-    let config = to_json(&spec.config)?;
+    let config = spec.config.clone();
     let mint_id = MintId::generate();
 
     let helper = helpers
@@ -682,14 +682,7 @@ pub async fn revoke_one(
         );
         return RevokeOutcome::Revoked;
     }
-    // The queue persists a credential's config as JSON; a minter reads YAML,
-    // and an in-daemon one is built from it. Every JSON document is a YAML
-    // document, so a config that does not survive this was never valid.
-    let config = match serde_yaml_ng::to_value(&entry.config) {
-        Ok(config) => config,
-        Err(err) => return RevokeOutcome::failed(err.to_string()),
-    };
-    let helper = match helpers.get(&entry.kind, &config).await {
+    let helper = match helpers.get(&entry.kind, &entry.config).await {
         Ok(helper) => helper,
         Err(err) => return RevokeOutcome::failed(err.to_string()),
     };
@@ -736,11 +729,6 @@ pub fn outcome_of(result: RevokeResult) -> RevokeOutcome {
         ),
         other => RevokeOutcome::failed(format!("unknown revoke outcome `{other}`")),
     }
-}
-
-/// Convert a credential's YAML `config` to the JSON the helper wire carries.
-fn to_json(config: &serde_yaml_ng::Value) -> Result<serde_json::Value, String> {
-    serde_json::to_value(config).map_err(|e| format!("config is not representable as JSON: {e}"))
 }
 
 #[cfg(test)]

@@ -547,11 +547,11 @@ impl Setup {
     fn config_yaml(&self) -> Option<String> {
         let text = match self {
             Setup::HttpBearer | Setup::HttpBasic => return None,
-            Setup::HttpHeader(config) => serde_yaml_ng::to_string(config),
-            Setup::PostgresDynamic(config) => serde_yaml_ng::to_string(config),
-            Setup::PostgresProxy(config) => serde_yaml_ng::to_string(config),
-            Setup::AwsSts(config) => serde_yaml_ng::to_string(config),
-            Setup::SshCert(config) => serde_yaml_ng::to_string(config),
+            Setup::HttpHeader(config) => briefcred_core::yaml::to_string(config),
+            Setup::PostgresDynamic(config) => briefcred_core::yaml::to_string(config),
+            Setup::PostgresProxy(config) => briefcred_core::yaml::to_string(config),
+            Setup::AwsSts(config) => briefcred_core::yaml::to_string(config),
+            Setup::SshCert(config) => briefcred_core::yaml::to_string(config),
         };
         Some(text.expect("a minter config serialises"))
     }
@@ -712,7 +712,7 @@ const POLICY_NOTES: &[&str] = &[
 
 /// Build the profile document.
 ///
-/// Emitted as text rather than through `serde_yaml_ng` so the file a user opens
+/// Emitted as text rather than through the YAML serialiser so the file a user opens
 /// afterwards has the comments that tell them what to change. A generated
 /// config with no comments is one nobody edits. The `config` block is the one
 /// part serialised, because its field names belong to the minter.
@@ -896,11 +896,11 @@ fn comment(yaml: &mut String, indent: usize, lines: &[&str]) {
 
 /// `value` as a YAML scalar, quoted exactly when YAML needs it to be.
 ///
-/// Through `serde_yaml_ng` rather than by hand, because the cases are not
+/// Through the YAML serialiser rather than by hand, because the cases are not
 /// obvious: a description of `yes`, a database called `0123`, or a role ARN
 /// with a `: ` in it would each load as something other than what was typed.
 fn scalar<T: Serialize + ?Sized>(value: &T) -> String {
-    serde_yaml_ng::to_string(value)
+    briefcred_core::yaml::to_string(value)
         .expect("a scalar serialises")
         .trim_end()
         .to_string()
@@ -913,7 +913,7 @@ fn scalar<T: Serialize + ?Sized>(value: &T) -> String {
 /// is a role ARN" would drift, and the one the daemon enforces is the one that
 /// matters.
 fn check<T: Serialize>(kind: &str, config: &T) -> std::result::Result<(), String> {
-    let value = serde_yaml_ng::to_value(config).map_err(|e| e.to_string())?;
+    let value = serde_json::to_value(config).map_err(|e| e.to_string())?;
     Registry::discover()
         .validate(kind, &value)
         .map_err(|e| e.to_string())

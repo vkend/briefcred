@@ -20,6 +20,22 @@ All notable changes to briefcred are recorded here. The format follows
 
 ### Security
 
+- **YAML is parsed in safe Rust.** `serde_yaml_ng` and the `unsafe-libyaml`
+  parser under it are replaced by `serde-saphyr`. `unsafe-libyaml` is a
+  machine translation of libyaml's C into unsafe Rust; it is archived, and
+  [RUSTSEC-2024-0449](https://rustsec.org/advisories/RUSTSEC-2024-0449) now
+  marks it unmaintained, which `cargo deny` refuses. A profile is the most
+  exposed input the daemon parses, since a registry can supply one. Every
+  document goes through `briefcred_core::yaml`, so profiles, hook rules and
+  tests share one set of parser options. A credential's `config` block is
+  now a `serde_json::Value`, which is what the helper wire carried anyway, so
+  the YAML-to-JSON re-encoding on each side of it is gone.
+
+  What a profile means is unchanged: `yes`, `no`, `on` and `off` are still
+  strings, and a duplicate key is still an error. Two things look different.
+  A parse error is now worded differently, on one line ending
+  `at line L, column C`. And a bare number with a leading zero, such as `0755`,
+  inside a `config` block reads as a float; quote it if it is meant as text.
 - **rustls 0.23.45.** The lockfile moves off 0.23.43, which accepted TLS 1.3
   handshake messages sent at the wrong encryption level
   ([RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285)).
@@ -650,7 +666,7 @@ All notable changes to briefcred are recorded here. The format follows
   it — `cargo deny` is configured with `unmaintained = "all"`, so a transitive
   one would be reported. Recorded here because "the unmaintained dependency was
   removed" would be the wrong summary: the deprecated *wrapper* was replaced
-  and the parser it wraps is unchanged.
+  and the parser it wraps is unchanged. (Since replaced; see Security above.)
 - **`rustls-pemfile` removed**, also unmaintained, in favour of the `pem`
   module of `rustls-pki-types`, which was already a dependency.
 - **The AWS SDK clients no longer pull the legacy TLS stack.** Their default

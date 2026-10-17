@@ -35,6 +35,7 @@ pub mod session_env;
 pub mod source;
 pub mod traits;
 pub mod types;
+pub mod yaml;
 
 pub use ca::CertificateAuthority;
 pub use error::{Error, Result};
