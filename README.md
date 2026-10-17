@@ -30,27 +30,27 @@ something that is only useful on your terms:
 
 ## Quick start
 
-macOS, from source (there is no packaged release yet):
+macOS, with Homebrew:
 
 ```sh
-for crate in cli daemon hook helper-postgres helper-sts; do
-    cargo install --locked --path crates/briefcred-$crate
-done
+brew install vkend/briefcred/briefcred
 briefcred install --trust-ca          # start the daemon, trust its local CA
 briefcred profile bootstrap           # e.g. an "openai" profile for an API key; the key goes in the keychain
 briefcred exec --profile=openai -- python agent.py
 ```
 
-[Install and run](#install-and-run) has the details, and
+The binaries are universal (Apple silicon and Intel), signed with a Developer
+ID and notarised by Apple. [Install and run](#install-and-run) has the details,
+including building from source, and
 [`examples/profiles/`](examples/profiles/) has ready-made profiles for OpenAI,
 Anthropic, GitHub, Stripe, a Postgres warehouse and an SSH bastion.
 
 See `ROADMAP.md` for the plan, `ARCHITECTURE.md` for the shape, and
 `THREAT_MODEL.md` for what is and is not guaranteed.
 
-**Status: alpha, unreleased.** Every roadmap phase is implemented and tested,
-but there is no tagged release yet, the configuration format and the CLI may
-still change before 1.0, and it has not had an outside security review. In one
+**Status: alpha.** Every roadmap phase is implemented and tested, and 0.1.0 is
+the first release, but the configuration format and the CLI may still change
+before 1.0, and it has not had an outside security review. In one
 sentence each, what is implemented:
 
 - **Minting.** `postgres-dynamic` roles, `aws-sts` sessions and `ssh-cert`
@@ -147,9 +147,35 @@ BRIEFCRED_PG_BIN=/usr/lib/postgresql/16/bin cargo test --workspace
 
 ## Install and run
 
-There is no packaged release yet, so install from source. All five binaries
-must land in the same directory, because `briefcred` finds the daemon beside
-itself and the daemon finds its helpers beside itself:
+Install with Homebrew, from the [`vkend/briefcred`](https://github.com/vkend/homebrew-briefcred)
+tap:
+
+```sh
+brew install vkend/briefcred/briefcred
+```
+
+It installs all five binaries — `briefcred`, `briefcred-daemon`, the two
+helpers the daemon spawns to mint, and `briefcred-hook` — from the signed and
+notarised release tarball. Then run `briefcred install`, below. Don't use
+`brew services` for briefcred: `briefcred install` writes and manages the
+LaunchAgent, and a second agent from `brew services` would fight it for the
+socket.
+
+After `brew upgrade briefcred`, move the running daemon onto the new binary
+without dropping a session:
+
+```sh
+briefcred daemon upgrade
+```
+
+The tarballs are also attached to each
+[GitHub release](https://github.com/vkend/briefcred/releases), with their
+SHA-256 sums, for installing by hand.
+
+### From source
+
+All five binaries must land in the same directory, because `briefcred` finds
+the daemon beside itself and the daemon finds its helpers beside itself:
 
 ```sh
 for crate in cli daemon hook helper-postgres helper-sts; do
@@ -157,8 +183,9 @@ for crate in cli daemon hook helper-postgres helper-sts; do
 done
 ```
 
-A Homebrew formula is ready (see [Releases and packaging](#releases-and-packaging))
-and will be published with the first release.
+Don't install both a source build and the Homebrew formula: whichever
+`briefcred` comes first on `PATH` is the one that runs, and `briefcred install`
+records the daemon that sits beside it.
 
 `briefcred install` provisions the directory layout, writes a starter
 `daemon.toml`, installs the service unit, and starts the daemon. It is
@@ -1447,7 +1474,8 @@ the tarball it just built, and uploads the stamped formula as a release asset
 named `briefcred.rb`.
 
 **Publishing the tap is a separate, manual step.** The tap is its own
-repository, created out of band, and the release workflow holds no token for
+repository, [`vkend/homebrew-briefcred`](https://github.com/vkend/homebrew-briefcred),
+and the release workflow holds no token for
 it: updating it means copying the `briefcred.rb` asset from the release into
 the tap and committing it. That is one deliberate manual act per release rather
 than a release workflow with write access to a second repository.
@@ -1470,10 +1498,12 @@ The workflow is the release; this is the order the human part goes in.
 5. **Watch the first workflow run**, because it is the live test of the release
    path. An unsigned release is a successful run, not a failed one — check the
    notes say which kind it produced.
-6. **Audit the formula before publishing the tap.** Download the `briefcred.rb`
-   asset and run `brew audit --strict --formula ./briefcred.rb` on a machine
-   with a working Homebrew. Then copy it into the tap repository and commit;
-   nothing automates that step, and deliberately so.
+6. **Update the tap and audit it.** Copy the release's `briefcred.rb` asset to
+   `Formula/briefcred.rb` in the tap repository and commit it; nothing
+   automates that step, and deliberately so. Then run
+   `brew audit --strict --online --formula vkend/briefcred/briefcred`.
+   Homebrew no longer audits a formula by file path, so the audit runs
+   against the tap; `--online` also checks that the release URL resolves.
 
 ## Security
 
