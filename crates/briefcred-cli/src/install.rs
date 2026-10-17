@@ -34,8 +34,12 @@ pub const STARTER_CONFIG: &str = "\
 # and streams it was already serving before it exits.
 # handoff_drain_secs = 30
 
-# The loopback port for the Prometheus endpoint. 0 asks for a free port.
+# The loopback ports briefcred listens on. 0 asks for a free port. They are
+# shared by every account on the machine, so a second account's daemon needs
+# its own; 'briefcred install' picks free ones when the defaults are taken.
 # metrics_port = 9317
+# proxy_port = 9318
+# pg_proxy_port = 9319
 
 # Whether to serve the Prometheus endpoint at all.
 # metrics_enabled = true
@@ -45,6 +49,103 @@ pub const STARTER_CONFIG: &str = "\
 # [ca]
 # keystore = \"keychain\"
 ";
+
+/// One of the daemon's loopback listeners, as `daemon.toml` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultPort {
+    /// The `daemon.toml` key.
+    pub key: &'static str,
+    /// The port the daemon uses when the key is absent.
+    pub port: u16,
+}
+
+/// The three listeners, in the order the starter config lists them.
+pub const DEFAULT_PORTS: [DefaultPort; 3] = [
+    DefaultPort {
+        key: "metrics_port",
+        port: briefcred_core::ports::DEFAULT_METRICS_PORT,
+    },
+    DefaultPort {
+        key: "proxy_port",
+        port: briefcred_core::ports::DEFAULT_PROXY_PORT,
+    },
+    DefaultPort {
+        key: "pg_proxy_port",
+        port: briefcred_core::ports::DEFAULT_PG_PROXY_PORT,
+    },
+];
+
+/// A default port that was taken, and the free one written in its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MovedPort {
+    /// The `daemon.toml` key.
+    pub key: &'static str,
+    /// The default that something else holds.
+    pub from: u16,
+    /// The port written into the starter config instead.
+    pub to: u16,
+}
+
+/// How far `choose_ports` looks: ten blocks of ten above the defaults.
+const PORT_SEARCH_BLOCKS: u16 = 10;
+
+/// Pick a replacement for every default port that `in_use` says is taken.
+///
+/// Every taken port moves by the same multiple of ten, so a second account
+/// whose defaults are all held gets 9327, 9328 and 9329: still adjacent and
+/// still recognisably briefcred's. A port that is free stays where it is.
+/// Returns what moved; an empty list means the defaults are fine. A taken port
+/// with no free block in reach is left at its default, and the daemon's own
+/// error names the key to set when it fails to bind.
+pub fn choose_ports(in_use: &dyn Fn(u16) -> bool) -> Vec<MovedPort> {
+    let taken: Vec<DefaultPort> = DEFAULT_PORTS
+        .into_iter()
+        .filter(|p| in_use(p.port))
+        .collect();
+    if taken.is_empty() {
+        return Vec::new();
+    }
+    (1..=PORT_SEARCH_BLOCKS)
+        .map(|block| block * 10)
+        .find(|offset| taken.iter().all(|p| !in_use(p.port + offset)))
+        .map(|offset| {
+            taken
+                .iter()
+                .map(|p| MovedPort {
+                    key: p.key,
+                    from: p.port,
+                    to: p.port + offset,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether something already listens on `port` on loopback.
+///
+/// Only "address in use" counts. Any other failure to bind says nothing about
+/// whether the daemon will manage it, so it is left to the daemon to report.
+pub fn port_in_use(port: u16) -> bool {
+    matches!(
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+    )
+}
+
+/// The starter config, with `moved` ports set rather than commented out.
+pub fn starter_config(moved: &[MovedPort]) -> String {
+    let mut text = STARTER_CONFIG.to_string();
+    for port in moved {
+        text = text.replace(
+            &format!("# {} = {}\n", port.key, port.from),
+            &format!(
+                "# {} {} was in use when this file was written.\n{} = {}\n",
+                port.key, port.from, port.key, port.to
+            ),
+        );
+    }
+    text
+}
 
 /// How long `install` waits for the started daemon to start listening.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -117,6 +218,9 @@ pub struct Report {
     pub files: Vec<(PathBuf, &'static str)>,
     /// Files left alone because they already exist.
     pub kept: Vec<PathBuf>,
+    /// Default ports that were taken, and what the starter config uses
+    /// instead. Empty when the defaults were free or a config already existed.
+    pub moved_ports: Vec<MovedPort>,
     /// The service-manager commands that were, or would be, run.
     pub commands: Vec<String>,
     /// Whether the daemon was listening before `install` returned.
@@ -180,6 +284,20 @@ pub fn provision(
     options: InstallOptions,
     store: &dyn KeyStore,
 ) -> Result<Report> {
+    provision_with(paths, daemon_binary, options, store, &port_in_use)
+}
+
+/// [`provision`], asking `in_use` which loopback ports are taken.
+///
+/// Separate so the tests can say which ports are busy rather than depend on
+/// what happens to be listening on the machine running them.
+pub fn provision_with(
+    paths: &Paths,
+    daemon_binary: &Path,
+    options: InstallOptions,
+    store: &dyn KeyStore,
+    in_use: &dyn Fn(u16) -> bool,
+) -> Result<Report> {
     let dry_run = options.dry_run;
     let mut report = Report::default();
 
@@ -200,8 +318,15 @@ pub fn provision(
     if config.exists() {
         report.kept.push(config);
     } else {
+        // Probed only for a config being written for the first time, and not
+        // while this home's own daemon is up: its listeners would be the ones
+        // found busy, and moving them would move the daemon off its own ports.
+        if !wait_until_listening(paths.sock(), Duration::ZERO) {
+            report.moved_ports = choose_ports(in_use);
+        }
         if !dry_run {
-            std::fs::write(&config, STARTER_CONFIG).map_err(|e| Error::io("write", &config, e))?;
+            std::fs::write(&config, starter_config(&report.moved_ports))
+                .map_err(|e| Error::io("write", &config, e))?;
             set_mode(&config, 0o600)?;
         }
         report.files.push((config, "starter configuration"));

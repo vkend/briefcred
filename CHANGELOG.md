@@ -6,6 +6,24 @@ All notable changes to briefcred are recorded here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- **A second account's daemon no longer fails to start.** briefcred's three
+  loopback ports (9317 metrics, 9318 HTTP proxy, 9319 Postgres proxy) are
+  shared by every account on a machine, so when one account's daemon held
+  them, another account's crash-looped and `briefcred install` only said the
+  daemon "was not listening after 10 s". When `briefcred install` writes a
+  first `daemon.toml`, it now checks the defaults and sets a free block for
+  any that are taken, moving them together by ten (9327, 9328, 9329) and
+  saying so in its output. An existing `daemon.toml` is never changed. The
+  starter config also lists `proxy_port` and `pg_proxy_port` now, not only
+  `metrics_port`.
+- **A listener that cannot bind names its address.** The error said
+  `cannot bind the metrics listener on <briefcred home>`, naming the home
+  directory instead of `127.0.0.1:<port>`, which read like a file problem.
+  It now names the address and, when the port is in use, the `daemon.toml`
+  key that moves it.
+
 ## 0.1.0 - 2026-10-17
 
 ### Changed

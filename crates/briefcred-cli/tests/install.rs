@@ -12,9 +12,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use briefcred_cli::install::{
-    provision, remove_files, wait_until_gone, wait_until_listening, InstallOptions, Report,
-    STARTER_CONFIG,
+    choose_ports, provision, provision_with, remove_files, starter_config, wait_until_gone,
+    wait_until_listening, InstallOptions, MovedPort, Report, STARTER_CONFIG,
 };
+use briefcred_cli::service::Ports;
 use briefcred_core::ca::CertificateAuthority;
 use briefcred_core::keystore::{FileKeyStore, KeyStore, CA_KEY_ITEM};
 use briefcred_core::paths::{Paths, Platform};
@@ -28,7 +29,16 @@ fn store_for(paths: &Paths) -> FileKeyStore {
 }
 
 fn run_provision(paths: &Paths, binary: &str, dry_run: bool) -> Report {
-    provision(
+    provision_busy(paths, binary, dry_run, &[])
+}
+
+/// Provision as if exactly `busy` were taken on loopback.
+///
+/// Every test says which ports are busy rather than probing, so the suite
+/// does not depend on whether the developer running it has a briefcred
+/// daemon of their own on the defaults.
+fn provision_busy(paths: &Paths, binary: &str, dry_run: bool, busy: &[u16]) -> Report {
+    provision_with(
         paths,
         Path::new(binary),
         InstallOptions {
@@ -36,6 +46,7 @@ fn run_provision(paths: &Paths, binary: &str, dry_run: bool) -> Report {
             trust_ca: false,
         },
         &store_for(paths),
+        &|port| busy.contains(&port),
     )
     .unwrap()
 }
@@ -373,5 +384,133 @@ fn uninstalling_keeps_the_ca_so_a_reinstall_stays_trusted() {
         removal.retained.iter().any(|(p, _)| *p == paths.ca_dir()),
         "and must say so: {:?}",
         removal.retained
+    );
+}
+
+#[test]
+fn free_default_ports_are_left_alone() {
+    assert!(choose_ports(&|_| false).is_empty());
+}
+
+#[test]
+fn taken_defaults_move_together_by_ten() {
+    let moved = choose_ports(&|port| (9317..=9319).contains(&port));
+    assert_eq!(
+        moved,
+        vec![
+            MovedPort {
+                key: "metrics_port",
+                from: 9317,
+                to: 9327
+            },
+            MovedPort {
+                key: "proxy_port",
+                from: 9318,
+                to: 9328
+            },
+            MovedPort {
+                key: "pg_proxy_port",
+                from: 9319,
+                to: 9329
+            },
+        ]
+    );
+}
+
+#[test]
+fn only_the_taken_default_moves() {
+    let moved = choose_ports(&|port| port == 9318);
+    assert_eq!(
+        moved,
+        vec![MovedPort {
+            key: "proxy_port",
+            from: 9318,
+            to: 9328
+        }]
+    );
+}
+
+#[test]
+fn a_taken_replacement_block_is_skipped() {
+    // A second account already moved to 9327-9329; a third gets 9337-9339.
+    let moved =
+        choose_ports(&|port| (9317..=9319).contains(&port) || (9327..=9329).contains(&port));
+    let to: Vec<u16> = moved.iter().map(|p| p.to).collect();
+    assert_eq!(to, vec![9337, 9338, 9339]);
+}
+
+#[test]
+fn the_starter_config_lists_every_port_the_daemon_listens_on() {
+    for key in ["metrics_port", "proxy_port", "pg_proxy_port"] {
+        assert!(STARTER_CONFIG.contains(&format!("# {key} = ")), "{key}");
+    }
+}
+
+#[test]
+fn a_starter_config_with_moved_ports_sets_them() {
+    let moved = choose_ports(&|port| (9317..=9319).contains(&port));
+    let text = starter_config(&moved);
+    let ports = Ports::from_daemon_toml(&text);
+    assert_eq!(
+        (ports.metrics, ports.proxy, ports.pg_proxy),
+        (9327, 9328, 9329)
+    );
+}
+
+#[test]
+fn an_install_whose_defaults_are_taken_writes_free_ports() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+    let report = provision_busy(
+        &paths,
+        "/opt/bin/briefcred-daemon",
+        false,
+        &[9317, 9318, 9319],
+    );
+
+    assert_eq!(report.moved_ports.len(), 3, "{:?}", report.moved_ports);
+    let written = std::fs::read_to_string(paths.daemon_toml()).unwrap();
+    let ports = Ports::from_daemon_toml(&written);
+    assert_eq!(
+        (ports.metrics, ports.proxy, ports.pg_proxy),
+        (9327, 9328, 9329)
+    );
+}
+
+#[test]
+fn a_dry_run_reports_the_ports_it_would_move_and_writes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+    let report = provision_busy(&paths, "/opt/bin/briefcred-daemon", true, &[9317]);
+
+    assert_eq!(
+        report.moved_ports,
+        vec![MovedPort {
+            key: "metrics_port",
+            from: 9317,
+            to: 9327
+        }]
+    );
+    assert!(!paths.daemon_toml().exists());
+}
+
+#[test]
+fn an_existing_config_is_kept_even_when_its_ports_are_taken() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths_at(&temp.path().join("home"));
+    run_provision(&paths, "/opt/bin/briefcred-daemon", false);
+    let before = std::fs::read_to_string(paths.daemon_toml()).unwrap();
+
+    let report = provision_busy(
+        &paths,
+        "/opt/bin/briefcred-daemon",
+        false,
+        &[9317, 9318, 9319],
+    );
+
+    assert!(report.moved_ports.is_empty(), "{:?}", report.moved_ports);
+    assert_eq!(
+        std::fs::read_to_string(paths.daemon_toml()).unwrap(),
+        before
     );
 }

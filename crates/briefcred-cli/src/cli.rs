@@ -788,6 +788,14 @@ fn print_install(report: &install::Report, dry_run: bool) {
     for path in &report.kept {
         outln!("  keep       {} (already present)", path.display());
     }
+    for port in &report.moved_ports {
+        outln!(
+            "  {verb}set        {} = {} (port {} is in use)",
+            port.key,
+            port.to,
+            port.from
+        );
+    }
     for command in &report.commands {
         outln!("  {verb}run        {command}");
     }
