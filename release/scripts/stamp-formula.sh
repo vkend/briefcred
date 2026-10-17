@@ -39,12 +39,23 @@ sed \
   -e "s|^\(  sha256 \).*$|\1\"$sha\"|" \
   "$IN" > "$OUT"
 
-# A stamp that changed no lines, or more than the two, is a formula nobody
-# should publish. Checking here rather than trusting the `sed` is the whole
-# reason this is a script and not an inline step.
-changed="$(diff <(cat "$IN") <(cat "$OUT") | grep -c '^[<>]' || true)"
-if [[ "$changed" -ne 4 ]]; then
-  echo "stamp-formula: expected to rewrite exactly 2 lines, rewrote $((changed / 2))" >&2
+# Check the result rather than trusting the `sed`, which is the whole reason
+# this is a script and not an inline step. The output must carry exactly one
+# `url` and one `sha256` line with the values just computed, and be otherwise
+# byte-identical to the template. The changed-line count is not the test: when
+# the template's placeholder `url` already names this version, as it does for
+# the version in the tree, a correct stamp changes only the checksum.
+if [[ "$(grep -c "^  url \"$url\"$" "$OUT")" -ne 1 ]]; then
+  echo "stamp-formula: the output does not have exactly one url line for $url" >&2
+  exit 1
+fi
+if [[ "$(grep -c "^  sha256 \"$sha\"$" "$OUT")" -ne 1 ]]; then
+  echo "stamp-formula: the output does not have exactly one sha256 line for $sha" >&2
+  exit 1
+fi
+if ! diff -q <(grep -v -e '^  url ' -e '^  sha256 ' "$IN") \
+             <(grep -v -e '^  url ' -e '^  sha256 ' "$OUT") > /dev/null; then
+  echo "stamp-formula: a line other than url and sha256 changed" >&2
   exit 1
 fi
 

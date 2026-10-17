@@ -103,6 +103,44 @@ fn stamping_rewrites_the_url_and_the_checksum_and_leaves_everything_else_alone()
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// Stamping the version the template's placeholder already names.
+///
+/// The committed formula's `url` points at the workspace version, so the first
+/// real release of that version produces the same `url` and only the checksum
+/// differs. v0.1.0's release run failed exactly here, on a check that demanded
+/// two changed lines.
+#[test]
+fn stamping_the_version_the_template_already_names_changes_only_the_checksum() {
+    let template = std::fs::read_to_string(
+        workspace_root()
+            .join("release")
+            .join("Formula")
+            .join("briefcred.rb"),
+    )
+    .expect("read the formula");
+    let url = template
+        .lines()
+        .find_map(|l| l.strip_prefix("  url \""))
+        .and_then(|l| l.strip_suffix('"'))
+        .expect("the template has a url line");
+    let tarball = url.rsplit('/').next().expect("a file name");
+    let version = tarball
+        .strip_prefix("briefcred-")
+        .and_then(|t| t.strip_suffix("-macos-universal.tar.gz"))
+        .expect("the tarball name carries the version");
+
+    let (before, after, dir) = stamp(version, tarball, b"hello");
+    let differing: Vec<_> = before
+        .lines()
+        .zip(after.lines())
+        .filter(|(b, a)| b != a)
+        .collect();
+    assert_eq!(differing.len(), 1, "{differing:#?}");
+    assert!(differing[0].0.trim_start().starts_with("sha256 "));
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn a_missing_tarball_is_refused_rather_than_stamped_with_nothing() {
     let root = workspace_root();
