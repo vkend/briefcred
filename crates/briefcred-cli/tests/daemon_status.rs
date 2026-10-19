@@ -103,7 +103,10 @@ fn status_against_a_running_daemon_reports_its_health() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("briefcred daemon is running"), "{stdout}");
-    assert!(stdout.contains("version    0.1.0"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("version    {}", env!("CARGO_PKG_VERSION"))),
+        "{stdout}"
+    );
     assert!(stdout.contains("metrics    http://127.0.0.1:"), "{stdout}");
     assert!(
         stdout.contains(&temp.path().join("audit").display().to_string()),
