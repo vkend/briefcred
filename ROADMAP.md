@@ -5,10 +5,18 @@ developer tooling. It hands subprocesses short-lived, narrowly scoped
 credentials, swaps placeholder keys for real ones at a local proxy, and
 records every mint, request, and revoke in an append-only audit log.
 
-This is a greenfield build. Nothing below has shipped. Phases are
-sequenced, not parallelised; each declares what is decided, what gets
-built, and what "done" looks like. Calendar estimates are deliberately
-omitted — sequencing is the load-bearing part.
+## Status
+
+Every phase below, and every additional minter, shipped in 0.1.0
+(2026-10-17). `CHANGELOG.md` records what each one became, including where
+the build departed from the plan. The phase sections stay as the record of
+what was decided and what "done" meant, and keep their numbers so older
+links still resolve.
+
+What is left is not a phase. It is the open ambiguities and open risks
+near the end of this file, and the cross-cutting work that never finishes,
+the runtime compatibility matrix above all. Settle an ambiguity here before
+building on it.
 
 ## Positioning
 
@@ -48,14 +56,15 @@ omitted — sequencing is the load-bearing part.
 
 ## Execution order
 
-Phases keep stable numbers for cross-linking. Build order:
+Phases keep stable numbers for cross-linking. They were built in this
+order:
 
 **0 → 1 → 2 → 3 → 4 (thin) → 10 → 5 → 8 → 6 → 7 → 9**
 
 Rationale: Phase 3 hands a minted Postgres role to the subprocess via env
-vars (Model C). Phase 10 converts Postgres to Model A, so it is pulled
-directly behind the thin proxy MVP. Streaming, upgrades, and HTTP/2 are
-deferred because nothing in the market differentiates on them.
+vars (Model C). Phase 10 converts Postgres to Model A, so it was pulled
+directly behind the thin proxy MVP. Streaming, upgrades, and HTTP/2 came
+last because nothing in the market differentiates on them.
 
 ---
 
@@ -463,17 +472,21 @@ is not.
 - Backup / restore / DR for daemon state, audit logs, CA keys.
 - Multi-machine: shared CI runners, build fleets — probably out of scope.
 - Master credential rotation while a session holds the old one.
-- Profile signing scheme specifics (must resolve before Phase 8).
+- ~~Profile signing scheme specifics (must resolve before Phase 8).~~
+  Resolved: minisign signatures checked against `trust_roots` in
+  `daemon.toml`; see `docs/profile-distribution.md`.
 
 ## Open risks
 
-- `LAContext` from a Rust LaunchAgent — budget a binding spike, run it
-  on macOS 26.4+ (open reports of keychain `errSecAuthFailed` and CA
-  trust regressions on that release).
+- macOS 26.4+ — open reports of keychain `errSecAuthFailed` and CA trust
+  regressions on that release. The `LAContext` binding from a Rust
+  LaunchAgent works; what still needs watching is each new macOS point
+  release.
 - First-party sandbox brokering (Anthropic Managed Agents, OpenAI
   Sandbox Agents) erodes the "agent never sees the key" pitch for hosted
   workloads; keep dynamic DB/STS minting as the headline.
-- Notarisation toolchain: Developer ID + `notarytool` + key handling in CI.
+- ~~Notarisation toolchain: Developer ID + `notarytool` + key handling in
+  CI.~~ Resolved: 0.1.0 was signed and notarised by the release workflow.
 - First-time-after-reboot: `RunAtLoad` must reach the Aqua session before
   any user app launches.
 - AWS STS revoke staleness — track if propagation exceeds ~5 s in practice.
