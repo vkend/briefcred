@@ -51,6 +51,7 @@ never reached briefcred.
 | **Rust** (`reqwest` with native roots) | system trust store, `SSL_CERT_FILE` | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` | Works; see the pinning note |
 | **Ruby** (`Net::HTTP`, OpenSSL) | `SSL_CERT_FILE` | lowercase `http_proxy` / `https_proxy` | See below |
 | **Node** | `NODE_EXTRA_CA_CERTS` | *none by default* | Needs help. See below |
+| **opencode** (Bun) | `NODE_EXTRA_CA_CERTS` | `HTTPS_PROXY`, `https_proxy`, `NO_PROXY` | Works; its stored key must go. See below |
 | **gcloud** | *its own bundled CA* | `HTTPS_PROXY` | Needs help. See below |
 | **psql** | `PGSSLROOTCERT` | not applicable | Does not use the HTTP proxy at all |
 
@@ -65,6 +66,10 @@ An agent written against `fetch` will send its request straight past briefcred,
 get a `403` from the vendor because it is holding a synthetic token, and
 produce no audit row at all — which is the signature of this problem.
 
+This is Node's behaviour, not every JavaScript runtime's. Bun's `fetch` reads
+the proxy variables, so a Bun-based agent can go through briefcred without
+help. That was checked through opencode, which is built on Bun; see below.
+
 What works:
 
 - Recent Node versions accept an opt-in flag for reading proxy environment
@@ -75,6 +80,80 @@ What works:
 - The CA half is fine: `NODE_EXTRA_CA_CERTS` is honoured, and it *adds* to the
   bundled roots rather than replacing them, so the subprocess keeps working
   against everything else.
+
+### opencode prefers its own stored key
+
+Checked by hand on 2026-10-18 with opencode 1.18.35 (built on Bun 1.3.14) on
+macOS, against an OpenAI-compatible provider (`@ai-sdk/openai-compatible`)
+whose key comes from an environment variable.
+
+opencode's model requests honour `HTTPS_PROXY` (and lowercase `https_proxy`,
+and `NO_PROXY`), and its TLS honours `NODE_EXTRA_CA_CERTS`, so
+`briefcred exec -- opencode` goes through the proxy with no plugin and no
+wrapper. The provider's address can be a hostname or an IP address; both went
+through the proxy.
+
+The configuration that works names the variable in the provider and lets the
+profile fill it, here from a credential named `gateway`:
+
+```json
+"provider": {
+  "my-gateway": {
+    "npm": "@ai-sdk/openai-compatible",
+    "env": ["MY_GATEWAY_KEY"],
+    "options": { "baseURL": "https://gateway.example.com/v1" },
+    "models": { "my-model": {} }
+  }
+}
+```
+
+```yaml
+env:
+  MY_GATEWAY_KEY: ${minted.gateway.TOKEN}
+```
+
+What to know:
+
+- **A key saved with `/connect` wins over the environment.** opencode stores
+  that key in `~/.local/share/opencode/auth.json` and uses it before the
+  variables in the provider's `env` list. Left there, it is what opencode
+  sends, and the proxy, finding no briefcred token in the request, refuses it:
+  opencode shows "Proxy Authentication Required" and the audit log shows
+  `proxy_token_rejected … reason=missing`. That fails closed, but the real key
+  is still on disk. Remove it first with `opencode auth logout <provider-id>`.
+- **The policy sees the host as the configuration writes it.** A `baseURL` of
+  `https://127.0.0.1:8443/v1` arrives as host `127.0.0.1`, and a policy that
+  permits `localhost` denies it. Write the policy's `resource.host` to match
+  the `baseURL` exactly.
+- **opencode's own background requests are refused.** At startup it fetches its
+  model catalogue from `models.opencode.ai` and looks up packages on
+  `registry.npmjs.org`. They carry no briefcred token, so each is refused and
+  logged as `proxy_token_rejected … reason=missing`. opencode carries on
+  without them, so the rows are expected and harmless.
+- **`OPENCODE_*` variables do not reach it unless the profile passes them.**
+  `briefcred exec` starts the child with an empty environment plus `PATH`,
+  `HOME`, `TERM`, `LANG`, `TMPDIR`, the profile's `env_passthrough` and its
+  `env`. A profile written by `briefcred profile bootstrap` has no
+  `env_passthrough`. Put settings in `opencode.json` instead (for example
+  `"autoupdate": false`, `"share": "disabled"`, `"lsp": false`), or name the
+  variables in `env_passthrough`.
+- **`opencode run` from a script wants `</dev/null`.** `briefcred exec` passes
+  its own standard input to the child. When that is a pipe that stays open, as
+  it can be in a script, a CI job or another agent's shell, `opencode run`
+  waits for it to close, and under `briefcred exec` it sent nothing until it
+  did.
+  From a terminal, and in the interactive interface, this does not come up.
+
+How to verify:
+
+```sh
+opencode auth logout <provider-id>
+briefcred exec --profile <name> -- opencode run "Reply with OK" </dev/null
+briefcred audit --since 5m
+```
+
+A working setup shows `proxy_request … POST <host>/v1/chat/completions allow
+status=200`; each prompt made two such requests in these checks.
 
 ### Go does not read `SSL_CERT_FILE` on macOS
 
