@@ -181,6 +181,27 @@ impl TokenSigner {
         })
     }
 
+    /// Make sure `store` holds a signing key, creating one only if it has none.
+    ///
+    /// Returns whether a key was created. An existing key is never read, so a
+    /// daemon calling this at startup does not prompt for keychain access the
+    /// way loading the key would.
+    ///
+    /// This exists for `briefcred daemon upgrade`. A handoff signs its blob
+    /// with this key, and creating a keychain item means macOS reading the
+    /// creating process's executable for the item's access list. After `brew
+    /// upgrade` that executable has been deleted, so a daemon that waited until
+    /// its first handoff to create the key could not, and the upgrade failed
+    /// with `UNIX[No such file or directory]`. Created at startup, the key is
+    /// written while the binary is still on disk.
+    pub fn ensure_stored(store: &dyn KeyStore) -> briefcred_core::Result<bool> {
+        if store.contains(TOKEN_SIGNER_ITEM)? {
+            return Ok(false);
+        }
+        TokenSigner::load_or_create(store)?;
+        Ok(true)
+    }
+
     /// Rebuild a signer from the hex form the key store holds.
     pub fn from_hex(encoded: &str) -> briefcred_core::Result<TokenSigner> {
         let bytes = Zeroizing::new(hex::decode(encoded.trim()).map_err(|_| {
@@ -544,6 +565,55 @@ mod tests {
         // The same key, proved by one verifying what the other signed.
         let token = first.sign(&claims("s1", "openai", 0));
         assert!(second.verify(&token, 1).is_ok());
+    }
+
+    /// A store that refuses to be read, to prove a caller never reads it.
+    struct Unreadable(FileKeyStore);
+
+    impl KeyStore for Unreadable {
+        fn put(&self, item: &str, secret: &Zeroizing<String>) -> briefcred_core::Result<()> {
+            self.0.put(item, secret)
+        }
+        fn get(&self, item: &str) -> briefcred_core::Result<Option<Zeroizing<String>>> {
+            panic!("`{item}` was read");
+        }
+        fn contains(&self, item: &str) -> briefcred_core::Result<bool> {
+            self.0.contains(item)
+        }
+        fn delete(&self, item: &str) -> briefcred_core::Result<()> {
+            self.0.delete(item)
+        }
+        fn location(&self) -> String {
+            self.0.location()
+        }
+        fn kind(&self) -> briefcred_core::KeystoreKind {
+            self.0.kind()
+        }
+    }
+
+    #[test]
+    fn ensure_stored_creates_a_key_that_later_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileKeyStore::new(dir.path());
+        assert!(TokenSigner::ensure_stored(&store).unwrap());
+
+        let signer = TokenSigner::load_or_create(&store).unwrap();
+        let again = TokenSigner::load_or_create(&store).unwrap();
+        let token = signer.sign(&claims("s1", "openai", 0));
+        assert!(again.verify(&token, 1).is_ok());
+    }
+
+    #[test]
+    fn ensure_stored_leaves_an_existing_key_unread_and_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = TokenSigner::load_or_create(&FileKeyStore::new(dir.path())).unwrap();
+
+        let store = Unreadable(FileKeyStore::new(dir.path()));
+        assert!(!TokenSigner::ensure_stored(&store).unwrap());
+
+        let token = first.sign(&claims("s1", "openai", 0));
+        let reloaded = TokenSigner::load_or_create(&FileKeyStore::new(dir.path())).unwrap();
+        assert!(reloaded.verify(&token, 1).is_ok());
     }
 
     #[test]

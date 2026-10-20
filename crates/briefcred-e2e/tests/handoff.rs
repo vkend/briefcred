@@ -591,6 +591,28 @@ async fn an_upgrade_to_a_binary_that_is_not_there_leaves_the_daemon_serving() {
     fixture.daemon.request(Request::Shutdown).await.ok();
 }
 
+/// The key a handoff is signed with exists before anything has used it.
+///
+/// Every other test here mints first, which creates the key along the way. A
+/// daemon nobody has proxied through has not, and on macOS creating it at
+/// handoff time fails once `brew upgrade` has deleted the running binary, so
+/// it has to be on disk from the moment the daemon starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_nobody_has_used_already_has_its_token_signer_key() {
+    let mut daemon = Daemon::prepare("master_source = \"file\"\n[ca]\nkeystore = \"file\"\n");
+    daemon.start().await.unwrap_or_else(|e| panic!("{e}"));
+
+    let key = daemon.home().join("ca").join("token-signer.key");
+    assert!(
+        key.exists(),
+        "no {} after startup:\n{}",
+        key.display(),
+        daemon.log()
+    );
+
+    daemon.request(Request::Shutdown).await.ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upgrade_under_a_live_websocket_drops_no_frames() {
     // The WebSocket relay is a task of its own — the handshake response ends

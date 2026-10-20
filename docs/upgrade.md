@@ -115,6 +115,20 @@ clock. Neither is what keeps the masters secret; the key agreement already does
 that. What they buy is that a blob captured off a socket cannot be presented to
 a *later* daemon as though it were current.
 
+### `cannot store `token-signer`: UNIX[No such file or directory]`
+
+A daemon from 0.1.1 or earlier that nobody had proxied through had no
+token-signer key yet, so it created one when asked to hand over. Creating a
+keychain item means macOS reading the creating process's executable, and
+`brew upgrade` deletes the old version's executable while its daemon is still
+running. The handoff failed with this message and the old daemon kept serving.
+
+Daemons from later versions create the key when they start, while their binary
+is still on disk. To get past it once, restart instead of upgrading:
+`briefcred daemon restart` starts the new binary. It closes the sessions open
+on the old daemon, revokes what they minted and cuts anything in flight, so do
+it when nothing is running through briefcred.
+
 ## The service manager still owns the *installed* daemon
 
 `briefcred daemon upgrade` replaces the running process. It does not rewrite

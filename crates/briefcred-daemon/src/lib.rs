@@ -130,11 +130,28 @@ pub async fn run_with(startup: Startup) -> Result<()> {
     let audit = crate::audit::spawn(AuditLog::open(&paths.audit_dir(), config.retention_days)?);
     let metrics = Arc::new(Metrics::new(audit.write_errors_handle()));
 
-    // Opened, not read: constructing a key store touches neither the keychain
-    // nor a file, so a daemon nobody upgrades and nobody proxies through still
-    // never prompts. See `ProxyIssuer` for the same reasoning about the key.
+    // Opened, not read: the signing key is loaded on first use, so a daemon
+    // nobody upgrades and nobody proxies through never prompts. See
+    // `ProxyIssuer` for the same reasoning about the key.
     let keystore: Arc<dyn briefcred_core::keystore::KeyStore> =
         Arc::from(config.ca.open_keystore(&paths)?);
+
+    // But it is *created* now if there is none, which neither reads it nor
+    // prompts. A handoff signs with it, and creating it later can fail: see
+    // `TokenSigner::ensure_stored`. A failure here is not fatal, because the
+    // key is created on first use anyway; what it costs is that a later
+    // `briefcred daemon upgrade` may fail, safely, with the old daemon still
+    // serving.
+    if matches!(startup, Startup::Fresh) {
+        match crate::proxy::token::TokenSigner::ensure_stored(keystore.as_ref()) {
+            Ok(true) => eprintln!("briefcred-daemon: created the token-signer key"),
+            Ok(false) => {}
+            Err(err) => eprintln!(
+                "briefcred-daemon: cannot create the token-signer key yet, so an upgrade \
+                 may fail until it exists: {err}"
+            ),
+        }
+    }
 
     // Register the signal handlers before any socket exists. `signal` installs
     // the handler when it is called, not when the future is first polled, so
