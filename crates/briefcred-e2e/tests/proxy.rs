@@ -2398,7 +2398,20 @@ async fn the_proxy_stays_within_its_latency_budget_over_two_hundred_calls() {
     // charge, the Cedar decision and an audit row — so the ratio alone would be
     // asserting that a proxy is free. The allowance is what makes this a bound
     // on the time briefcred adds, which is the honest thing to bound.
-    let budget = direct_each.mul_f64(1.10) + Duration::from_millis(2);
+    //
+    // The allowance depends on the build. Two milliseconds was set against a
+    // release build, which adds about 0.2 ms here. `cargo test` builds debug,
+    // which adds about 0.56 ms on an M-series laptop and 2.1 to 2.4 ms on
+    // GitHub's macOS runners, where the direct call is three to four times
+    // slower too. Held to the release allowance, CI failed on runner speed
+    // rather than on anything briefcred did. Five milliseconds leaves debug
+    // the same headroom on those runners that release has here.
+    let allowance = if cfg!(debug_assertions) {
+        Duration::from_millis(5)
+    } else {
+        Duration::from_millis(2)
+    };
+    let budget = direct_each.mul_f64(1.10) + allowance;
     assert!(
         proxied_each <= budget,
         "proxied {proxied_each:?} per call against direct {direct_each:?}, \
