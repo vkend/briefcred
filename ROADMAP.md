@@ -412,7 +412,9 @@ round trip dominates, is under one percent. The measured figure on this
 machine is about 212 µs added per call in a release build. So the bound
 asserted is `proxied <= direct * 1.10 + 2 ms`: the ratio for the case
 where the upstream is far away, and the allowance for the case where it
-is not.
+is not. A debug build, which is what `cargo test` and CI run, is allowed
+5 ms instead: it adds about 0.56 ms on a laptop and over 2 ms on GitHub's
+macOS runners.
 
 ---
 
