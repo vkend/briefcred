@@ -4,7 +4,19 @@ All notable changes to briefcred are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.1.2 - 2026-10-19
+## 0.1.2 - 2026-10-20
+
+### Security
+
+- **rustls-webpki 0.103.16 and webpki-roots 1.0.10.** Both proxies verify the
+  upstream's certificate against `webpki-roots`, and the versions in 0.1.1
+  could accept a certificate chain through emSign intermediates that have
+  since been distrusted and whose private keys are now public
+  ([RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382),
+  [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381)).
+  Someone holding one of those keys who could also intercept the connection
+  could impersonate an upstream to the HTTP or Postgres proxy and receive the
+  real credential it injects.
 
 ### Fixed
 
