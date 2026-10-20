@@ -12,17 +12,17 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vkend/briefcred"
 
 [workspace.dependencies]
-briefcred-core = { path = "crates/briefcred-core", version = "0.1.1" }
-briefcred-proto = { path = "crates/briefcred-proto", version = "0.1.1" }
-briefcred-helper-postgres = { path = "crates/briefcred-helper-postgres", version = "0.1.1" }
-briefcred-helper-sts = { path = "crates/briefcred-helper-sts", version = "0.1.1" }
+briefcred-core = { path = "crates/briefcred-core", version = "0.1.2" }
+briefcred-proto = { path = "crates/briefcred-proto", version = "0.1.2" }
+briefcred-helper-postgres = { path = "crates/briefcred-helper-postgres", version = "0.1.2" }
+briefcred-helper-sts = { path = "crates/briefcred-helper-sts", version = "0.1.2" }
 
 async-trait = "0.1"
 base64 = "0.22"
