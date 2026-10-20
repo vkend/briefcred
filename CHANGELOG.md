@@ -4,6 +4,21 @@ All notable changes to briefcred are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- **`briefcred daemon upgrade` works after `brew upgrade` on a daemon nobody
+  has proxied through.** The handoff is signed with the token-signer key, and a
+  daemon that had never issued a proxy token had not created it yet, so it
+  tried to create it in the middle of the handoff. On macOS that means writing
+  a keychain item, which needs the running process's executable, and `brew
+  upgrade` had already deleted it. The upgrade failed with `cannot store
+  `token-signer`: UNIX[No such file or directory]` and the old daemon kept
+  serving. The daemon now creates the key when it starts, if there is none. It
+  checks without reading an existing key, so startup still never prompts for
+  keychain access. `KeyStore` gains `contains` for that.
+
 ## 0.1.1 - 2026-10-19
 
 ### Added

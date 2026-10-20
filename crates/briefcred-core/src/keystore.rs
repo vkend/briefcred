@@ -60,6 +60,13 @@ pub trait KeyStore: Send + Sync {
     /// Read the secret stored under `item`, or `None` if there is none.
     fn get(&self, item: &str) -> Result<Option<Zeroizing<String>>>;
 
+    /// Whether anything is stored under `item`, without reading it.
+    ///
+    /// Separate from [`KeyStore::get`] because reading a keychain item is what
+    /// can prompt for access, and asking whether one exists is not. A caller
+    /// that only needs to know whether to create something must not prompt.
+    fn contains(&self, item: &str) -> Result<bool>;
+
     /// Remove `item`. Removing something absent is not an error.
     fn delete(&self, item: &str) -> Result<()>;
 
@@ -195,6 +202,12 @@ impl KeyStore for FileKeyStore {
         }
     }
 
+    fn contains(&self, item: &str) -> Result<bool> {
+        let path = self.path(item);
+        path.try_exists()
+            .map_err(|e| io_error("look for", &path, e))
+    }
+
     fn delete(&self, item: &str) -> Result<()> {
         let path = self.path(item);
         match std::fs::remove_file(&path) {
@@ -253,6 +266,24 @@ impl KeyStore for KeychainKeyStore {
         }
     }
 
+    fn contains(&self, item: &str) -> Result<bool> {
+        use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+        // Attributes only: the item's data is what its access list guards, so
+        // a search that never asks for it never prompts.
+        let found = ItemSearchOptions::new()
+            .class(ItemClass::generic_password())
+            .service(&self.service)
+            .account(item)
+            .load_attributes(true)
+            .limit(Limit::Max(1))
+            .search();
+        match found {
+            Ok(results) => Ok(!results.is_empty()),
+            Err(err) if err.code() == ITEM_NOT_FOUND => Ok(false),
+            Err(err) => Err(Error::Keystore(format!("cannot look for `{item}`: {err}"))),
+        }
+    }
+
     fn delete(&self, item: &str) -> Result<()> {
         match security_framework::passwords::delete_generic_password(&self.service, item) {
             Ok(()) => Ok(()),
@@ -292,6 +323,17 @@ mod tests {
     fn an_absent_item_reads_as_none_rather_than_an_error() {
         let (_dir, store) = temp_store();
         assert!(store.get(CA_KEY_ITEM).unwrap().is_none());
+    }
+
+    #[test]
+    fn contains_reports_an_item_only_once_it_is_stored() {
+        let (_dir, store) = temp_store();
+        assert!(!store.contains(TOKEN_SIGNER_ITEM).unwrap());
+        store
+            .put(TOKEN_SIGNER_ITEM, &Zeroizing::new("abc".into()))
+            .unwrap();
+        assert!(store.contains(TOKEN_SIGNER_ITEM).unwrap());
+        assert!(!store.contains(CA_KEY_ITEM).unwrap());
     }
 
     #[test]
@@ -369,9 +411,12 @@ mod tests {
         let store = KeychainKeyStore::new("io.github.vkend.briefcred.ca.test");
         let item = "round-trip";
         let secret = Zeroizing::new("keychain-value".to_string());
+        assert!(!store.contains(item).unwrap());
         store.put(item, &secret).unwrap();
+        assert!(store.contains(item).unwrap());
         assert_eq!(store.get(item).unwrap().as_deref(), Some(&*secret));
         store.delete(item).unwrap();
+        assert!(!store.contains(item).unwrap());
         assert!(store.get(item).unwrap().is_none());
     }
 }
