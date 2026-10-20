@@ -4,7 +4,15 @@ All notable changes to briefcred are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.1.1 - 2026-10-19
+
+### Added
+
+- **opencode in `docs/compatibility.md`.** opencode is built on Bun, whose
+  `fetch` reads the proxy variables, so `briefcred exec -- opencode` works
+  without a wrapper. The new section gives a provider configuration that works
+  and says what gets in the way, starting with the key `/connect` stores, which
+  opencode prefers over the environment.
 
 ### Fixed
 

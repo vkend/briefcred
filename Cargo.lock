@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "briefcred-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "briefcred-core",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "briefcred-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "briefcred-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "briefcred-e2e"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "briefcred-cli",
  "briefcred-core",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "briefcred-helper-postgres"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "briefcred-core",
  "briefcred-proto",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "briefcred-helper-sts"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -974,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "briefcred-hook"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "briefcred-core",
  "briefcred-proto",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "briefcred-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
