@@ -543,8 +543,25 @@ fn https_client(base: &str) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .redirect(policy)
+        .use_preconfigured_tls(tls_config()?)
         .build()
         .map_err(|e| Error::Signature(format!("cannot build an HTTPS client: {e}")))
+}
+
+/// The same roots every other outbound connection verifies against.
+///
+/// Handed to `reqwest` whole, so the ALPN it would otherwise set has to be
+/// set here: without it the client never negotiates HTTP/2.
+fn tls_config() -> Result<rustls::ClientConfig> {
+    let roots = crate::trust::upstream_roots()?;
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Tls(e.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 async fn get(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
@@ -926,6 +943,18 @@ mod tests {
 
     fn registry() -> Registry {
         Registry::discover()
+    }
+
+    #[test]
+    fn the_registry_client_accepts_the_shared_tls_config() {
+        // `reqwest` rejects a preconfigured config from a backend it was not
+        // built with only at `build()`, so building is the whole check.
+        assert!(https_client("https://registry.example").is_ok());
+        let config = tls_config().unwrap();
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     /// A home with a profiles directory and one registry inside it.

@@ -34,6 +34,7 @@ pub mod registry;
 pub mod session_env;
 pub mod source;
 pub mod traits;
+pub mod trust;
 pub mod types;
 pub mod yaml;
 

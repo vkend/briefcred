@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use briefcred_core::ca::CertificateAuthority;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, ServerConfig};
 use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -71,7 +71,8 @@ pub fn server_config(ca: &CertificateAuthority, hostname: &str) -> Result<Arc<Se
     Ok(Arc::new(config))
 }
 
-/// A `ClientConfig` that verifies upstreams against the system trust store.
+/// A `ClientConfig` that verifies upstreams against the system trust store,
+/// less the roots [`briefcred_core::trust`] distrusts.
 ///
 /// `extra_roots`, when given, is a PEM bundle added to the store. It exists so
 /// the test suite can point the proxy at an in-process upstream signed by a
@@ -79,29 +80,8 @@ pub fn server_config(ca: &CertificateAuthority, hostname: &str) -> Result<Arc<Se
 /// and adding a root here is adding a certificate authority the proxy will
 /// believe for every host.
 pub fn client_config(extra_roots: Option<&Path>) -> Result<Arc<ClientConfig>> {
-    let mut roots = RootCertStore::empty();
-
-    match rustls_native_certs::load_native_certs() {
-        loaded if !loaded.certs.is_empty() => {
-            let (added, _ignored) = roots.add_parsable_certificates(loaded.certs);
-            if added == 0 {
-                return Err(Error::Proxy(
-                    "the system trust store has no usable certificates".to_string(),
-                ));
-            }
-        }
-        // A platform whose trust store cannot be read is not a platform where
-        // the proxy should give up: the bundled Mozilla roots verify every
-        // public upstream anybody is likely to call. Said once, at startup, so
-        // an operator can see which set is in force.
-        _ => {
-            eprintln!(
-                "briefcred-daemon: cannot read the system trust store; \
-                 falling back to the bundled Mozilla roots"
-            );
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
-    }
+    let mut roots = briefcred_core::trust::upstream_roots()
+        .map_err(|e| Error::Proxy(format!("cannot load upstream roots: {e}")))?;
 
     if let Some(path) = extra_roots {
         let pem = std::fs::read(path).map_err(|e| Error::io("read", path, e))?;
