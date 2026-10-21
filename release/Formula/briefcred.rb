@@ -16,7 +16,7 @@
 class Briefcred < Formula
   desc "Local credential broker for AI agents and developer tooling"
   homepage "https://github.com/vkend/briefcred"
-  url "https://github.com/vkend/briefcred/releases/download/v0.1.2/briefcred-0.1.2-macos-universal.tar.gz"
+  url "https://github.com/vkend/briefcred/releases/download/v0.1.3/briefcred-0.1.3-macos-universal.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license any_of: ["MIT", "Apache-2.0"]
 
