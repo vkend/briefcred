@@ -4,6 +4,22 @@ All notable changes to briefcred are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Security
+
+- **emSign ECC Root CA - G3 is no longer trusted for upstream connections,**
+  even where the system store still carries it, as macOS 26.3 does. Mozilla
+  and Chrome withdrew it on 20 October after the compromise of eight
+  intermediates beneath it. The compromised intermediates themselves were
+  already rejected in 0.1.2, by key, including Sectigo's cross-signs of them
+  under AAA Certificate Services; a test now pins that.
+- **Every outbound TLS client uses the same roots.** The HTTP proxy, the
+  Postgres proxy in `verify-full`, the Postgres minter and the registry fetch
+  each loaded the system store with their own copy of the code. They now share
+  one, which also gives the Postgres minter the bundled-Mozilla-roots fallback
+  the proxies already had. The AWS helper still uses the AWS SDK's own roots.
+
 ## 0.1.2 - 2026-10-20
 
 ### Security

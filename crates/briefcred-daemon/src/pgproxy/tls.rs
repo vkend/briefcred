@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use briefcred_core::minters::postgres_proxy::SslMode;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::TlsConnector;
 
@@ -44,21 +44,11 @@ pub fn connector(mode: SslMode) -> Result<Option<TlsConnector>, String> {
     Ok(Some(TlsConnector::from(Arc::new(config))))
 }
 
-/// The `verify-full` configuration: the system trust store, and a hostname
+/// The `verify-full` configuration: the system trust store (less the roots
+/// [`briefcred_core::trust`] distrusts), and a hostname
 /// check that `rustls` performs against the `ServerName` the caller passes.
 fn verifying_config() -> Result<ClientConfig, String> {
-    let mut roots = RootCertStore::empty();
-    let loaded = rustls_native_certs::load_native_certs();
-    if loaded.certs.is_empty() {
-        // Same fallback the HTTP proxy makes, for the same reason: a platform
-        // whose store cannot be read still verifies every public CA.
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    } else {
-        let (added, _ignored) = roots.add_parsable_certificates(loaded.certs);
-        if added == 0 {
-            return Err("the system trust store has no usable certificates".to_string());
-        }
-    }
+    let roots = briefcred_core::trust::upstream_roots().map_err(|e| e.to_string())?;
     ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("cannot build a TLS client config: {e}"))

@@ -696,16 +696,7 @@ pub async fn connect_as(
 }
 
 fn make_tls() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
-    let mut roots = rustls::RootCertStore::empty();
-    let loaded = rustls_native_certs::load_native_certs();
-    for cert in loaded.certs {
-        let _ = roots.add(cert);
-    }
-    if roots.is_empty() {
-        return Err(Error::Tls(
-            "no platform root certificates available; cannot verify the database server".into(),
-        ));
-    }
+    let roots = crate::trust::upstream_roots()?;
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let client_config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
